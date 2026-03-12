@@ -10,9 +10,14 @@ import sys
 # Ensure project root is on sys.path so `from src...` works when running this script
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.scene import Scene, AgentSpec, ObstacleSpec
+from src.scene import Scene, AgentSpec, ObstacleSpec, PathSpec
 from src.ORCASim import ORCASim
 from src.occupancy2d import Occupancy2d
+
+
+OCC_RESOLUTION = 0.1
+OCC_MARGIN = 0.2
+OCC_AGENT_RADIUS = 0.1
 
 
 def build_occupancy_maps(
@@ -69,9 +74,13 @@ def animate_rollout(
     occupancy_resolution: Tuple[float, float],
     time_step: float,
 ) -> None:
-    import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation
-    from matplotlib.patches import Polygon
+    import importlib
+
+    plt = importlib.import_module("matplotlib.pyplot")
+    animation_mod = importlib.import_module("matplotlib.animation")
+    patches_mod = importlib.import_module("matplotlib.patches")
+    FuncAnimation = animation_mod.FuncAnimation
+    Polygon = patches_mod.Polygon
 
     num_steps, _, _ = traj.shape
 
@@ -177,35 +186,26 @@ def main() -> None:
         action="store_true",
         help="Display a matplotlib animation of the agents.",
     )
-    parser.add_argument(
-        "--occ-resolution",
-        type=float,
-        default=0.1,
-        help="Occupancy map resolution in meters per cell.",
-    )
-    parser.add_argument(
-        "--occ-margin",
-        type=float,
-        default=0.2,
-        help="Margin (meters) around trajectories/goals/obstacles in occupancy map.",
-    )
-    parser.add_argument(
-        "--agent-radius",
-        type=float,
-        default=0.1,
-        help="Agent radius used for occupancy rasterization.",
-    )
     args = parser.parse_args()
 
     scene = Scene(
         agents=[
-            AgentSpec(position=(-4.0, 0.0), goal=(4.0, 0.0)),
-            AgentSpec(position=(4.0, 1.0), goal=(-4.0, 1.0)),
-            AgentSpec(position=(0.0, -4.0), goal=(0.0, 4.0)),
-            AgentSpec(position=(-2.5, -2.5), goal=(2.5, 2.5)),
+            AgentSpec(position=(-4.2, -0.3), goal=(0.3, 4.2), path_index=0),
+            AgentSpec(position=(-4.0, 0.3), goal=(-0.3, 4.2), path_index=0),
+            AgentSpec(position=(0.3, 4.2), goal=(-4.2, -0.3), path_index=1),
+            AgentSpec(position=(-0.3, 4.0), goal=(-4.0, 0.3), path_index=1),
         ],
         obstacles=[
-            ObstacleSpec(vertices=[(-5.0, -5.0), (5.0, -5.0), (5.0, -4.8), (-5.0, -4.8)]),
+            ObstacleSpec(vertices=[(-5.0, -1.2), (1.0, -1.2), (1.0, -1.0), (-5.0, -1.0)]),
+            ObstacleSpec(vertices=[(-5.0, 1.0), (-0.8, 1.0), (-0.8, 1.2), (-5.0, 1.2)]),
+            ObstacleSpec(vertices=[(-5.0, -1.2), (-4.8, -1.2), (-4.8, 1.2), (-5.0, 1.2)]),
+            ObstacleSpec(vertices=[(1.0, -0.5), (1.2, -0.5), (1.2, 5.2), (1.0, 5.2)]),
+            ObstacleSpec(vertices=[(-1.2, 0.8), (-1.0, 0.8), (-1.0, 5.2), (-1.2, 5.2)]),
+            ObstacleSpec(vertices=[(-1.2, 5.0), (1.2, 5.0), (1.2, 5.2), (-1.2, 5.2)]),
+        ],
+        paths=[
+            PathSpec(points=[(-4.5, 0.0), (0.0, 0.0), (0.0, 4.5)]),
+            PathSpec(points=[(0.0, 4.5), (0.0, 0.0), (-4.5, 0.0)]),
         ],
     )
 
@@ -216,9 +216,9 @@ def main() -> None:
         traj=traj,
         goals=goals,
         obstacles=scene.obstacles,
-        resolution=args.occ_resolution,
-        margin=args.occ_margin,
-        agent_radius=args.agent_radius,
+        resolution=OCC_RESOLUTION,
+        margin=OCC_MARGIN,
+        agent_radius=OCC_AGENT_RADIUS,
     )
 
     if args.animate:
