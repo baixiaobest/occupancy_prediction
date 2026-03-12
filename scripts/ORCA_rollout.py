@@ -1,0 +1,243 @@
+from __future__ import annotations
+
+import argparse
+from typing import List, Tuple
+
+import numpy as np
+import os
+import sys
+
+# Ensure project root is on sys.path so `from src...` works when running this script
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from src.scene import Scene, AgentSpec, ObstacleSpec
+from src.ORCASim import ORCASim
+from src.occupancy2d import Occupancy2d
+
+
+def build_occupancy_maps(
+    traj: np.ndarray,
+    goals: np.ndarray,
+    obstacles: List[ObstacleSpec],
+    resolution: float,
+    margin: float,
+    agent_radius: float,
+) -> Tuple[List[np.ndarray], np.ndarray, Tuple[float, float]]:
+    min_xy = traj.min(axis=(0, 1))
+    max_xy = traj.max(axis=(0, 1))
+    min_xy = np.minimum(min_xy, goals.min(axis=0))
+    max_xy = np.maximum(max_xy, goals.max(axis=0))
+
+    for obstacle in obstacles:
+        if not obstacle.vertices:
+            continue
+        verts = np.asarray(obstacle.vertices, dtype=np.float32)
+        min_xy = np.minimum(min_xy, verts.min(axis=0))
+        max_xy = np.maximum(max_xy, verts.max(axis=0))
+
+    origin = (min_xy - margin).astype(np.float32)
+    upper = (max_xy + margin).astype(np.float32)
+    size = upper - origin
+
+    shifted_traj = traj - origin[None, None, :]
+    shifted_obstacles: List[List[Tuple[float, float]]] = []
+    for obstacle in obstacles:
+        shifted_obstacles.append(
+            [
+                (float(vx - origin[0]), float(vy - origin[1]))
+                for vx, vy in obstacle.vertices
+            ]
+        )
+
+    occ2d = Occupancy2d(
+        resolution=(resolution, resolution),
+        size=(float(size[0]), float(size[1])),
+        trajectory=shifted_traj,
+        static_obstacles=shifted_obstacles,
+        agent_radius=agent_radius,
+    )
+    grids = [grid.cpu().numpy() for grid in occ2d.generate()]
+    return grids, origin, (resolution, resolution)
+
+
+def animate_rollout(
+    traj: np.ndarray,
+    goals: np.ndarray,
+    obstacles: List[ObstacleSpec],
+    occupancy_grids: List[np.ndarray],
+    occupancy_origin: np.ndarray,
+    occupancy_resolution: Tuple[float, float],
+    time_step: float,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+    from matplotlib.patches import Polygon
+
+    num_steps, _, _ = traj.shape
+
+    fig_traj, ax_traj = plt.subplots(figsize=(6, 6))
+    ax_traj.set_title("ORCA Pedestrian Simulation")
+    ax_traj.set_xlabel("X")
+    ax_traj.set_ylabel("Y")
+    ax_traj.set_aspect("equal", adjustable="box")
+
+    min_xy = traj.min(axis=(0, 1))
+    max_xy = traj.max(axis=(0, 1))
+    min_xy = np.minimum(min_xy, goals.min(axis=0))
+    max_xy = np.maximum(max_xy, goals.max(axis=0))
+    for obstacle in obstacles:
+        if not obstacle.vertices:
+            continue
+        verts = np.asarray(obstacle.vertices, dtype=np.float32)
+        min_xy = np.minimum(min_xy, verts.min(axis=0))
+        max_xy = np.maximum(max_xy, verts.max(axis=0))
+
+    min_xy -= 1.0
+    max_xy += 1.0
+    ax_traj.set_xlim(float(min_xy[0]), float(max_xy[0]))
+    ax_traj.set_ylim(float(min_xy[1]), float(max_xy[1]))
+
+    for obstacle in obstacles:
+        if len(obstacle.vertices) < 3:
+            continue
+        patch = Polygon(
+            obstacle.vertices,
+            closed=True,
+            facecolor="lightgray",
+            edgecolor="black",
+            linewidth=1.0,
+        )
+        ax_traj.add_patch(patch)
+
+    scat = ax_traj.scatter(traj[0, :, 0], traj[0, :, 1], s=60, c="tab:blue")
+    ax_traj.scatter(goals[:, 0], goals[:, 1], s=80, c="tab:red", marker="x")
+    traj_time_text = ax_traj.text(0.02, 0.98, "", transform=ax_traj.transAxes, va="top")
+
+    fig_occ, ax_occ = plt.subplots(figsize=(6, 6))
+    ax_occ.set_title("Occupancy Map")
+    ax_occ.set_xlabel("X")
+    ax_occ.set_ylabel("Y")
+    ax_occ.set_aspect("equal", adjustable="box")
+
+    first_grid = occupancy_grids[0]
+    cells_y, cells_x = first_grid.shape
+    res_x, res_y = occupancy_resolution
+    extent = (
+        float(occupancy_origin[0]),
+        float(occupancy_origin[0] + cells_x * res_x),
+        float(occupancy_origin[1]),
+        float(occupancy_origin[1] + cells_y * res_y),
+    )
+    im = ax_occ.imshow(
+        first_grid,
+        origin="lower",
+        cmap="gray_r",
+        vmin=0,
+        vmax=1,
+        extent=extent,
+        interpolation="nearest",
+    )
+    fig_occ.colorbar(im, ax=ax_occ, fraction=0.046, pad=0.04)
+    occ_time_text = ax_occ.text(0.02, 0.98, "", transform=ax_occ.transAxes, va="top")
+
+    def update(frame: int):
+        scat.set_offsets(traj[frame])
+        traj_time_text.set_text(f"t={frame * time_step:.2f}s")
+        im.set_data(occupancy_grids[frame])
+        occ_time_text.set_text(f"t={frame * time_step:.2f}s")
+        return scat, traj_time_text, im, occ_time_text
+
+    anim_traj = FuncAnimation(
+        fig_traj,
+        update,
+        frames=num_steps,
+        interval=time_step * 1000,
+        blit=False,
+    )
+    anim_occ = FuncAnimation(
+        fig_occ,
+        update,
+        frames=num_steps,
+        interval=time_step * 1000,
+        blit=False,
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+    _ = (anim_traj, anim_occ)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run an ORCA pedestrian rollout.")
+    parser.add_argument("--steps", type=int, default=200, help="Number of steps.")
+    parser.add_argument("--dt", type=float, default=0.1, help="Simulation time step.")
+    parser.add_argument(
+        "--animate",
+        action="store_true",
+        help="Display a matplotlib animation of the agents.",
+    )
+    parser.add_argument(
+        "--occ-resolution",
+        type=float,
+        default=0.1,
+        help="Occupancy map resolution in meters per cell.",
+    )
+    parser.add_argument(
+        "--occ-margin",
+        type=float,
+        default=0.2,
+        help="Margin (meters) around trajectories/goals/obstacles in occupancy map.",
+    )
+    parser.add_argument(
+        "--agent-radius",
+        type=float,
+        default=0.1,
+        help="Agent radius used for occupancy rasterization.",
+    )
+    args = parser.parse_args()
+
+    scene = Scene(
+        agents=[
+            AgentSpec(position=(-4.0, 0.0), goal=(4.0, 0.0)),
+            AgentSpec(position=(4.0, 1.0), goal=(-4.0, 1.0)),
+            AgentSpec(position=(0.0, -4.0), goal=(0.0, 4.0)),
+            AgentSpec(position=(-2.5, -2.5), goal=(2.5, 2.5)),
+        ],
+        obstacles=[
+            ObstacleSpec(vertices=[(-5.0, -5.0), (5.0, -5.0), (5.0, -4.8), (-5.0, -4.8)]),
+        ],
+    )
+
+    orca_sim = ORCASim(scene=scene, time_step=args.dt)
+    traj = orca_sim.simulate(steps=args.steps, stop_on_goal=True)
+    goals = np.array([agent.goal for agent in scene.agents], dtype=np.float32)
+    occupancy_grids, occupancy_origin, occupancy_resolution = build_occupancy_maps(
+        traj=traj,
+        goals=goals,
+        obstacles=scene.obstacles,
+        resolution=args.occ_resolution,
+        margin=args.occ_margin,
+        agent_radius=args.agent_radius,
+    )
+
+    if args.animate:
+        animate_rollout(
+            traj=traj,
+            goals=goals,
+            obstacles=scene.obstacles,
+            occupancy_grids=occupancy_grids,
+            occupancy_origin=occupancy_origin,
+            occupancy_resolution=occupancy_resolution,
+            time_step=args.dt,
+        )
+    else:
+        for i, pos in enumerate(traj[-1]):
+            print(f"agent[{i}] final position: ({pos[0]:.2f}, {pos[1]:.2f})")
+        print(
+            f"occupancy generated: {len(occupancy_grids)} frames, grid shape {occupancy_grids[0].shape}"
+        )
+
+
+if __name__ == "__main__":
+    main()
