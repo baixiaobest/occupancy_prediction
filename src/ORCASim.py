@@ -13,6 +13,8 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
 
 
 class ORCASim:
+    """ORCA simulator wrapper with optional reference-path guided navigation."""
+
     def __init__(
         self,
         scene,
@@ -27,6 +29,22 @@ class ORCASim:
         path_goal_switch_tolerance: float = 0.5,
         path_segment_remaining_switch_ratio: float = 0.1,
     ) -> None:
+        """Initialize ORCA simulator and scene-dependent guidance parameters.
+
+        Args:
+            scene: Scene object containing agents, obstacles, and optional paths.
+            time_step: Simulation step size.
+            neighbor_dist: Neighbor search radius for ORCA.
+            max_neighbors: Maximum neighbors considered per agent.
+            time_horizon: Agent-agent avoidance time horizon.
+            time_horizon_obst: Agent-obstacle avoidance time horizon.
+            radius: Agent radius used by ORCA.
+            max_speed: Agent speed upper bound.
+            goal_tolerance: Distance threshold for considering goal reached.
+            path_goal_switch_tolerance: Projection-gap threshold for switching to direct goal motion.
+            path_segment_remaining_switch_ratio: Fraction of segment length remaining below which
+                preferred direction switches to the next segment.
+        """
         self.scene = scene
         self.time_step = time_step
         self.goal_tolerance = goal_tolerance
@@ -45,13 +63,25 @@ class ORCASim:
         self.agent_ids = self._setup_agents()
 
     def _setup_agents(self) -> List[int]:
+        """Create ORCA agents from scene specifications and return simulator IDs."""
         ids: List[int] = []
         for agent in self.scene.agents:
             agent_id = self.sim.addAgent(agent.position)
             ids.append(agent_id)
         return ids
 
+    @staticmethod
+    def _sample_point_in_region(region, rng: np.random.Generator) -> tuple[float, float]:
+        """Sample a random point uniformly inside an axis-aligned rectangular region."""
+        min_corner = np.array(region.min_corner, dtype=np.float32)
+        max_corner = np.array(region.max_corner, dtype=np.float32)
+        low = np.minimum(min_corner, max_corner)
+        high = np.maximum(min_corner, max_corner)
+        sample = rng.uniform(low=low, high=high)
+        return float(sample[0]), float(sample[1])
+
     def _setup_obstacles(self) -> None:
+        """Register polygon obstacles in ORCA and finalize obstacle processing."""
         for obstacle in self.scene.obstacles:
             if len(obstacle.vertices) < 2:
                 continue
@@ -65,6 +95,11 @@ class ORCASim:
         seg_start: np.ndarray,
         seg_end: np.ndarray,
     ) -> tuple[np.ndarray, float]:
+        """Project a point to a line segment.
+
+        Returns:
+            A tuple `(closest_point, t)` where `t` is the clamped segment parameter in [0, 1].
+        """
         segment = seg_end - seg_start
         seg_len_sq = float(np.dot(segment, segment))
         if seg_len_sq <= 1e-12:
@@ -80,6 +115,14 @@ class ORCASim:
         point: np.ndarray,
         path_points: list[tuple[float, float]],
     ) -> tuple[np.ndarray, np.ndarray, int, float]:
+        """Find closest point on a polyline and preferred local travel direction.
+
+        If the closest projection is near the end of a segment (remaining ratio below
+        `path_segment_remaining_switch_ratio`), the direction of the next segment is used.
+
+        Returns:
+            `(closest_point, direction, segment_index, t_on_segment)`.
+        """
         if len(path_points) < 2:
             return point.copy(), np.zeros(2, dtype=np.float32), -1, 0.0
 
@@ -122,14 +165,23 @@ class ORCASim:
 
         return best_point.astype(np.float32), best_dir, best_seg_idx, best_t
 
-    def _compute_preferred_direction(self, idx: int, pos: np.ndarray, goal: np.ndarray) -> np.ndarray:
+    def _compute_preferred_direction(
+        self,
+        pos: np.ndarray,
+        goal: np.ndarray,
+        path_index: int | None,
+    ) -> np.ndarray:
+        """Compute preferred movement direction for one agent.
+
+        Agents without path association use direct goal direction.
+        Path-associated agents follow path direction, except when the agent and goal
+        project to nearby points on the path, in which case direct goal direction is used.
+        """
         to_goal = goal - pos
         goal_dist = float(np.linalg.norm(to_goal))
         if goal_dist <= self.goal_tolerance:
             return np.zeros(2, dtype=np.float32)
 
-        agent_spec = self.scene.agents[idx]
-        path_index = getattr(agent_spec, "path_index", None)
         scene_paths = getattr(self.scene, "paths", [])
 
         if path_index is None or path_index < 0 or path_index >= len(scene_paths):
@@ -151,11 +203,51 @@ class ORCASim:
         return (to_goal / max(goal_dist, 1e-6)).astype(np.float32)
 
     def _set_preferred_velocities(self) -> None:
+        """Update preferred velocity vectors for all agents before each ORCA step."""
         for idx, agent_id in enumerate(self.agent_ids):
             pos = np.array(self.sim.getAgentPosition(agent_id), dtype=np.float32)
             goal = np.array(self.scene.agents[idx].goal, dtype=np.float32)
-            velocity = self._compute_preferred_direction(idx, pos, goal)
+            path_index = getattr(self.scene.agents[idx], "path_index", None)
+            velocity = self._compute_preferred_direction(pos, goal, path_index)
             self.sim.setAgentPrefVelocity(agent_id, (float(velocity[0]), float(velocity[1])))
+
+    def _spawn_from_region_pair(self, pair, rng: np.random.Generator) -> int:
+        """Spawn one startup agent for a region pair using sampled spawn and destination points."""
+        from src.scene import AgentSpec
+
+        spawn_pos = self._sample_point_in_region(pair.spawn_region, rng)
+        dest_pos = self._sample_point_in_region(pair.destination_region, rng)
+        self.scene.agents.append(
+            AgentSpec(
+                position=spawn_pos,
+                goal=dest_pos,
+                path_index=getattr(pair, "path_index", None),
+            )
+        )
+        return self.sim.addAgent(spawn_pos)
+
+    def initialize_agents_from_region_pairs(self, seed: int | None = None) -> None:
+        """Spawn startup agents from all configured region pairs.
+
+        This method is intended for startup-only region-pair scenes so that the
+        resulting agent set is fixed and compatible with `simulate()`.
+        """
+        region_pairs = getattr(self.scene, "region_pairs", [])
+        if not region_pairs:
+            return
+
+        rng = np.random.default_rng(seed)
+        for pair in region_pairs:
+            startup_count = int(max(0, getattr(pair, "startup_agent_count", 0)))
+            for _ in range(startup_count):
+                agent_id = self._spawn_from_region_pair(pair, rng)
+                self.agent_ids.append(agent_id)
+
+    def get_runtime_goals(self) -> np.ndarray:
+        """Return goals for all currently configured agents in simulation order."""
+        if not self.scene.agents:
+            return np.zeros((0, 2), dtype=np.float32)
+        return np.array([agent.goal for agent in self.scene.agents], dtype=np.float32)
 
     def simulate(self, steps: int, stop_on_goal: bool = False) -> np.ndarray:
         """Run the simulation for up to `steps` steps.
@@ -184,4 +276,5 @@ class ORCASim:
                     return traj[: step + 1]
 
         return traj
+
 

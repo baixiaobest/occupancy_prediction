@@ -10,7 +10,14 @@ import sys
 # Ensure project root is on sys.path so `from src...` works when running this script
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.scene import Scene, AgentSpec, ObstacleSpec, PathSpec
+from src.scene import (
+    Scene,
+    AgentSpec,
+    ObstacleSpec,
+    PathSpec,
+    RegionSpec,
+    RegionPairSpec,
+)
 from src.ORCASim import ORCASim
 from src.occupancy2d import Occupancy2d
 
@@ -28,6 +35,12 @@ def build_occupancy_maps(
     margin: float,
     agent_radius: float,
 ) -> Tuple[List[np.ndarray], np.ndarray, Tuple[float, float]]:
+    """Build per-timestep occupancy grids from rollout trajectory and static obstacles.
+
+    Returns:
+        A tuple `(grids, origin, resolution_xy)` where `origin` maps grid coordinates
+        back to world coordinates.
+    """
     min_xy = traj.min(axis=(0, 1))
     max_xy = traj.max(axis=(0, 1))
     min_xy = np.minimum(min_xy, goals.min(axis=0))
@@ -74,6 +87,7 @@ def animate_rollout(
     occupancy_resolution: Tuple[float, float],
     time_step: float,
 ) -> None:
+    """Animate trajectory and occupancy map in two synchronized matplotlib windows."""
     import importlib
 
     plt = importlib.import_module("matplotlib.pyplot")
@@ -178,8 +192,9 @@ def animate_rollout(
 
 
 def main() -> None:
+    """Run an ORCA rollout with optional animation and occupancy-map generation."""
     parser = argparse.ArgumentParser(description="Run an ORCA pedestrian rollout.")
-    parser.add_argument("--steps", type=int, default=200, help="Number of steps.")
+    parser.add_argument("--steps", type=int, default=400, help="Number of steps.")
     parser.add_argument("--dt", type=float, default=0.1, help="Simulation time step.")
     parser.add_argument(
         "--animate",
@@ -188,28 +203,57 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    scene = Scene(
-        agents=[
-            AgentSpec(position=(-4.2, -0.3), goal=(0.3, 4.2), path_index=0),
-            AgentSpec(position=(-4.0, 0.3), goal=(-0.3, 4.2), path_index=0),
-            AgentSpec(position=(0.3, 4.2), goal=(-4.2, -0.3), path_index=1),
-            AgentSpec(position=(-0.3, 4.0), goal=(-4.0, 0.3), path_index=1),
-        ],
-        obstacles=[
-            ObstacleSpec(vertices=[(-5.0, -1.2), (1.0, -1.2), (1.0, -1.0), (-5.0, -1.0)]),
-            ObstacleSpec(vertices=[(-5.0, 1.0), (-0.8, 1.0), (-0.8, 1.2), (-5.0, 1.2)]),
-            ObstacleSpec(vertices=[(-5.0, -1.2), (-4.8, -1.2), (-4.8, 1.2), (-5.0, 1.2)]),
-            ObstacleSpec(vertices=[(1.0, -0.5), (1.2, -0.5), (1.2, 5.2), (1.0, 5.2)]),
-            ObstacleSpec(vertices=[(-1.2, 0.8), (-1.0, 0.8), (-1.0, 5.2), (-1.2, 5.2)]),
-            ObstacleSpec(vertices=[(-1.2, 5.0), (1.2, 5.0), (1.2, 5.2), (-1.2, 5.2)]),
-        ],
-        paths=[
-            PathSpec(points=[(-4.5, 0.0), (0.0, 0.0), (0.0, 4.5)]),
-            PathSpec(points=[(0.0, 4.5), (0.0, 0.0), (-4.5, 0.0)]),
-        ],
-    )
+    corridor_obstacles = [
+        ObstacleSpec(vertices=[(-15.0, -4.4), (4.4, -4.4), (4.4, -4.0), (-15.0, -4.0)]),
+        ObstacleSpec(vertices=[(-15.0, 4.0), (-4.0, 4.0), (-4.0, 4.4), (-15.0, 4.4)]),
+        ObstacleSpec(vertices=[(-15.4, -4.4), (-15.0, -4.4), (-15.0, 4.4), (-15.4, 4.4)]),
+        ObstacleSpec(vertices=[(4.0, -4.4), (4.4, -4.4), (4.4, 15.4), (4.0, 15.4)]),
+        ObstacleSpec(vertices=[(-4.4, 4.4), (-4.0, 4.4), (-4.0, 15.4), (-4.4, 15.4)]),
+        ObstacleSpec(vertices=[(-4.4, 15.0), (4.4, 15.0), (4.4, 15.4), (-4.4, 15.4)]),
+    ]
+    corridor_paths = [
+        PathSpec(points=[(-15.0, 0.0), (0.0, 0.0), (0.0, 15.0)]),
+        PathSpec(points=[(0.0, 15.0), (0.0, 0.0), (-15.0, 0.0)]),
+    ]
+
+    REGION_SPAWN = True
+
+    if not REGION_SPAWN:
+        scene = Scene(
+            agents=[
+                AgentSpec(position=(-14.0, -1.0), goal=(1.0, 14.0), path_index=0),
+                AgentSpec(position=(-14.0, 1.0), goal=(-1.0, 14.0), path_index=0),
+                AgentSpec(position=(1.0, 14.0), goal=(-14.0, -1.0), path_index=1),
+                AgentSpec(position=(-1.0, 14.0), goal=(-14.0, 1.0), path_index=1),
+            ],
+            obstacles=corridor_obstacles,
+            paths=corridor_paths,
+        )
+    else:
+        scene = Scene(
+            agents=[],
+            obstacles=corridor_obstacles,
+            paths=corridor_paths,
+            region_pairs=[
+                RegionPairSpec(
+                    spawn_region=RegionSpec(min_corner=(-14.5, -2.0), max_corner=(-13.0, 2.0)),
+                    destination_region=RegionSpec(min_corner=(-2.0, 13.0), max_corner=(2.0, 14.5)),
+                    startup_agent_count=8,
+                    path_index=0,
+                ),
+                RegionPairSpec(
+                    spawn_region=RegionSpec(min_corner=(-2.0, 13.0), max_corner=(2.0, 14.5)),
+                    destination_region=RegionSpec(min_corner=(-14.5, -2.0), max_corner=(-13.0, 2.0)),
+                    startup_agent_count=8,
+                    path_index=1,
+                ),
+            ],
+        )
 
     orca_sim = ORCASim(scene=scene, time_step=args.dt)
+    if REGION_SPAWN:
+        orca_sim.initialize_agents_from_region_pairs(seed=0)
+
     traj = orca_sim.simulate(steps=args.steps, stop_on_goal=True)
     goals = np.array([agent.goal for agent in scene.agents], dtype=np.float32)
     occupancy_grids, occupancy_origin, occupancy_resolution = build_occupancy_maps(
@@ -220,6 +264,9 @@ def main() -> None:
         margin=OCC_MARGIN,
         agent_radius=OCC_AGENT_RADIUS,
     )
+
+    if REGION_SPAWN:
+        print(f"region-pair startup spawn: total agents={traj.shape[1]}")
 
     if args.animate:
         animate_rollout(
