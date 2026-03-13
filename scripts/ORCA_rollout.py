@@ -10,10 +10,10 @@ import sys
 # Ensure project root is on sys.path so `from src...` works when running this script
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.scene import ObstacleSpec
+from src.scene import ObstacleSpec, PathSpec
 from src.ORCASim import ORCASim
 from src.occupancy2d import Occupancy2d
-from src.scene_template import StraightCorridorTemplate
+from src.scene_template import StraightCorridorTemplate, LShapeCorridorTemplate
 
 
 OCC_RESOLUTION = 0.1
@@ -76,6 +76,7 @@ def animate_rollout(
     traj: np.ndarray,
     goals: np.ndarray,
     obstacles: List[ObstacleSpec],
+    paths: List[PathSpec],
     occupancy_grids: List[np.ndarray],
     occupancy_origin: np.ndarray,
     occupancy_resolution: Tuple[float, float],
@@ -132,6 +133,19 @@ def animate_rollout(
             linewidth=1.0,
         )
         ax_traj.add_patch(patch)
+
+    for path in paths:
+        if len(path.points) < 2:
+            continue
+        path_points = np.asarray(path.points, dtype=np.float32)
+        ax_traj.plot(
+            path_points[:, 0],
+            path_points[:, 1],
+            linestyle="--",
+            linewidth=2.0,
+            color="tab:orange",
+            alpha=0.9,
+        )
 
     scat = ax_traj.scatter(traj[0, :, 0], traj[0, :, 1], s=60, c="tab:blue")
     ax_traj.scatter(goals[:, 0], goals[:, 1], s=80, c="tab:red", marker="x")
@@ -204,25 +218,26 @@ def main() -> None:
     args = parser.parse_args()
     # ORCASim configuration constants
     TIME_STEP = args.dt
-    NEIGHBOR_DIST = 5.0
+    NEIGHBOR_DIST = 3.0
     MAX_NEIGHBORS = 10
     TIME_HORIZON = 5.0
     TIME_HORIZON_OBST = 5.0
     RADIUS = 0.3
     MAX_SPEED = 5.0
     GOAL_TOLERANCE = 0.2
-    PATH_GOAL_SWITCH_TOLERANCE = 0.5
+    PATH_GOAL_SWITCH_TOLERANCE = 3.0
     PATH_SEGMENT_REMAINING_SWITCH_RATIO = 0.05
 
-    template = StraightCorridorTemplate(
+    template = LShapeCorridorTemplate(
         width_range=(3.0, 10.0),
-        length_range=(8.0, 20.0),
+        horizontal_length_range=(8.0, 20.0),
+        vertical_length_range=(8.0, 20.0),
         spawn_density_range=(0.5, 0.2),
         spawn_velocity_range=(0.8, 2.6),
         num_region_pairs=2,
     )
-    scenes = template.generate(num_levels=4)
-    print(f"generated {len(scenes)} scenes from StraightCorridorTemplate")
+    scenes = template.generate(num_levels=5)
+    print(f"generated {len(scenes)} scenes from LShapeCorridorTemplate")
 
     for scene_index, scene in enumerate(scenes):
         orca_sim = ORCASim(
@@ -260,6 +275,7 @@ def main() -> None:
                 traj=traj,
                 goals=goals,
                 obstacles=scene.obstacles,
+                paths=scene.paths,
                 occupancy_grids=occupancy_grids,
                 occupancy_origin=occupancy_origin,
                 occupancy_resolution=occupancy_resolution,

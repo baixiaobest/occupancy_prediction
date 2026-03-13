@@ -64,6 +64,7 @@ class ORCASim:
             max_speed,
         )
         self.agent_desired_speeds: List[float] = []
+        self.agent_direct_goal_latched: List[bool] = []
         self._setup_obstacles()
         self.agent_ids = self._setup_agents()
         self._region_pairs_initialized = False
@@ -77,6 +78,7 @@ class ORCASim:
             agent_id = self.sim.addAgent(agent.position)
             ids.append(agent_id)
             self.agent_desired_speeds.append(self.max_speed)
+            self.agent_direct_goal_latched.append(False)
         return ids
 
     @staticmethod
@@ -197,6 +199,7 @@ class ORCASim:
         pos: np.ndarray,
         goal: np.ndarray,
         path_index: int | None,
+        agent_index: int,
     ) -> np.ndarray:
         """Compute preferred movement direction for one agent.
 
@@ -214,6 +217,9 @@ class ORCASim:
         if path_index is None or path_index < 0 or path_index >= len(scene_paths):
             return (to_goal / max(goal_dist, 1e-6)).astype(np.float32)
 
+        if self.agent_direct_goal_latched[agent_index]:
+            return (to_goal / max(goal_dist, 1e-6)).astype(np.float32)
+
         path_points = scene_paths[path_index].points
         pos_closest, path_direction, _, _ = self._closest_point_and_direction_on_path(
             pos, path_points
@@ -222,6 +228,7 @@ class ORCASim:
 
         projection_gap = float(np.linalg.norm(goal_closest - pos_closest))
         if projection_gap <= self.path_goal_switch_tolerance:
+            self.agent_direct_goal_latched[agent_index] = True
             return (to_goal / max(goal_dist, 1e-6)).astype(np.float32)
 
         if float(np.linalg.norm(path_direction)) > 1e-6:
@@ -235,7 +242,7 @@ class ORCASim:
             pos = np.array(self.sim.getAgentPosition(agent_id), dtype=np.float32)
             goal = np.array(self.scene.agents[idx].goal, dtype=np.float32)
             path_index = getattr(self.scene.agents[idx], "path_index", None)
-            direction = self._compute_preferred_direction(pos, goal, path_index)
+            direction = self._compute_preferred_direction(pos, goal, path_index, idx)
             desired_speed = self.agent_desired_speeds[idx]
             velocity = direction * desired_speed
             self.sim.setAgentPrefVelocity(agent_id, (float(velocity[0]), float(velocity[1])))
@@ -257,6 +264,7 @@ class ORCASim:
         sampled_speed = self._sample_max_speed(getattr(pair, "velocity_range", None), rng)
         self.sim.setAgentMaxSpeed(agent_id, sampled_speed)
         self.agent_desired_speeds.append(sampled_speed)
+        self.agent_direct_goal_latched.append(False)
         return agent_id
 
     def initialize_agents_from_region_pairs(self, seed: int | None = None) -> None:
