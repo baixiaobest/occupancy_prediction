@@ -21,6 +21,7 @@ class Occupancy2d:
 		trajectory: np.ndarray | torch.Tensor | None = None,
 		static_obstacles: Sequence[object] | None = None,
 		agent_radius: float = 0.3,
+		center: Tuple[float, float] | torch.Tensor | None = None,
 	) -> None:
 		self.resolution = _to_tensor(resolution)
 		self.size = _to_tensor(size)
@@ -36,6 +37,17 @@ class Occupancy2d:
 			raise ValueError("size must be positive")
 		if self.agent_radius < 0:
 			raise ValueError("agent_radius must be non-negative")
+
+		default_center = self.size * 0.5
+		if center is not None:
+			center_tensor = _to_tensor(center)
+		else:
+			center_tensor = default_center
+
+		if center_tensor.numel() != 2:
+			raise ValueError("center must have exactly two elements")
+
+		self.center = center_tensor.to(dtype=torch.float32)
 
 	def update_inputs(
 		self,
@@ -94,12 +106,13 @@ class Occupancy2d:
 	) -> None:
 		cells_y, cells_x = grid.shape
 		resolution = self.resolution.to(device=grid.device, dtype=torch.float32)
+		grid_min = (self.center - self.size * 0.5).to(device=grid.device, dtype=torch.float32)
 
 		min_xy = center_xy - half_size_xy
 		max_xy = center_xy + half_size_xy
 
-		min_idx = torch.floor(min_xy / resolution).to(dtype=torch.long)
-		max_idx = torch.floor(max_xy / resolution).to(dtype=torch.long)
+		min_idx = torch.floor((min_xy - grid_min) / resolution).to(dtype=torch.long)
+		max_idx = torch.floor((max_xy - grid_min) / resolution).to(dtype=torch.long)
 
 		min_ix = int(torch.clamp(min_idx[0], 0, cells_x - 1).item())
 		max_ix = int(torch.clamp(max_idx[0], 0, cells_x - 1).item())
@@ -125,19 +138,21 @@ class Occupancy2d:
 
 		res_x = float(self.resolution[0].item())
 		res_y = float(self.resolution[1].item())
+		grid_min_x = float((self.center[0] - self.size[0] * 0.5).item())
+		grid_min_y = float((self.center[1] - self.size[1] * 0.5).item())
 
-		min_ix = max(0, int(np.floor(min_x / res_x)))
-		max_ix = min(cells_x - 1, int(np.floor(max_x / res_x)))
-		min_iy = max(0, int(np.floor(min_y / res_y)))
-		max_iy = min(cells_y - 1, int(np.floor(max_y / res_y)))
+		min_ix = max(0, int(np.floor((min_x - grid_min_x) / res_x)))
+		max_ix = min(cells_x - 1, int(np.floor((max_x - grid_min_x) / res_x)))
+		min_iy = max(0, int(np.floor((min_y - grid_min_y) / res_y)))
+		max_iy = min(cells_y - 1, int(np.floor((max_y - grid_min_y) / res_y)))
 
 		if min_ix > max_ix or min_iy > max_iy:
 			return
 
 		for iy in range(min_iy, max_iy + 1):
-			center_y = (iy + 0.5) * res_y
+			center_y = grid_min_y + (iy + 0.5) * res_y
 			for ix in range(min_ix, max_ix + 1):
-				center_x = (ix + 0.5) * res_x
+				center_x = grid_min_x + (ix + 0.5) * res_x
 				if _point_in_polygon(center_x, center_y, polygon):
 					grid[iy, ix] = 1
 
