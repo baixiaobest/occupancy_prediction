@@ -29,6 +29,9 @@ class ORCASim:
         path_goal_switch_tolerance: float = 0.5,
         path_segment_remaining_switch_ratio: float = 0.1,
         region_pair_seed: int | None = 0,
+        pref_velocity_noise_std: float = 0.0,
+        pref_velocity_noise_interval: int = 1,
+        pref_velocity_noise_seed: int | None = 0,
     ) -> None:
         """Initialize ORCA simulator and scene-dependent guidance parameters.
 
@@ -47,13 +50,27 @@ class ORCASim:
                 preferred direction switches to the next segment.
             region_pair_seed: Random seed used for startup region-pair spawning when
                 the scene is configured with region pairs and no explicit agents.
+            pref_velocity_noise_std: Standard deviation of Gaussian noise added to
+                preferred velocity components to break symmetric deadlocks.
+            pref_velocity_noise_interval: Number of simulation steps between noise
+                resampling events (must be >= 1).
+            pref_velocity_noise_seed: Random seed for preferred-velocity noise.
         """
+        if pref_velocity_noise_std < 0.0:
+            raise ValueError("pref_velocity_noise_std must be >= 0")
+        if pref_velocity_noise_interval < 1:
+            raise ValueError("pref_velocity_noise_interval must be >= 1")
+
         self.scene = scene
         self.time_step = time_step
         self.max_speed = float(max_speed)
         self.goal_tolerance = goal_tolerance
         self.path_goal_switch_tolerance = path_goal_switch_tolerance
         self.path_segment_remaining_switch_ratio = path_segment_remaining_switch_ratio
+        self.pref_velocity_noise_std = float(pref_velocity_noise_std)
+        self.pref_velocity_noise_interval = int(pref_velocity_noise_interval)
+        self._pref_velocity_rng = np.random.default_rng(pref_velocity_noise_seed)
+        self._pref_velocity_step_count = 0
         self.sim = rvo2.PyRVOSimulator(
             time_step,
             neighbor_dist,
@@ -65,6 +82,7 @@ class ORCASim:
         )
         self.agent_desired_speeds: List[float] = []
         self.agent_direct_goal_latched: List[bool] = []
+        self.agent_pref_velocity_noise: List[np.ndarray] = []
         self._setup_obstacles()
         self.agent_ids = self._setup_agents()
         self._region_pairs_initialized = False
@@ -79,6 +97,7 @@ class ORCASim:
             ids.append(agent_id)
             self.agent_desired_speeds.append(self.max_speed)
             self.agent_direct_goal_latched.append(False)
+            self.agent_pref_velocity_noise.append(np.zeros(2, dtype=np.float32))
         return ids
 
     @staticmethod
@@ -238,6 +257,20 @@ class ORCASim:
 
     def _set_preferred_velocities(self) -> None:
         """Update preferred velocity vectors for all agents before each ORCA step."""
+        should_resample_noise = (
+            self.pref_velocity_noise_std > 0.0
+            and self._pref_velocity_step_count % self.pref_velocity_noise_interval == 0
+        )
+
+        if should_resample_noise:
+            for idx in range(len(self.agent_pref_velocity_noise)):
+                sampled_noise = self._pref_velocity_rng.normal(
+                    loc=0.0,
+                    scale=self.pref_velocity_noise_std,
+                    size=2,
+                ).astype(np.float32)
+                self.agent_pref_velocity_noise[idx] = sampled_noise
+
         for idx, agent_id in enumerate(self.agent_ids):
             pos = np.array(self.sim.getAgentPosition(agent_id), dtype=np.float32)
             goal = np.array(self.scene.agents[idx].goal, dtype=np.float32)
@@ -245,7 +278,13 @@ class ORCASim:
             direction = self._compute_preferred_direction(pos, goal, path_index, idx)
             desired_speed = self.agent_desired_speeds[idx]
             velocity = direction * desired_speed
+
+            if float(np.linalg.norm(direction)) > 1e-6 and self.pref_velocity_noise_std > 0.0:
+                velocity = velocity + self.agent_pref_velocity_noise[idx]
+
             self.sim.setAgentPrefVelocity(agent_id, (float(velocity[0]), float(velocity[1])))
+
+        self._pref_velocity_step_count += 1
 
     def _spawn_from_region_pair(self, pair, rng: np.random.Generator) -> int:
         """Spawn one startup agent for a region pair using sampled spawn and destination points."""
@@ -265,6 +304,7 @@ class ORCASim:
         self.sim.setAgentMaxSpeed(agent_id, sampled_speed)
         self.agent_desired_speeds.append(sampled_speed)
         self.agent_direct_goal_latched.append(False)
+        self.agent_pref_velocity_noise.append(np.zeros(2, dtype=np.float32))
         return agent_id
 
     def initialize_agents_from_region_pairs(self, seed: int | None = None) -> None:

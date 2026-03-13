@@ -13,7 +13,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from src.scene import ObstacleSpec, PathSpec
 from src.ORCASim import ORCASim
 from src.occupancy2d import Occupancy2d
-from src.scene_template import StraightCorridorTemplate, LShapeCorridorTemplate
+from src.scene_template import (
+    StraightCorridorTemplate,
+    LShapeCorridorTemplate,
+    TShapeCorridorTemplate,
+)
 
 
 OCC_RESOLUTION = 0.1
@@ -227,17 +231,31 @@ def main() -> None:
     GOAL_TOLERANCE = 0.2
     PATH_GOAL_SWITCH_TOLERANCE = 3.0
     PATH_SEGMENT_REMAINING_SWITCH_RATIO = 0.05
+    PREF_VELOCITY_NOISE_STD = 0.08
+    PREF_VELOCITY_NOISE_INTERVAL = 3
+    PREF_VELOCITY_NOISE_SEED = 0
 
-    template = LShapeCorridorTemplate(
+    l_template = LShapeCorridorTemplate(
         width_range=(3.0, 10.0),
         horizontal_length_range=(8.0, 20.0),
         vertical_length_range=(8.0, 20.0),
         spawn_density_range=(0.5, 0.2),
         spawn_velocity_range=(0.8, 2.6),
+        turn_radius_ratio=1.2,
         num_region_pairs=2,
     )
+    template = TShapeCorridorTemplate(
+        width_range=(3.0, 10.0),
+        horizontal_length_range=(8.0, 20.0),
+        vertical_length_range=(8.0, 20.0),
+        spawn_density_range=(0.3, 0.2),
+        spawn_velocity_range=(0.8, 2.6),
+        spawn_depth_ratio=0.3,
+        turn_radius_ratio=1.2,
+        num_enabled_start_regions=3,
+    )
     scenes = template.generate(num_levels=5)
-    print(f"generated {len(scenes)} scenes from LShapeCorridorTemplate")
+    print(f"generated {len(scenes)} scenes from {template.__class__.__name__}")
 
     for scene_index, scene in enumerate(scenes):
         orca_sim = ORCASim(
@@ -253,6 +271,9 @@ def main() -> None:
             path_goal_switch_tolerance=PATH_GOAL_SWITCH_TOLERANCE,
             path_segment_remaining_switch_ratio=PATH_SEGMENT_REMAINING_SWITCH_RATIO,
             region_pair_seed=scene_index,
+            pref_velocity_noise_std=PREF_VELOCITY_NOISE_STD,
+            pref_velocity_noise_interval=PREF_VELOCITY_NOISE_INTERVAL,
+            pref_velocity_noise_seed=PREF_VELOCITY_NOISE_SEED + scene_index,
         )
         traj = orca_sim.simulate(steps=args.steps, stop_on_goal=True)
         goals = np.array([agent.goal for agent in scene.agents], dtype=np.float32)
