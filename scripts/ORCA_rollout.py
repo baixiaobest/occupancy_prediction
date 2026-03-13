@@ -10,21 +10,15 @@ import sys
 # Ensure project root is on sys.path so `from src...` works when running this script
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.scene import (
-    Scene,
-    AgentSpec,
-    ObstacleSpec,
-    PathSpec,
-    RegionSpec,
-    RegionPairSpec,
-)
+from src.scene import ObstacleSpec
 from src.ORCASim import ORCASim
 from src.occupancy2d import Occupancy2d
+from src.scene_template import StraightCorridorTemplate
 
 
 OCC_RESOLUTION = 0.1
 OCC_MARGIN = 0.2
-OCC_AGENT_RADIUS = 0.1
+OCC_AGENT_RADIUS = 0.2
 
 
 def build_occupancy_maps(
@@ -86,6 +80,7 @@ def animate_rollout(
     occupancy_origin: np.ndarray,
     occupancy_resolution: Tuple[float, float],
     time_step: float,
+    title_prefix: str = "",
 ) -> None:
     """Animate trajectory and occupancy map in two synchronized matplotlib windows."""
     import importlib
@@ -99,7 +94,13 @@ def animate_rollout(
     num_steps, _, _ = traj.shape
 
     fig_traj, ax_traj = plt.subplots(figsize=(6, 6))
-    ax_traj.set_title("ORCA Pedestrian Simulation")
+    traj_title = "ORCA Pedestrian Simulation"
+    occ_title = "Occupancy Map"
+    if title_prefix:
+        traj_title = f"{title_prefix} - {traj_title}"
+        occ_title = f"{title_prefix} - {occ_title}"
+
+    ax_traj.set_title(traj_title)
     ax_traj.set_xlabel("X")
     ax_traj.set_ylabel("Y")
     ax_traj.set_aspect("equal", adjustable="box")
@@ -137,7 +138,7 @@ def animate_rollout(
     traj_time_text = ax_traj.text(0.02, 0.98, "", transform=ax_traj.transAxes, va="top")
 
     fig_occ, ax_occ = plt.subplots(figsize=(6, 6))
-    ax_occ.set_title("Occupancy Map")
+    ax_occ.set_title(occ_title)
     ax_occ.set_xlabel("X")
     ax_occ.set_ylabel("Y")
     ax_occ.set_aspect("equal", adjustable="box")
@@ -191,18 +192,7 @@ def animate_rollout(
     _ = (anim_traj, anim_occ)
 
 
-def main() -> None:
-    """Run an ORCA rollout with optional animation and occupancy-map generation."""
-    parser = argparse.ArgumentParser(description="Run an ORCA pedestrian rollout.")
-    parser.add_argument("--steps", type=int, default=400, help="Number of steps.")
-    parser.add_argument("--dt", type=float, default=0.1, help="Simulation time step.")
-    parser.add_argument(
-        "--animate",
-        action="store_true",
-        help="Display a matplotlib animation of the agents.",
-    )
-    args = parser.parse_args()
-
+def get_L_shape_scene() -> Scene:
     corridor_obstacles = [
         ObstacleSpec(vertices=[(-15.0, -4.4), (4.4, -4.4), (4.4, -4.0), (-15.0, -4.0)]),
         ObstacleSpec(vertices=[(-15.0, 4.0), (-4.0, 4.0), (-4.0, 4.4), (-15.0, 4.4)]),
@@ -216,74 +206,86 @@ def main() -> None:
         PathSpec(points=[(0.0, 15.0), (0.0, 0.0), (-15.0, 0.0)]),
     ]
 
-    REGION_SPAWN = True
-
-    if not REGION_SPAWN:
-        scene = Scene(
-            agents=[
-                AgentSpec(position=(-14.0, -1.0), goal=(1.0, 14.0), path_index=0),
-                AgentSpec(position=(-14.0, 1.0), goal=(-1.0, 14.0), path_index=0),
-                AgentSpec(position=(1.0, 14.0), goal=(-14.0, -1.0), path_index=1),
-                AgentSpec(position=(-1.0, 14.0), goal=(-14.0, 1.0), path_index=1),
-            ],
-            obstacles=corridor_obstacles,
-            paths=corridor_paths,
-        )
-    else:
-        scene = Scene(
+    scene = Scene(
             agents=[],
             obstacles=corridor_obstacles,
             paths=corridor_paths,
             region_pairs=[
                 RegionPairSpec(
-                    spawn_region=RegionSpec(min_corner=(-14.5, -2.0), max_corner=(-13.0, 2.0)),
+                    spawn_region=RegionSpec(min_corner=(-14.5, -2.0), max_corner=(-10.0, 2.0)),
                     destination_region=RegionSpec(min_corner=(-2.0, 13.0), max_corner=(2.0, 14.5)),
                     startup_agent_count=8,
                     path_index=0,
                 ),
                 RegionPairSpec(
-                    spawn_region=RegionSpec(min_corner=(-2.0, 13.0), max_corner=(2.0, 14.5)),
+                    spawn_region=RegionSpec(min_corner=(-2.0, 10.0), max_corner=(2.0, 14.5)),
                     destination_region=RegionSpec(min_corner=(-14.5, -2.0), max_corner=(-13.0, 2.0)),
                     startup_agent_count=8,
                     path_index=1,
                 ),
             ],
         )
+    return scene
 
-    orca_sim = ORCASim(scene=scene, time_step=args.dt)
-    if REGION_SPAWN:
-        orca_sim.initialize_agents_from_region_pairs(seed=0)
-
-    traj = orca_sim.simulate(steps=args.steps, stop_on_goal=True)
-    goals = np.array([agent.goal for agent in scene.agents], dtype=np.float32)
-    occupancy_grids, occupancy_origin, occupancy_resolution = build_occupancy_maps(
-        traj=traj,
-        goals=goals,
-        obstacles=scene.obstacles,
-        resolution=OCC_RESOLUTION,
-        margin=OCC_MARGIN,
-        agent_radius=OCC_AGENT_RADIUS,
+def main() -> None:
+    """Run an ORCA rollout with optional animation and occupancy-map generation."""
+    parser = argparse.ArgumentParser(description="Run an ORCA pedestrian rollout.")
+    parser.add_argument("--steps", type=int, default=400, help="Number of steps.")
+    parser.add_argument("--dt", type=float, default=0.1, help="Simulation time step.")
+    parser.add_argument(
+        "--animate",
+        action="store_true",
+        help="Display a matplotlib animation of the agents.",
     )
+    args = parser.parse_args()
+    template = StraightCorridorTemplate(
+        width_range=(3.0, 6.0),
+        length_range=(8.0, 15.0),
+        startup_agent_count_per_pair=8,
+        num_region_pairs=1,
+    )
+    scenes = template.generate(num_levels=4)
+    print(f"generated {len(scenes)} scenes from StraightCorridorTemplate")
 
-    if REGION_SPAWN:
-        print(f"region-pair startup spawn: total agents={traj.shape[1]}")
-
-    if args.animate:
-        animate_rollout(
+    for scene_index, scene in enumerate(scenes):
+        orca_sim = ORCASim(scene=scene, time_step=args.dt, region_pair_seed=scene_index)
+        traj = orca_sim.simulate(steps=args.steps, stop_on_goal=True)
+        goals = np.array([agent.goal for agent in scene.agents], dtype=np.float32)
+        occupancy_grids, occupancy_origin, occupancy_resolution = build_occupancy_maps(
             traj=traj,
             goals=goals,
             obstacles=scene.obstacles,
-            occupancy_grids=occupancy_grids,
-            occupancy_origin=occupancy_origin,
-            occupancy_resolution=occupancy_resolution,
-            time_step=args.dt,
+            resolution=OCC_RESOLUTION,
+            margin=OCC_MARGIN,
+            agent_radius=OCC_AGENT_RADIUS,
         )
-    else:
-        for i, pos in enumerate(traj[-1]):
-            print(f"agent[{i}] final position: ({pos[0]:.2f}, {pos[1]:.2f})")
+
         print(
-            f"occupancy generated: {len(occupancy_grids)} frames, grid shape {occupancy_grids[0].shape}"
+            f"scene[{scene_index}] startup spawn: total agents={traj.shape[1]}, "
+            f"steps={traj.shape[0]}"
         )
+
+        if args.animate:
+            animate_rollout(
+                traj=traj,
+                goals=goals,
+                obstacles=scene.obstacles,
+                occupancy_grids=occupancy_grids,
+                occupancy_origin=occupancy_origin,
+                occupancy_resolution=occupancy_resolution,
+                time_step=args.dt,
+                title_prefix=f"Scene {scene_index + 1}/{len(scenes)}",
+            )
+        else:
+            for i, pos in enumerate(traj[-1]):
+                print(
+                    f"scene[{scene_index}] agent[{i}] final position: "
+                    f"({pos[0]:.2f}, {pos[1]:.2f})"
+                )
+            print(
+                f"scene[{scene_index}] occupancy generated: {len(occupancy_grids)} frames, "
+                f"grid shape {occupancy_grids[0].shape}"
+            )
 
 
 if __name__ == "__main__":

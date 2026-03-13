@@ -28,6 +28,7 @@ class ORCASim:
         goal_tolerance: float = 0.1,
         path_goal_switch_tolerance: float = 0.5,
         path_segment_remaining_switch_ratio: float = 0.1,
+        region_pair_seed: int | None = 0,
     ) -> None:
         """Initialize ORCA simulator and scene-dependent guidance parameters.
 
@@ -44,6 +45,8 @@ class ORCASim:
             path_goal_switch_tolerance: Projection-gap threshold for switching to direct goal motion.
             path_segment_remaining_switch_ratio: Fraction of segment length remaining below which
                 preferred direction switches to the next segment.
+            region_pair_seed: Random seed used for startup region-pair spawning when
+                the scene is configured with region pairs and no explicit agents.
         """
         self.scene = scene
         self.time_step = time_step
@@ -61,6 +64,9 @@ class ORCASim:
         )
         self._setup_obstacles()
         self.agent_ids = self._setup_agents()
+        self._region_pairs_initialized = False
+        if len(self.scene.agents) == 0 and len(getattr(self.scene, "region_pairs", [])) > 0:
+            self.initialize_agents_from_region_pairs(seed=region_pair_seed)
 
     def _setup_agents(self) -> List[int]:
         """Create ORCA agents from scene specifications and return simulator IDs."""
@@ -232,6 +238,9 @@ class ORCASim:
         This method is intended for startup-only region-pair scenes so that the
         resulting agent set is fixed and compatible with `simulate()`.
         """
+        if self._region_pairs_initialized:
+            return
+
         region_pairs = getattr(self.scene, "region_pairs", [])
         if not region_pairs:
             return
@@ -243,11 +252,7 @@ class ORCASim:
                 agent_id = self._spawn_from_region_pair(pair, rng)
                 self.agent_ids.append(agent_id)
 
-    def get_runtime_goals(self) -> np.ndarray:
-        """Return goals for all currently configured agents in simulation order."""
-        if not self.scene.agents:
-            return np.zeros((0, 2), dtype=np.float32)
-        return np.array([agent.goal for agent in self.scene.agents], dtype=np.float32)
+        self._region_pairs_initialized = True
 
     def simulate(self, steps: int, stop_on_goal: bool = False) -> np.ndarray:
         """Run the simulation for up to `steps` steps.
