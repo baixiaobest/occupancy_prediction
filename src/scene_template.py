@@ -760,3 +760,441 @@ class TShapeCorridorTemplate(SceneTemplate):
             paths=paths,
             region_pairs=region_pairs,
         )
+
+
+class CrossShapeCorridorTemplate(SceneTemplate):
+    """Template for cross-shaped corridor scenes with grouped start terminals.
+
+    Terminal centers are:
+    - left: (-horizontal_length, 0)
+    - right: (horizontal_length, 0)
+    - bottom: (0, -vertical_length)
+    - top: (0, vertical_length)
+
+    With all starts enabled, this yields 12 directed region pairs
+    (4 starts x 3 destinations each).
+    """
+
+    def __init__(
+        self,
+        width_range: Tuple[float, float],
+        horizontal_length_range: Tuple[float, float],
+        vertical_length_range: Tuple[float, float],
+        spawn_density_range: Tuple[float, float] = (1.0, 1.0),
+        spawn_velocity_range: Tuple[float, float] = (1.5, 1.5),
+        num_enabled_start_regions: int = 4,
+        spawn_depth_ratio: float = 0.15,
+        spawn_width_ratio: float = 0.8,
+        wall_thickness: float = 0.4,
+        turn_smoothing_segments: int = 6,
+        turn_radius_ratio: float = 0.6,
+    ) -> None:
+        if num_enabled_start_regions not in (1, 2, 3, 4):
+            raise ValueError("num_enabled_start_regions must be 1, 2, 3, or 4")
+        if spawn_density_range[0] < 0.0 or spawn_density_range[1] < 0.0:
+            raise ValueError("spawn_density_range values must be >= 0")
+        if spawn_velocity_range[0] < 0.0 or spawn_velocity_range[1] < 0.0:
+            raise ValueError("spawn_velocity_range values must be >= 0")
+        if not (0.0 < spawn_depth_ratio <= 0.5):
+            raise ValueError("spawn_depth_ratio must be in (0, 0.5]")
+        if not (0.0 < spawn_width_ratio <= 1.0):
+            raise ValueError("spawn_width_ratio must be in (0, 1]")
+        if wall_thickness <= 0.0:
+            raise ValueError("wall_thickness must be > 0")
+        if turn_smoothing_segments < 1:
+            raise ValueError("turn_smoothing_segments must be >= 1")
+        if turn_radius_ratio <= 0.0:
+            raise ValueError("turn_radius_ratio must be > 0")
+
+        self.width_range = (float(width_range[0]), float(width_range[1]))
+        self.horizontal_length_range = (
+            float(horizontal_length_range[0]),
+            float(horizontal_length_range[1]),
+        )
+        self.vertical_length_range = (
+            float(vertical_length_range[0]),
+            float(vertical_length_range[1]),
+        )
+        self.spawn_density_range = (
+            float(spawn_density_range[0]),
+            float(spawn_density_range[1]),
+        )
+        self.spawn_velocity_range = (
+            float(spawn_velocity_range[0]),
+            float(spawn_velocity_range[1]),
+        )
+        self.num_enabled_start_regions = int(num_enabled_start_regions)
+        self.spawn_depth_ratio = float(spawn_depth_ratio)
+        self.spawn_width_ratio = float(spawn_width_ratio)
+        self.wall_thickness = float(wall_thickness)
+        self.turn_smoothing_segments = int(turn_smoothing_segments)
+        self.turn_radius_ratio = float(turn_radius_ratio)
+
+    def generate(self, num_levels: int) -> List[Scene]:
+        """Generate `num_levels` cross-shaped corridor scenes."""
+        widths = self._linear_levels(self.width_range, num_levels)
+        horizontal_lengths = self._linear_levels(self.horizontal_length_range, num_levels)
+        vertical_lengths = self._linear_levels(self.vertical_length_range, num_levels)
+        densities = self._linear_levels(self.spawn_density_range, num_levels)
+
+        scenes: List[Scene] = []
+        for width, horizontal_length, vertical_length, density in zip(
+            widths, horizontal_lengths, vertical_lengths, densities
+        ):
+            if width <= 0.0 or horizontal_length <= 0.0 or vertical_length <= 0.0:
+                raise ValueError("Sampled width and lengths must be > 0")
+            scenes.append(
+                self._build_scene(
+                    width=width,
+                    horizontal_length=horizontal_length,
+                    vertical_length=vertical_length,
+                    spawn_density=density,
+                )
+            )
+
+        return scenes
+
+    def _build_scene(
+        self,
+        width: float,
+        horizontal_length: float,
+        vertical_length: float,
+        spawn_density: float,
+    ) -> Scene:
+        half_width = 0.5 * width
+        wall_t = self.wall_thickness
+
+        left_x = -horizontal_length
+        right_x = horizontal_length
+        bottom_y = -vertical_length
+        top_y = vertical_length
+
+        upper_left_wall = ObstacleSpec(
+            vertices=[
+                (left_x - wall_t, half_width),
+                (-half_width, half_width),
+                (-half_width, half_width + wall_t),
+                (left_x - wall_t, half_width + wall_t),
+            ]
+        )
+        upper_right_wall = ObstacleSpec(
+            vertices=[
+                (half_width, half_width),
+                (right_x + wall_t, half_width),
+                (right_x + wall_t, half_width + wall_t),
+                (half_width, half_width + wall_t),
+            ]
+        )
+        lower_left_wall = ObstacleSpec(
+            vertices=[
+                (left_x - wall_t, -half_width - wall_t),
+                (-half_width, -half_width - wall_t),
+                (-half_width, -half_width),
+                (left_x - wall_t, -half_width),
+            ]
+        )
+        lower_right_wall = ObstacleSpec(
+            vertices=[
+                (half_width, -half_width - wall_t),
+                (right_x + wall_t, -half_width - wall_t),
+                (right_x + wall_t, -half_width),
+                (half_width, -half_width),
+            ]
+        )
+        top_stem_left_wall = ObstacleSpec(
+            vertices=[
+                (-half_width - wall_t, half_width),
+                (-half_width, half_width),
+                (-half_width, top_y + wall_t),
+                (-half_width - wall_t, top_y + wall_t),
+            ]
+        )
+        top_stem_right_wall = ObstacleSpec(
+            vertices=[
+                (half_width, half_width),
+                (half_width + wall_t, half_width),
+                (half_width + wall_t, top_y + wall_t),
+                (half_width, top_y + wall_t),
+            ]
+        )
+        bottom_stem_left_wall = ObstacleSpec(
+            vertices=[
+                (-half_width - wall_t, bottom_y - wall_t),
+                (-half_width, bottom_y - wall_t),
+                (-half_width, -half_width),
+                (-half_width - wall_t, -half_width),
+            ]
+        )
+        bottom_stem_right_wall = ObstacleSpec(
+            vertices=[
+                (half_width, bottom_y - wall_t),
+                (half_width + wall_t, bottom_y - wall_t),
+                (half_width + wall_t, -half_width),
+                (half_width, -half_width),
+            ]
+        )
+
+        spawn_half_width = max(1e-6, 0.5 * self.spawn_width_ratio * width)
+        horizontal_spawn_depth = max(
+            1e-6,
+            min(self.spawn_depth_ratio * horizontal_length, horizontal_length),
+        )
+        vertical_spawn_depth = max(
+            1e-6,
+            min(self.spawn_depth_ratio * vertical_length, vertical_length),
+        )
+
+        left_region = RegionSpec(
+            min_corner=(left_x, -spawn_half_width),
+            max_corner=(left_x + horizontal_spawn_depth, spawn_half_width),
+        )
+        right_region = RegionSpec(
+            min_corner=(right_x - horizontal_spawn_depth, -spawn_half_width),
+            max_corner=(right_x, spawn_half_width),
+        )
+        bottom_region = RegionSpec(
+            min_corner=(-spawn_half_width, bottom_y),
+            max_corner=(spawn_half_width, bottom_y + vertical_spawn_depth),
+        )
+        top_region = RegionSpec(
+            min_corner=(-spawn_half_width, top_y - vertical_spawn_depth),
+            max_corner=(spawn_half_width, top_y),
+        )
+
+        horizontal_spawn_area = 2.0 * spawn_half_width * horizontal_spawn_depth
+        vertical_spawn_area = 2.0 * spawn_half_width * vertical_spawn_depth
+        left_spawn_count = self._spawn_count_from_density(spawn_density, horizontal_spawn_area)
+        right_spawn_count = self._spawn_count_from_density(spawn_density, horizontal_spawn_area)
+        bottom_spawn_count = self._spawn_count_from_density(spawn_density, vertical_spawn_area)
+        top_spawn_count = self._spawn_count_from_density(spawn_density, vertical_spawn_area)
+
+        terminal_points = {
+            "left": (left_x, 0.0),
+            "right": (right_x, 0.0),
+            "bottom": (0.0, bottom_y),
+            "top": (0.0, top_y),
+        }
+        terminal_regions = {
+            "left": left_region,
+            "right": right_region,
+            "bottom": bottom_region,
+            "top": top_region,
+        }
+        terminal_counts = {
+            "left": left_spawn_count,
+            "right": right_spawn_count,
+            "bottom": bottom_spawn_count,
+            "top": top_spawn_count,
+        }
+
+        starts_in_order = ["left", "right", "bottom", "top"]
+        enabled_starts = starts_in_order[: self.num_enabled_start_regions]
+        all_pairs = [
+            (start_name, end_name)
+            for start_name in starts_in_order
+            for end_name in starts_in_order
+            if start_name != end_name
+        ]
+        selected_pairs = [pair for pair in all_pairs if pair[0] in enabled_starts]
+
+        turn_radius = self._compute_turn_radius(
+            half_width=half_width,
+            primary_length=horizontal_length,
+            secondary_length=vertical_length,
+            turn_radius_ratio=self.turn_radius_ratio,
+        )
+
+        def _build_turn_path(start_name: str, end_name: str) -> List[Tuple[float, float]]:
+            if (start_name, end_name) in (("left", "right"), ("right", "left")):
+                return [terminal_points[start_name], terminal_points[end_name]]
+            if (start_name, end_name) in (("top", "bottom"), ("bottom", "top")):
+                return [terminal_points[start_name], terminal_points[end_name]]
+
+            points: List[Tuple[float, float]] = []
+
+            if start_name == "left" and end_name == "top":
+                points.append((left_x, 0.0))
+                if left_x < -turn_radius:
+                    points.append((-turn_radius, 0.0))
+                points.extend(
+                    self._arc_interior_points(
+                        center_x=-turn_radius,
+                        center_y=turn_radius,
+                        radius=turn_radius,
+                        start_angle=-0.5 * math.pi,
+                        end_angle=0.0,
+                        num_segments=self.turn_smoothing_segments,
+                    )
+                )
+                points.append((0.0, turn_radius))
+                if top_y > turn_radius:
+                    points.append((0.0, top_y))
+                return points
+
+            if start_name == "left" and end_name == "bottom":
+                points.append((left_x, 0.0))
+                if left_x < -turn_radius:
+                    points.append((-turn_radius, 0.0))
+                points.extend(
+                    self._arc_interior_points(
+                        center_x=-turn_radius,
+                        center_y=-turn_radius,
+                        radius=turn_radius,
+                        start_angle=0.5 * math.pi,
+                        end_angle=0.0,
+                        num_segments=self.turn_smoothing_segments,
+                    )
+                )
+                points.append((0.0, -turn_radius))
+                if bottom_y < -turn_radius:
+                    points.append((0.0, bottom_y))
+                return points
+
+            if start_name == "right" and end_name == "top":
+                points.append((right_x, 0.0))
+                if right_x > turn_radius:
+                    points.append((turn_radius, 0.0))
+                points.extend(
+                    self._arc_interior_points(
+                        center_x=turn_radius,
+                        center_y=turn_radius,
+                        radius=turn_radius,
+                        start_angle=-0.5 * math.pi,
+                        end_angle=-math.pi,
+                        num_segments=self.turn_smoothing_segments,
+                    )
+                )
+                points.append((0.0, turn_radius))
+                if top_y > turn_radius:
+                    points.append((0.0, top_y))
+                return points
+
+            if start_name == "right" and end_name == "bottom":
+                points.append((right_x, 0.0))
+                if right_x > turn_radius:
+                    points.append((turn_radius, 0.0))
+                points.extend(
+                    self._arc_interior_points(
+                        center_x=turn_radius,
+                        center_y=-turn_radius,
+                        radius=turn_radius,
+                        start_angle=0.5 * math.pi,
+                        end_angle=math.pi,
+                        num_segments=self.turn_smoothing_segments,
+                    )
+                )
+                points.append((0.0, -turn_radius))
+                if bottom_y < -turn_radius:
+                    points.append((0.0, bottom_y))
+                return points
+
+            if start_name == "bottom" and end_name == "left":
+                points.append((0.0, bottom_y))
+                if bottom_y < -turn_radius:
+                    points.append((0.0, -turn_radius))
+                points.extend(
+                    self._arc_interior_points(
+                        center_x=-turn_radius,
+                        center_y=-turn_radius,
+                        radius=turn_radius,
+                        start_angle=0.0,
+                        end_angle=0.5 * math.pi,
+                        num_segments=self.turn_smoothing_segments,
+                    )
+                )
+                points.append((-turn_radius, 0.0))
+                if left_x < -turn_radius:
+                    points.append((left_x, 0.0))
+                return points
+
+            if start_name == "bottom" and end_name == "right":
+                points.append((0.0, bottom_y))
+                if bottom_y < -turn_radius:
+                    points.append((0.0, -turn_radius))
+                points.extend(
+                    self._arc_interior_points(
+                        center_x=turn_radius,
+                        center_y=-turn_radius,
+                        radius=turn_radius,
+                        start_angle=math.pi,
+                        end_angle=0.5 * math.pi,
+                        num_segments=self.turn_smoothing_segments,
+                    )
+                )
+                points.append((turn_radius, 0.0))
+                if right_x > turn_radius:
+                    points.append((right_x, 0.0))
+                return points
+
+            if start_name == "top" and end_name == "left":
+                points.append((0.0, top_y))
+                if top_y > turn_radius:
+                    points.append((0.0, turn_radius))
+                points.extend(
+                    self._arc_interior_points(
+                        center_x=-turn_radius,
+                        center_y=turn_radius,
+                        radius=turn_radius,
+                        start_angle=0.0,
+                        end_angle=-0.5 * math.pi,
+                        num_segments=self.turn_smoothing_segments,
+                    )
+                )
+                points.append((-turn_radius, 0.0))
+                if left_x < -turn_radius:
+                    points.append((left_x, 0.0))
+                return points
+
+            if start_name == "top" and end_name == "right":
+                points.append((0.0, top_y))
+                if top_y > turn_radius:
+                    points.append((0.0, turn_radius))
+                points.extend(
+                    self._arc_interior_points(
+                        center_x=turn_radius,
+                        center_y=turn_radius,
+                        radius=turn_radius,
+                        start_angle=math.pi,
+                        end_angle=1.5 * math.pi,
+                        num_segments=self.turn_smoothing_segments,
+                    )
+                )
+                points.append((turn_radius, 0.0))
+                if right_x > turn_radius:
+                    points.append((right_x, 0.0))
+                return points
+
+            return [terminal_points[start_name], (0.0, 0.0), terminal_points[end_name]]
+
+        paths: List[PathSpec] = []
+        region_pairs: List[RegionPairSpec] = []
+        for start_name, end_name in selected_pairs:
+            path_points = _build_turn_path(start_name, end_name)
+
+            path_index = len(paths)
+            paths.append(PathSpec(points=path_points))
+            region_pairs.append(
+                RegionPairSpec(
+                    spawn_region=terminal_regions[start_name],
+                    destination_region=terminal_regions[end_name],
+                    startup_agent_count=terminal_counts[start_name],
+                    path_index=path_index,
+                    velocity_range=self.spawn_velocity_range,
+                )
+            )
+
+        return Scene(
+            agents=[],
+            obstacles=[
+                upper_left_wall,
+                upper_right_wall,
+                lower_left_wall,
+                lower_right_wall,
+                top_stem_left_wall,
+                top_stem_right_wall,
+                bottom_stem_left_wall,
+                bottom_stem_right_wall,
+            ],
+            paths=paths,
+            region_pairs=region_pairs,
+        )
