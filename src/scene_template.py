@@ -13,6 +13,10 @@ class SceneTemplate(ABC):
     """Base class for scene templates that generate a list of scenes."""
 
     @abstractmethod
+    def get_name(self) -> str:
+        """Return a stable template name for logging and file naming."""
+
+    @abstractmethod
     def generate(self, num_levels: int) -> List[Scene]:
         """Generate a list of scenes for the requested number of levels."""
 
@@ -226,6 +230,10 @@ class StraightCorridorTemplate(SceneTemplate):
 
         return scenes
 
+    def get_name(self) -> str:
+        """Return the template name."""
+        return "straight_corridor"
+
     def _build_scene(self, width: float, length: float, spawn_density: float) -> Scene:
         half_width = 0.5 * width
         wall_t = self.wall_thickness
@@ -400,6 +408,10 @@ class LShapeCorridorTemplate(SceneTemplate):
             )
 
         return scenes
+
+    def get_name(self) -> str:
+        """Return the template name."""
+        return "l_shape_corridor"
 
     def _build_scene(
         self,
@@ -647,6 +659,10 @@ class TShapeCorridorTemplate(SceneTemplate):
             )
 
         return scenes
+
+    def get_name(self) -> str:
+        """Return the template name."""
+        return "t_shape_corridor"
 
     def _build_scene(
         self,
@@ -1002,6 +1018,10 @@ class CrossShapeCorridorTemplate(SceneTemplate):
             )
 
         return scenes
+
+    def get_name(self) -> str:
+        """Return the template name."""
+        return "cross_shape_corridor"
 
     def _build_scene(
         self,

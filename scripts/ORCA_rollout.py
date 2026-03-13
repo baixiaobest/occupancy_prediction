@@ -6,6 +6,7 @@ from typing import List, Tuple
 import numpy as np
 import os
 import sys
+import torch
 
 # Ensure project root is on sys.path so `from src...` works when running this script
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -13,13 +14,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from src.scene import ObstacleSpec, PathSpec
 from src.ORCASim import ORCASim
 from src.occupancy2d import Occupancy2d
+from src.rollout_data import RollOutData
 from src.rollout_setting import RollOutSetting
 from src.templates import default_templates
-
-
-OCC_RESOLUTION = 0.1
-OCC_MARGIN = 0.2
-OCC_AGENT_RADIUS = 0.2
 
 
 # RollOutSetting is defined in src.rollout_setting
@@ -35,7 +32,7 @@ def build_occupancy_maps(
     agent_radius: float,
     occupancy_length: float | None = None,
     occupancy_width: float | None = None,
-) -> Tuple[List[List[np.ndarray]], List[np.ndarray], Tuple[float, float]]:
+) -> Tuple[List[List[torch.Tensor]], List[np.ndarray], Tuple[float, float]]:
     """Build per-timestep occupancy grids from rollout trajectory and static obstacles.
 
     Args:
@@ -93,7 +90,7 @@ def build_occupancy_maps(
         if centers_arr.ndim != 2 or centers_arr.shape[1] != 2:
             raise ValueError("ego_centers must have shape (K, 2)")
 
-    all_grids: List[List[np.ndarray]] = []
+    all_grids: List[List[torch.Tensor]] = []
     origins: List[np.ndarray] = []
 
     for center_xy in centers_arr:
@@ -122,7 +119,7 @@ def build_occupancy_maps(
             static_obstacles=shifted_obstacles,
             agent_radius=agent_radius,
         )
-        all_grids.append([grid.cpu().numpy() for grid in occ2d.generate()])
+        all_grids.append(occ2d.generate())
         origins.append(origin)
 
     return all_grids, origins, (resolution, resolution)
@@ -289,17 +286,23 @@ def animate_rollout(
 def main() -> None:
     """Run an ORCA rollout with optional animation and occupancy-map generation."""
     parser = argparse.ArgumentParser(description="Run an ORCA pedestrian rollout.")
-    parser.add_argument("--steps", type=int, default=150, help="Number of steps.")
-    parser.add_argument("--dt", type=float, default=0.1, help="Simulation time step.")
     parser.add_argument(
         "--animate",
         action="store_true",
         help="Display a matplotlib animation of the agents.",
     )
-
     args = parser.parse_args()
+
+    SAVE_ROLLOUTS = True
+    DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+    if SAVE_ROLLOUTS:
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+    ANIMATE = False
+
     # ORCASim configuration constants
-    TIME_STEP = args.dt
+    TIME_STEP = 0.1
+    NUM_STEPS = 150
     NEIGHBOR_DIST = 3.0
     MAX_NEIGHBORS = 5
     TIME_HORIZON = 3.0
@@ -313,6 +316,11 @@ def main() -> None:
     PREF_VELOCITY_NOISE_INTERVAL = 3
     PREF_VELOCITY_NOISE_SEED = 0
 
+    # Occupancy settings
+    OCC_RESOLUTION = 0.1
+    OCC_MARGIN = 0.2
+    OCC_AGENT_RADIUS = 0.2
+
     # premade templates are provided by `src.templates.default_templates()`
     rollout_setting = RollOutSetting(
         templates=default_templates(),
@@ -323,8 +331,13 @@ def main() -> None:
 
     global_scene_index = 0
     for tpl in rollout_setting.templates:
+        template_name = tpl.get_name()
+        template_rollouts: List[RollOutData] = []
         scenes = tpl.generate(num_levels=5)
-        print(f"generated {len(scenes)} scenes from {tpl.__class__.__name__}")
+        print(
+            f"generated {len(scenes)} scenes from {tpl.__class__.__name__} "
+            f"(name={template_name})"
+        )
 
         for local_idx, scene in enumerate(scenes):
             scene_index = global_scene_index
@@ -345,7 +358,7 @@ def main() -> None:
                 pref_velocity_noise_interval=PREF_VELOCITY_NOISE_INTERVAL,
                 pref_velocity_noise_seed=PREF_VELOCITY_NOISE_SEED + scene_index,
             )
-            traj = orca_sim.simulate(steps=args.steps, stop_on_goal=True)
+            traj = orca_sim.simulate(steps=NUM_STEPS, stop_on_goal=True)
             goals = np.array([agent.goal for agent in scene.agents], dtype=np.float32)
             occupancy_grids, occupancy_origin, occupancy_resolution = build_occupancy_maps(
                 traj=traj,
@@ -359,19 +372,35 @@ def main() -> None:
                 occupancy_length=10.0,
             )
 
+            if SAVE_ROLLOUTS:
+                rollout_data = RollOutData(
+                    occupancy_grids=occupancy_grids,
+                    dt=TIME_STEP,
+                )
+                template_rollouts.append(rollout_data)
+                print(
+                    f"scene[{scene_index}] queued rollout data for template "
+                    f"{template_name}"
+                )
+
             print(
                 f"scene[{scene_index}] startup spawn: total agents={traj.shape[1]}, "
                 f"steps={traj.shape[0]}"
             )
-
+            
             title_prefix = f"{tpl.__class__.__name__} {local_idx + 1}/{len(scenes)}"
-            if args.animate:
+            if ANIMATE:
+                occupancy_grids_np = [
+                [grid.detach().cpu().numpy() for grid in per_center_grids]
+                for per_center_grids in occupancy_grids
+                ]
+
                 animate_rollout(
                     traj=traj,
                     goals=goals,
                     obstacles=scene.obstacles,
                     paths=scene.paths,
-                    occupancy_grids=occupancy_grids,
+                    occupancy_grids=occupancy_grids_np,
                     occupancy_origins=occupancy_origin,
                     occupancy_resolution=occupancy_resolution,
                     time_step=TIME_STEP,
@@ -390,6 +419,14 @@ def main() -> None:
                 )
 
             global_scene_index += 1
+
+        if SAVE_ROLLOUTS:
+            data_path = os.path.join(DATA_DIR, f"rollout_{template_name}.pt")
+            torch.save(template_rollouts, data_path)
+            print(
+                f"saved template rollout data: {data_path} "
+                f"({len(template_rollouts)} scenes)"
+            )
 
 
 if __name__ == "__main__":

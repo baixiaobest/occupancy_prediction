@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List
 
 from src.scene_template import (
+    SceneTemplate,
     StraightCorridorTemplate,
     LShapeCorridorTemplate,
     TShapeCorridorTemplate,
@@ -10,7 +11,7 @@ from src.scene_template import (
 )
 
 
-def default_templates() -> List[object]:
+def default_templates() -> List[SceneTemplate]:
     """Return a list of premade scene-template instances used for rollouts.
 
     These mirror the templates previously embedded in the rollout script.
