@@ -200,19 +200,45 @@ def main() -> None:
         action="store_true",
         help="Display a matplotlib animation of the agents.",
     )
+
     args = parser.parse_args()
+    # ORCASim configuration constants
+    TIME_STEP = args.dt
+    NEIGHBOR_DIST = 5.0
+    MAX_NEIGHBORS = 10
+    TIME_HORIZON = 5.0
+    TIME_HORIZON_OBST = 5.0
+    RADIUS = 0.3
+    MAX_SPEED = 5.0
+    GOAL_TOLERANCE = 0.2
+    PATH_GOAL_SWITCH_TOLERANCE = 0.5
+    PATH_SEGMENT_REMAINING_SWITCH_RATIO = 0.05
+
     template = StraightCorridorTemplate(
-        width_range=(3.0, 6.0),
-        length_range=(8.0, 15.0),
-        spawn_density_range=(1.0, 1.0),
+        width_range=(3.0, 10.0),
+        length_range=(8.0, 20.0),
+        spawn_density_range=(0.5, 0.2),
         spawn_velocity_range=(0.8, 2.6),
-        num_region_pairs=1,
+        num_region_pairs=2,
     )
     scenes = template.generate(num_levels=4)
     print(f"generated {len(scenes)} scenes from StraightCorridorTemplate")
 
     for scene_index, scene in enumerate(scenes):
-        orca_sim = ORCASim(scene=scene, time_step=args.dt, region_pair_seed=scene_index)
+        orca_sim = ORCASim(
+            scene=scene,
+            time_step=TIME_STEP,
+            neighbor_dist=NEIGHBOR_DIST,
+            max_neighbors=MAX_NEIGHBORS,
+            time_horizon=TIME_HORIZON,
+            time_horizon_obst=TIME_HORIZON_OBST,
+            radius=RADIUS,
+            max_speed=MAX_SPEED,
+            goal_tolerance=GOAL_TOLERANCE,
+            path_goal_switch_tolerance=PATH_GOAL_SWITCH_TOLERANCE,
+            path_segment_remaining_switch_ratio=PATH_SEGMENT_REMAINING_SWITCH_RATIO,
+            region_pair_seed=scene_index,
+        )
         traj = orca_sim.simulate(steps=args.steps, stop_on_goal=True)
         goals = np.array([agent.goal for agent in scene.agents], dtype=np.float32)
         occupancy_grids, occupancy_origin, occupancy_resolution = build_occupancy_maps(
@@ -237,7 +263,7 @@ def main() -> None:
                 occupancy_grids=occupancy_grids,
                 occupancy_origin=occupancy_origin,
                 occupancy_resolution=occupancy_resolution,
-                time_step=args.dt,
+                time_step=TIME_STEP,
                 title_prefix=f"Scene {scene_index + 1}/{len(scenes)}",
             )
         else:
