@@ -17,6 +17,7 @@ from src.scene_template import (
     StraightCorridorTemplate,
     LShapeCorridorTemplate,
     TShapeCorridorTemplate,
+    CrossShapeCorridorTemplate,
 )
 
 
@@ -211,7 +212,7 @@ def animate_rollout(
 def main() -> None:
     """Run an ORCA rollout with optional animation and occupancy-map generation."""
     parser = argparse.ArgumentParser(description="Run an ORCA pedestrian rollout.")
-    parser.add_argument("--steps", type=int, default=400, help="Number of steps.")
+    parser.add_argument("--steps", type=int, default=150, help="Number of steps.")
     parser.add_argument("--dt", type=float, default=0.1, help="Simulation time step.")
     parser.add_argument(
         "--animate",
@@ -223,18 +224,25 @@ def main() -> None:
     # ORCASim configuration constants
     TIME_STEP = args.dt
     NEIGHBOR_DIST = 3.0
-    MAX_NEIGHBORS = 10
-    TIME_HORIZON = 5.0
+    MAX_NEIGHBORS = 5
+    TIME_HORIZON = 3.0
     TIME_HORIZON_OBST = 5.0
     RADIUS = 0.3
     MAX_SPEED = 5.0
     GOAL_TOLERANCE = 0.2
     PATH_GOAL_SWITCH_TOLERANCE = 3.0
     PATH_SEGMENT_REMAINING_SWITCH_RATIO = 0.05
-    PREF_VELOCITY_NOISE_STD = 0.08
+    PREF_VELOCITY_NOISE_STD = 0.02
     PREF_VELOCITY_NOISE_INTERVAL = 3
     PREF_VELOCITY_NOISE_SEED = 0
 
+    straight_template = StraightCorridorTemplate(
+        width_range=(3.0, 10.0),
+        length_range=(8.0, 20.0),
+        spawn_density_range=(0.3, 0.2),
+        spawn_velocity_range=(0.8, 2.6),
+        num_region_pairs=2,
+    )
     l_template = LShapeCorridorTemplate(
         width_range=(3.0, 10.0),
         horizontal_length_range=(8.0, 20.0),
@@ -244,7 +252,7 @@ def main() -> None:
         turn_radius_ratio=1.2,
         num_region_pairs=2,
     )
-    template = TShapeCorridorTemplate(
+    t_template = TShapeCorridorTemplate(
         width_range=(3.0, 10.0),
         horizontal_length_range=(8.0, 20.0),
         vertical_length_range=(8.0, 20.0),
@@ -254,6 +262,17 @@ def main() -> None:
         turn_radius_ratio=1.2,
         num_enabled_start_regions=3,
     )
+    cross_template = CrossShapeCorridorTemplate(
+        width_range=(3.0, 10.0),
+        horizontal_length_range=(8.0, 20.0),
+        vertical_length_range=(8.0, 20.0),
+        spawn_density_range=(0.1, 0.1),
+        spawn_velocity_range=(0.8, 2.6),
+        spawn_depth_ratio=0.3,
+        turn_radius_ratio=1.2,
+        num_enabled_start_regions=4,
+    )
+    template = straight_template
     scenes = template.generate(num_levels=5)
     print(f"generated {len(scenes)} scenes from {template.__class__.__name__}")
 
