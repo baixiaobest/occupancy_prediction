@@ -54,3 +54,4 @@ class Scene:
     obstacles: List[ObstacleSpec]
     paths: List[PathSpec] = field(default_factory=list)
     region_pairs: List[RegionPairSpec] = field(default_factory=list)
+    ego_centers: List[Tuple[float, float]] = field(default_factory=list)

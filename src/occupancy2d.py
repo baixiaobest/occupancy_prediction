@@ -107,9 +107,20 @@ class Occupancy2d:
 		cells_y, cells_x = grid.shape
 		resolution = self.resolution.to(device=grid.device, dtype=torch.float32)
 		grid_min = (self.center - self.size * 0.5).to(device=grid.device, dtype=torch.float32)
+		grid_max = grid_min + torch.tensor(
+			[cells_x, cells_y], device=grid.device, dtype=torch.float32
+		) * resolution
 
 		min_xy = center_xy - half_size_xy
 		max_xy = center_xy + half_size_xy
+
+		if (
+			max_xy[0] <= grid_min[0]
+			or min_xy[0] >= grid_max[0]
+			or max_xy[1] <= grid_min[1]
+			or min_xy[1] >= grid_max[1]
+		):
+			return
 
 		min_idx = torch.floor((min_xy - grid_min) / resolution).to(dtype=torch.long)
 		max_idx = torch.floor((max_xy - grid_min) / resolution).to(dtype=torch.long)

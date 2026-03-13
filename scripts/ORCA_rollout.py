@@ -29,19 +29,20 @@ def build_occupancy_maps(
     traj: np.ndarray,
     goals: np.ndarray,
     obstacles: List[ObstacleSpec],
+    ego_centers: List[Tuple[float, float]] | np.ndarray,
     resolution: float,
     margin: float,
     agent_radius: float,
     occupancy_length: float | None = None,
     occupancy_width: float | None = None,
-    occupancy_center: Tuple[float, float] | np.ndarray | None = None,
-) -> Tuple[List[np.ndarray], np.ndarray, Tuple[float, float]]:
+) -> Tuple[List[List[np.ndarray]], List[np.ndarray], Tuple[float, float]]:
     """Build per-timestep occupancy grids from rollout trajectory and static obstacles.
 
     Args:
         traj: Rollout trajectory with shape (T, N, 2).
         goals: Goal positions with shape (N, 2).
         obstacles: Static polygon obstacles.
+        ego_centers: List of world-frame `(x, y)` centers used to build occupancy maps.
         resolution: Occupancy grid resolution in meters per cell.
         margin: Padding applied to automatic sizing bounds.
         agent_radius: Agent rasterization radius.
@@ -49,12 +50,11 @@ def build_occupancy_maps(
             x-size is derived from trajectory/goals/obstacles bounds plus margin.
         occupancy_width: Optional map width along the y-axis. If omitted,
             y-size is derived from trajectory/goals/obstacles bounds plus margin.
-        occupancy_center: Optional map center `(x, y)` in world coordinates. If
-            omitted, map placement follows current automatic logic.
 
     Returns:
-        A tuple `(grids, origin, resolution_xy)` where `origin` maps grid coordinates
-        back to world coordinates.
+        A tuple `(all_grids, origins, resolution_xy)` where each entry in
+        `all_grids` is a per-timestep occupancy sequence centered at the matching
+        entry in `origins`.
     """
     min_xy = traj.min(axis=(0, 1))
     max_xy = traj.max(axis=(0, 1))
@@ -77,48 +77,55 @@ def build_occupancy_maps(
     if occupancy_width is not None and occupancy_width <= 0:
         raise ValueError("occupancy_width must be positive when provided")
 
-    center_override: np.ndarray | None = None
-    if occupancy_center is not None:
-        center_arr = np.asarray(occupancy_center, dtype=np.float32)
-        if center_arr.shape != (2,):
-            raise ValueError("occupancy_center must contain exactly two values (x, y)")
-        center_override = center_arr
-
     center = 0.5 * (min_xy + max_xy)
     size = auto_size.copy()
-    origin = auto_origin.copy()
 
     if occupancy_length is not None:
         size[0] = float(occupancy_length)
-        origin[0] = float(center[0] - 0.5 * size[0])
 
     if occupancy_width is not None:
         size[1] = float(occupancy_width)
-        origin[1] = float(center[1] - 0.5 * size[1])
 
-    if center_override is not None:
-        origin[0] = float(center_override[0] - 0.5 * size[0])
-        origin[1] = float(center_override[1] - 0.5 * size[1])
+    centers_arr = np.asarray(ego_centers, dtype=np.float32)
+    if centers_arr.size == 0:
+        centers_arr = center.reshape(1, 2)
+    else:
+        if centers_arr.ndim != 2 or centers_arr.shape[1] != 2:
+            raise ValueError("ego_centers must have shape (K, 2)")
 
-    shifted_traj = traj - origin[None, None, :]
-    shifted_obstacles: List[List[Tuple[float, float]]] = []
-    for obstacle in obstacles:
-        shifted_obstacles.append(
+    all_grids: List[List[np.ndarray]] = []
+    origins: List[np.ndarray] = []
+
+    for center_xy in centers_arr:
+        origin = np.array(
             [
-                (float(vx - origin[0]), float(vy - origin[1]))
-                for vx, vy in obstacle.vertices
-            ]
+                float(center_xy[0] - 0.5 * size[0]),
+                float(center_xy[1] - 0.5 * size[1]),
+            ],
+            dtype=np.float32,
         )
 
-    occ2d = Occupancy2d(
-        resolution=(resolution, resolution),
-        size=(float(size[0]), float(size[1])),
-        trajectory=shifted_traj,
-        static_obstacles=shifted_obstacles,
-        agent_radius=agent_radius,
-    )
-    grids = [grid.cpu().numpy() for grid in occ2d.generate()]
-    return grids, origin, (resolution, resolution)
+        shifted_traj = traj - origin[None, None, :]
+        shifted_obstacles: List[List[Tuple[float, float]]] = []
+        for obstacle in obstacles:
+            shifted_obstacles.append(
+                [
+                    (float(vx - origin[0]), float(vy - origin[1]))
+                    for vx, vy in obstacle.vertices
+                ]
+            )
+
+        occ2d = Occupancy2d(
+            resolution=(resolution, resolution),
+            size=(float(size[0]), float(size[1])),
+            trajectory=shifted_traj,
+            static_obstacles=shifted_obstacles,
+            agent_radius=agent_radius,
+        )
+        all_grids.append([grid.cpu().numpy() for grid in occ2d.generate()])
+        origins.append(origin)
+
+    return all_grids, origins, (resolution, resolution)
 
 
 def animate_rollout(
@@ -126,13 +133,13 @@ def animate_rollout(
     goals: np.ndarray,
     obstacles: List[ObstacleSpec],
     paths: List[PathSpec],
-    occupancy_grids: List[np.ndarray],
-    occupancy_origin: np.ndarray,
+    occupancy_grids: List[List[np.ndarray]],
+    occupancy_origins: List[np.ndarray],
     occupancy_resolution: Tuple[float, float],
     time_step: float,
     title_prefix: str = "",
 ) -> None:
-    """Animate trajectory and occupancy map in two synchronized matplotlib windows."""
+    """Animate trajectory and all occupancy maps in synchronized matplotlib windows."""
     import importlib
 
     plt = importlib.import_module("matplotlib.pyplot")
@@ -200,39 +207,65 @@ def animate_rollout(
     ax_traj.scatter(goals[:, 0], goals[:, 1], s=80, c="tab:red", marker="x")
     traj_time_text = ax_traj.text(0.02, 0.98, "", transform=ax_traj.transAxes, va="top")
 
-    fig_occ, ax_occ = plt.subplots(figsize=(6, 6))
-    ax_occ.set_title(occ_title)
-    ax_occ.set_xlabel("X")
-    ax_occ.set_ylabel("Y")
-    ax_occ.set_aspect("equal", adjustable="box")
+    num_occ_maps = len(occupancy_grids)
+    if num_occ_maps == 0:
+        raise ValueError("occupancy_grids must contain at least one occupancy map")
 
-    first_grid = occupancy_grids[0]
-    cells_y, cells_x = first_grid.shape
+    occ_cols = int(np.ceil(np.sqrt(num_occ_maps)))
+    occ_rows = int(np.ceil(num_occ_maps / occ_cols))
+    fig_occ, axes_occ = plt.subplots(
+        occ_rows,
+        occ_cols,
+        figsize=(4.0 * occ_cols, 4.0 * occ_rows),
+        squeeze=False,
+    )
+    fig_occ.suptitle(occ_title)
+
+    flat_axes = axes_occ.flatten()
+    occ_images = []
+    occ_time_texts = []
     res_x, res_y = occupancy_resolution
-    extent = (
-        float(occupancy_origin[0]),
-        float(occupancy_origin[0] + cells_x * res_x),
-        float(occupancy_origin[1]),
-        float(occupancy_origin[1] + cells_y * res_y),
-    )
-    im = ax_occ.imshow(
-        first_grid,
-        origin="lower",
-        cmap="gray_r",
-        vmin=0,
-        vmax=1,
-        extent=extent,
-        interpolation="nearest",
-    )
-    fig_occ.colorbar(im, ax=ax_occ, fraction=0.046, pad=0.04)
-    occ_time_text = ax_occ.text(0.02, 0.98, "", transform=ax_occ.transAxes, va="top")
+
+    for occ_idx in range(num_occ_maps):
+        ax_occ = flat_axes[occ_idx]
+        first_grid = occupancy_grids[occ_idx][0]
+        cells_y, cells_x = first_grid.shape
+        origin = occupancy_origins[occ_idx]
+        extent = (
+            float(origin[0]),
+            float(origin[0] + cells_x * res_x),
+            float(origin[1]),
+            float(origin[1] + cells_y * res_y),
+        )
+        im = ax_occ.imshow(
+            first_grid,
+            origin="lower",
+            cmap="gray_r",
+            vmin=0,
+            vmax=1,
+            extent=extent,
+            interpolation="nearest",
+        )
+        ax_occ.set_title(f"Occ #{occ_idx}")
+        ax_occ.set_xlabel("X")
+        ax_occ.set_ylabel("Y")
+        ax_occ.set_aspect("equal", adjustable="box")
+        time_text = ax_occ.text(0.02, 0.98, "", transform=ax_occ.transAxes, va="top")
+        occ_images.append(im)
+        occ_time_texts.append(time_text)
+
+    for ax_occ in flat_axes[num_occ_maps:]:
+        ax_occ.axis("off")
 
     def update(frame: int):
         scat.set_offsets(traj[frame])
         traj_time_text.set_text(f"t={frame * time_step:.2f}s")
-        im.set_data(occupancy_grids[frame])
-        occ_time_text.set_text(f"t={frame * time_step:.2f}s")
-        return scat, traj_time_text, im, occ_time_text
+        artists = [scat, traj_time_text]
+        for occ_idx, (im, time_text) in enumerate(zip(occ_images, occ_time_texts)):
+            im.set_data(occupancy_grids[occ_idx][frame])
+            time_text.set_text(f"t={frame * time_step:.2f}s")
+            artists.extend([im, time_text])
+        return tuple(artists)
 
     anim_traj = FuncAnimation(
         fig_traj,
@@ -318,10 +351,10 @@ def main() -> None:
                 traj=traj,
                 goals=goals,
                 obstacles=scene.obstacles,
+                ego_centers=scene.ego_centers,
                 resolution=OCC_RESOLUTION,
                 margin=OCC_MARGIN,
                 agent_radius=OCC_AGENT_RADIUS,
-                occupancy_center=(0.0, 0.0),
                 occupancy_width=10.0,
                 occupancy_length=10.0,
             )
@@ -339,7 +372,7 @@ def main() -> None:
                     obstacles=scene.obstacles,
                     paths=scene.paths,
                     occupancy_grids=occupancy_grids,
-                    occupancy_origin=occupancy_origin,
+                    occupancy_origins=occupancy_origin,
                     occupancy_resolution=occupancy_resolution,
                     time_step=TIME_STEP,
                     title_prefix=title_prefix,
@@ -351,8 +384,9 @@ def main() -> None:
                         f"({pos[0]:.2f}, {pos[1]:.2f})"
                     )
                 print(
-                    f"scene[{scene_index}] occupancy generated: {len(occupancy_grids)} frames, "
-                    f"grid shape {occupancy_grids[0].shape}"
+                    f"scene[{scene_index}] occupancy generated: {len(occupancy_grids)} maps, "
+                    f"{len(occupancy_grids[0])} frames each, "
+                    f"grid shape {occupancy_grids[0][0].shape}"
                 )
 
             global_scene_index += 1

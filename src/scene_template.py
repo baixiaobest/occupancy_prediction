@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 import math
 from typing import List, Tuple
 
+import numpy as np
+
 from src.scene import ObstacleSpec, PathSpec, RegionPairSpec, RegionSpec, Scene
 
 
@@ -80,6 +82,75 @@ class SceneTemplate(ABC):
             )
         return points
 
+    @staticmethod
+    def _sample_points_on_polyline(
+        polyline: List[Tuple[float, float]], spacing: float
+    ) -> List[Tuple[float, float]]:
+        """Sample points along a polyline with approximately uniform spacing."""
+        if not polyline:
+            return []
+        if len(polyline) == 1:
+            return [polyline[0]]
+        if spacing <= 0.0:
+            raise ValueError("spacing must be > 0")
+
+        sampled: List[Tuple[float, float]] = [polyline[0]]
+        next_target = spacing
+        traversed = 0.0
+
+        for idx in range(len(polyline) - 1):
+            x0, y0 = polyline[idx]
+            x1, y1 = polyline[idx + 1]
+            dx = x1 - x0
+            dy = y1 - y0
+            seg_len = math.hypot(dx, dy)
+            if seg_len <= 1e-9:
+                continue
+
+            while next_target <= traversed + seg_len + 1e-9:
+                alpha = (next_target - traversed) / seg_len
+                sampled.append((float(x0 + alpha * dx), float(y0 + alpha * dy)))
+                next_target += spacing
+
+            traversed += seg_len
+
+        end_point = polyline[-1]
+        if math.hypot(sampled[-1][0] - end_point[0], sampled[-1][1] - end_point[1]) > 1e-6:
+            sampled.append(end_point)
+
+        return sampled
+
+    @staticmethod
+    def _merge_unique_points(
+        points: List[Tuple[float, float]], precision: int = 6
+    ) -> List[Tuple[float, float]]:
+        """Merge duplicate points while preserving insertion order."""
+        merged: List[Tuple[float, float]] = []
+        seen: set[Tuple[float, float]] = set()
+        for x, y in points:
+            key = (round(float(x), precision), round(float(y), precision))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((float(x), float(y)))
+        return merged
+
+    @staticmethod
+    def _jitter_points(
+        points: List[Tuple[float, float]],
+        noise_std: float,
+        rng: np.random.Generator,
+    ) -> List[Tuple[float, float]]:
+        """Apply Gaussian XY jitter to points."""
+        if noise_std <= 0.0:
+            return list(points)
+
+        jittered: List[Tuple[float, float]] = []
+        for x, y in points:
+            noise = rng.normal(loc=0.0, scale=noise_std, size=2)
+            jittered.append((float(x + noise[0]), float(y + noise[1])))
+        return jittered
+
 
 class StraightCorridorTemplate(SceneTemplate):
     """Template for straight-corridor scenes with one-way or opposing traffic.
@@ -98,6 +169,9 @@ class StraightCorridorTemplate(SceneTemplate):
         spawn_depth_ratio: float = 0.15,
         spawn_width_ratio: float = 0.8,
         wall_thickness: float = 0.4,
+        ego_center_spacing: float = 1.0,
+        ego_center_noise_std: float = 0.1,
+        ego_center_noise_seed: int | None = 0,
     ) -> None:
         if num_region_pairs not in (1, 2):
             raise ValueError("num_region_pairs must be 1 or 2")
@@ -111,6 +185,10 @@ class StraightCorridorTemplate(SceneTemplate):
             raise ValueError("spawn_width_ratio must be in (0, 1]")
         if wall_thickness <= 0.0:
             raise ValueError("wall_thickness must be > 0")
+        if ego_center_spacing <= 0.0:
+            raise ValueError("ego_center_spacing must be > 0")
+        if ego_center_noise_std < 0.0:
+            raise ValueError("ego_center_noise_std must be >= 0")
 
         self.width_range = (float(width_range[0]), float(width_range[1]))
         self.length_range = (float(length_range[0]), float(length_range[1]))
@@ -126,6 +204,9 @@ class StraightCorridorTemplate(SceneTemplate):
         self.spawn_depth_ratio = float(spawn_depth_ratio)
         self.spawn_width_ratio = float(spawn_width_ratio)
         self.wall_thickness = float(wall_thickness)
+        self.ego_center_spacing = float(ego_center_spacing)
+        self.ego_center_noise_std = float(ego_center_noise_std)
+        self._ego_center_rng = np.random.default_rng(ego_center_noise_seed)
 
     def generate(self, num_levels: int) -> List[Scene]:
         """Generate `num_levels` straight-corridor scenes.
@@ -201,11 +282,22 @@ class StraightCorridorTemplate(SceneTemplate):
                 )
             )
 
+        ego_center_base = self._sample_points_on_polyline(
+            [(0.0, 0.0), (length, 0.0)],
+            spacing=self.ego_center_spacing,
+        )
+        ego_centers = self._jitter_points(
+            ego_center_base,
+            noise_std=self.ego_center_noise_std,
+            rng=self._ego_center_rng,
+        )
+
         return Scene(
             agents=[],
             obstacles=[bottom_wall, top_wall],
             paths=[],
             region_pairs=region_pairs,
+            ego_centers=ego_centers,
         )
 
 
@@ -229,6 +321,9 @@ class LShapeCorridorTemplate(SceneTemplate):
         wall_thickness: float = 0.4,
         turn_smoothing_segments: int = 6,
         turn_radius_ratio: float = 0.6,
+        ego_center_spacing: float = 1.0,
+        ego_center_noise_std: float = 0.05,
+        ego_center_noise_seed: int | None = 0,
     ) -> None:
         if num_region_pairs not in (1, 2):
             raise ValueError("num_region_pairs must be 1 or 2")
@@ -246,6 +341,10 @@ class LShapeCorridorTemplate(SceneTemplate):
             raise ValueError("turn_smoothing_segments must be >= 1")
         if turn_radius_ratio <= 0.0:
             raise ValueError("turn_radius_ratio must be > 0")
+        if ego_center_spacing <= 0.0:
+            raise ValueError("ego_center_spacing must be > 0")
+        if ego_center_noise_std < 0.0:
+            raise ValueError("ego_center_noise_std must be >= 0")
 
         self.width_range = (float(width_range[0]), float(width_range[1]))
         self.horizontal_length_range = (
@@ -270,6 +369,9 @@ class LShapeCorridorTemplate(SceneTemplate):
         self.wall_thickness = float(wall_thickness)
         self.turn_smoothing_segments = int(turn_smoothing_segments)
         self.turn_radius_ratio = float(turn_radius_ratio)
+        self.ego_center_spacing = float(ego_center_spacing)
+        self.ego_center_noise_std = float(ego_center_noise_std)
+        self._ego_center_rng = np.random.default_rng(ego_center_noise_seed)
 
     def generate(self, num_levels: int) -> List[Scene]:
         """Generate `num_levels` L-shaped corridor scenes.
@@ -421,6 +523,16 @@ class LShapeCorridorTemplate(SceneTemplate):
                 )
             )
 
+        ego_center_base = self._sample_points_on_polyline(
+            centerline_forward_points,
+            spacing=self.ego_center_spacing,
+        )
+        ego_centers = self._jitter_points(
+            ego_center_base,
+            noise_std=self.ego_center_noise_std,
+            rng=self._ego_center_rng,
+        )
+
         return Scene(
             agents=[],
             obstacles=[
@@ -431,6 +543,7 @@ class LShapeCorridorTemplate(SceneTemplate):
             ],
             paths=paths,
             region_pairs=region_pairs,
+            ego_centers=ego_centers,
         )
 
 
@@ -459,6 +572,9 @@ class TShapeCorridorTemplate(SceneTemplate):
         wall_thickness: float = 0.4,
         turn_smoothing_segments: int = 6,
         turn_radius_ratio: float = 0.6,
+        ego_center_spacing: float = 1.0,
+        ego_center_noise_std: float = 0.05,
+        ego_center_noise_seed: int | None = 0,
     ) -> None:
         if num_enabled_start_regions not in (1, 2, 3):
             raise ValueError("num_enabled_start_regions must be 1, 2, or 3")
@@ -476,6 +592,10 @@ class TShapeCorridorTemplate(SceneTemplate):
             raise ValueError("turn_smoothing_segments must be >= 1")
         if turn_radius_ratio <= 0.0:
             raise ValueError("turn_radius_ratio must be > 0")
+        if ego_center_spacing <= 0.0:
+            raise ValueError("ego_center_spacing must be > 0")
+        if ego_center_noise_std < 0.0:
+            raise ValueError("ego_center_noise_std must be >= 0")
 
         self.width_range = (float(width_range[0]), float(width_range[1]))
         self.horizontal_length_range = (
@@ -500,6 +620,9 @@ class TShapeCorridorTemplate(SceneTemplate):
         self.wall_thickness = float(wall_thickness)
         self.turn_smoothing_segments = int(turn_smoothing_segments)
         self.turn_radius_ratio = float(turn_radius_ratio)
+        self.ego_center_spacing = float(ego_center_spacing)
+        self.ego_center_noise_std = float(ego_center_noise_std)
+        self._ego_center_rng = np.random.default_rng(ego_center_noise_seed)
 
     def generate(self, num_levels: int) -> List[Scene]:
         """Generate `num_levels` T-shaped corridor scenes."""
@@ -748,6 +871,21 @@ class TShapeCorridorTemplate(SceneTemplate):
                 )
             )
 
+        horizontal_centers = self._sample_points_on_polyline(
+            [(left_x, 0.0), (right_x, 0.0)],
+            spacing=self.ego_center_spacing,
+        )
+        vertical_centers = self._sample_points_on_polyline(
+            [(0.0, bottom_y), (0.0, 0.0)],
+            spacing=self.ego_center_spacing,
+        )
+        ego_center_base = self._merge_unique_points(horizontal_centers + vertical_centers)
+        ego_centers = self._jitter_points(
+            ego_center_base,
+            noise_std=self.ego_center_noise_std,
+            rng=self._ego_center_rng,
+        )
+
         return Scene(
             agents=[],
             obstacles=[
@@ -759,6 +897,7 @@ class TShapeCorridorTemplate(SceneTemplate):
             ],
             paths=paths,
             region_pairs=region_pairs,
+            ego_centers=ego_centers,
         )
 
 
@@ -788,6 +927,9 @@ class CrossShapeCorridorTemplate(SceneTemplate):
         wall_thickness: float = 0.4,
         turn_smoothing_segments: int = 6,
         turn_radius_ratio: float = 0.6,
+        ego_center_spacing: float = 1.0,
+        ego_center_noise_std: float = 0.05,
+        ego_center_noise_seed: int | None = 0,
     ) -> None:
         if num_enabled_start_regions not in (1, 2, 3, 4):
             raise ValueError("num_enabled_start_regions must be 1, 2, 3, or 4")
@@ -805,6 +947,10 @@ class CrossShapeCorridorTemplate(SceneTemplate):
             raise ValueError("turn_smoothing_segments must be >= 1")
         if turn_radius_ratio <= 0.0:
             raise ValueError("turn_radius_ratio must be > 0")
+        if ego_center_spacing <= 0.0:
+            raise ValueError("ego_center_spacing must be > 0")
+        if ego_center_noise_std < 0.0:
+            raise ValueError("ego_center_noise_std must be >= 0")
 
         self.width_range = (float(width_range[0]), float(width_range[1]))
         self.horizontal_length_range = (
@@ -829,6 +975,9 @@ class CrossShapeCorridorTemplate(SceneTemplate):
         self.wall_thickness = float(wall_thickness)
         self.turn_smoothing_segments = int(turn_smoothing_segments)
         self.turn_radius_ratio = float(turn_radius_ratio)
+        self.ego_center_spacing = float(ego_center_spacing)
+        self.ego_center_noise_std = float(ego_center_noise_std)
+        self._ego_center_rng = np.random.default_rng(ego_center_noise_seed)
 
     def generate(self, num_levels: int) -> List[Scene]:
         """Generate `num_levels` cross-shaped corridor scenes."""
@@ -1183,6 +1332,21 @@ class CrossShapeCorridorTemplate(SceneTemplate):
                 )
             )
 
+        horizontal_centers = self._sample_points_on_polyline(
+            [(left_x, 0.0), (right_x, 0.0)],
+            spacing=self.ego_center_spacing,
+        )
+        vertical_centers = self._sample_points_on_polyline(
+            [(0.0, bottom_y), (0.0, top_y)],
+            spacing=self.ego_center_spacing,
+        )
+        ego_center_base = self._merge_unique_points(horizontal_centers + vertical_centers)
+        ego_centers = self._jitter_points(
+            ego_center_base,
+            noise_std=self.ego_center_noise_std,
+            rng=self._ego_center_rng,
+        )
+
         return Scene(
             agents=[],
             obstacles=[
@@ -1197,4 +1361,5 @@ class CrossShapeCorridorTemplate(SceneTemplate):
             ],
             paths=paths,
             region_pairs=region_pairs,
+            ego_centers=ego_centers,
         )

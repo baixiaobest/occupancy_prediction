@@ -20,6 +20,8 @@ def default_templates() -> List[object]:
         length_range=(8.0, 20.0),
         spawn_density_range=(0.3, 0.2),
         spawn_velocity_range=(0.8, 2.6),
+        ego_center_spacing=2.0,
+        ego_center_noise_std=0.1,
         num_region_pairs=2,
     )
     l_template = LShapeCorridorTemplate(
@@ -29,6 +31,8 @@ def default_templates() -> List[object]:
         spawn_density_range=(0.5, 0.2),
         spawn_velocity_range=(0.8, 2.6),
         turn_radius_ratio=1.2,
+        ego_center_spacing=2.0,
+        ego_center_noise_std=0.1,
         num_region_pairs=2,
     )
     t_template = TShapeCorridorTemplate(
@@ -39,6 +43,8 @@ def default_templates() -> List[object]:
         spawn_velocity_range=(0.8, 2.6),
         spawn_depth_ratio=0.3,
         turn_radius_ratio=1.2,
+        ego_center_spacing=2.0,
+        ego_center_noise_std=0.1,
         num_enabled_start_regions=3,
     )
     cross_template = CrossShapeCorridorTemplate(
@@ -49,6 +55,8 @@ def default_templates() -> List[object]:
         spawn_velocity_range=(0.8, 2.6),
         spawn_depth_ratio=0.3,
         turn_radius_ratio=1.2,
+        ego_center_spacing=2.0,
+        ego_center_noise_std=0.1,
         num_enabled_start_regions=4,
     )
 
