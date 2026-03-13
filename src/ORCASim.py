@@ -50,6 +50,7 @@ class ORCASim:
         """
         self.scene = scene
         self.time_step = time_step
+        self.max_speed = float(max_speed)
         self.goal_tolerance = goal_tolerance
         self.path_goal_switch_tolerance = path_goal_switch_tolerance
         self.path_segment_remaining_switch_ratio = path_segment_remaining_switch_ratio
@@ -62,6 +63,7 @@ class ORCASim:
             radius,
             max_speed,
         )
+        self.agent_desired_speeds: List[float] = []
         self._setup_obstacles()
         self.agent_ids = self._setup_agents()
         self._region_pairs_initialized = False
@@ -74,6 +76,7 @@ class ORCASim:
         for agent in self.scene.agents:
             agent_id = self.sim.addAgent(agent.position)
             ids.append(agent_id)
+            self.agent_desired_speeds.append(self.max_speed)
         return ids
 
     @staticmethod
@@ -85,6 +88,24 @@ class ORCASim:
         high = np.maximum(min_corner, max_corner)
         sample = rng.uniform(low=low, high=high)
         return float(sample[0]), float(sample[1])
+
+    def _sample_max_speed(
+        self,
+        velocity_range: tuple[float, float] | None,
+        rng: np.random.Generator,
+    ) -> float:
+        """Sample agent max speed from an optional range; fall back to simulator default."""
+        if velocity_range is None:
+            return self.max_speed
+
+        min_speed = float(velocity_range[0])
+        max_speed = float(velocity_range[1])
+        low = min(min_speed, max_speed)
+        high = max(min_speed, max_speed)
+        if low < 0.0:
+            raise ValueError("RegionPairSpec.velocity_range must be non-negative")
+
+        return float(rng.uniform(low=low, high=high))
 
     def _setup_obstacles(self) -> None:
         """Register polygon obstacles in ORCA and finalize obstacle processing."""
@@ -214,7 +235,9 @@ class ORCASim:
             pos = np.array(self.sim.getAgentPosition(agent_id), dtype=np.float32)
             goal = np.array(self.scene.agents[idx].goal, dtype=np.float32)
             path_index = getattr(self.scene.agents[idx], "path_index", None)
-            velocity = self._compute_preferred_direction(pos, goal, path_index)
+            direction = self._compute_preferred_direction(pos, goal, path_index)
+            desired_speed = self.agent_desired_speeds[idx]
+            velocity = direction * desired_speed
             self.sim.setAgentPrefVelocity(agent_id, (float(velocity[0]), float(velocity[1])))
 
     def _spawn_from_region_pair(self, pair, rng: np.random.Generator) -> int:
@@ -230,7 +253,11 @@ class ORCASim:
                 path_index=getattr(pair, "path_index", None),
             )
         )
-        return self.sim.addAgent(spawn_pos)
+        agent_id = self.sim.addAgent(spawn_pos)
+        sampled_speed = self._sample_max_speed(getattr(pair, "velocity_range", None), rng)
+        self.sim.setAgentMaxSpeed(agent_id, sampled_speed)
+        self.agent_desired_speeds.append(sampled_speed)
+        return agent_id
 
     def initialize_agents_from_region_pairs(self, seed: int | None = None) -> None:
         """Spawn startup agents from all configured region pairs.

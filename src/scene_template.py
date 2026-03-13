@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import math
 from typing import List, Tuple
 
-from src.scene import ObstacleSpec, PathSpec, RegionPairSpec, RegionSpec, Scene
+from src.scene import ObstacleSpec, RegionPairSpec, RegionSpec, Scene
 
 
 class SceneTemplate(ABC):
@@ -38,16 +39,19 @@ class StraightCorridorTemplate(SceneTemplate):
         self,
         width_range: Tuple[float, float],
         length_range: Tuple[float, float],
-        startup_agent_count_per_pair: int = 8,
+        spawn_density_range: Tuple[float, float] = (1.0, 1.0),
+        spawn_velocity_range: Tuple[float, float] = (1.5, 1.5),
         num_region_pairs: int = 1,
         spawn_depth_ratio: float = 0.15,
         spawn_width_ratio: float = 0.8,
         wall_thickness: float = 0.4,
     ) -> None:
-        if startup_agent_count_per_pair < 0:
-            raise ValueError("startup_agent_count_per_pair must be >= 0")
         if num_region_pairs not in (1, 2):
             raise ValueError("num_region_pairs must be 1 or 2")
+        if spawn_density_range[0] < 0.0 or spawn_density_range[1] < 0.0:
+            raise ValueError("spawn_density_range values must be >= 0")
+        if spawn_velocity_range[0] < 0.0 or spawn_velocity_range[1] < 0.0:
+            raise ValueError("spawn_velocity_range values must be >= 0")
         if not (0.0 < spawn_depth_ratio <= 0.5):
             raise ValueError("spawn_depth_ratio must be in (0, 0.5]")
         if not (0.0 < spawn_width_ratio <= 1.0):
@@ -57,7 +61,14 @@ class StraightCorridorTemplate(SceneTemplate):
 
         self.width_range = (float(width_range[0]), float(width_range[1]))
         self.length_range = (float(length_range[0]), float(length_range[1]))
-        self.startup_agent_count_per_pair = int(startup_agent_count_per_pair)
+        self.spawn_density_range = (
+            float(spawn_density_range[0]),
+            float(spawn_density_range[1]),
+        )
+        self.spawn_velocity_range = (
+            float(spawn_velocity_range[0]),
+            float(spawn_velocity_range[1]),
+        )
         self.num_region_pairs = int(num_region_pairs)
         self.spawn_depth_ratio = float(spawn_depth_ratio)
         self.spawn_width_ratio = float(spawn_width_ratio)
@@ -66,20 +77,22 @@ class StraightCorridorTemplate(SceneTemplate):
     def generate(self, num_levels: int) -> List[Scene]:
         """Generate `num_levels` straight-corridor scenes.
 
-        Level i uses linearly sampled width and length at the same interpolation ratio.
+        Level i uses linearly sampled width, length, and spawn density.
+        Spawn count per region pair is floor(density * spawn_area).
         """
         widths = self._linear_levels(self.width_range, num_levels)
         lengths = self._linear_levels(self.length_range, num_levels)
+        densities = self._linear_levels(self.spawn_density_range, num_levels)
 
         scenes: List[Scene] = []
-        for width, length in zip(widths, lengths):
+        for width, length, density in zip(widths, lengths, densities):
             if width <= 0.0 or length <= 0.0:
                 raise ValueError("Sampled width and length must be > 0")
-            scenes.append(self._build_scene(width=width, length=length))
+            scenes.append(self._build_scene(width=width, length=length, spawn_density=density))
 
         return scenes
 
-    def _build_scene(self, width: float, length: float) -> Scene:
+    def _build_scene(self, width: float, length: float, spawn_density: float) -> Scene:
         half_width = 0.5 * width
         wall_t = self.wall_thickness
 
@@ -102,6 +115,8 @@ class StraightCorridorTemplate(SceneTemplate):
 
         spawn_depth = max(1e-6, self.spawn_depth_ratio * length)
         spawn_half_width = max(1e-6, 0.5 * self.spawn_width_ratio * width)
+        spawn_area = 2.0 * spawn_half_width * spawn_depth
+        startup_agent_count = max(0, math.floor(spawn_density * spawn_area))
 
         left_region = RegionSpec(
             min_corner=(0.0, -spawn_half_width),
@@ -112,17 +127,13 @@ class StraightCorridorTemplate(SceneTemplate):
             max_corner=(length, spawn_half_width),
         )
 
-        paths = [
-            PathSpec(points=[(0.0, 0.0), (length, 0.0)]),
-            PathSpec(points=[(length, 0.0), (0.0, 0.0)]),
-        ]
-
         region_pairs = [
             RegionPairSpec(
                 spawn_region=left_region,
                 destination_region=right_region,
-                startup_agent_count=self.startup_agent_count_per_pair,
-                path_index=0,
+                startup_agent_count=startup_agent_count,
+                path_index=None,
+                velocity_range=self.spawn_velocity_range,
             )
         ]
 
@@ -131,14 +142,15 @@ class StraightCorridorTemplate(SceneTemplate):
                 RegionPairSpec(
                     spawn_region=right_region,
                     destination_region=left_region,
-                    startup_agent_count=self.startup_agent_count_per_pair,
-                    path_index=1,
+                    startup_agent_count=startup_agent_count,
+                    path_index=None,
+                    velocity_range=self.spawn_velocity_range,
                 )
             )
 
         return Scene(
             agents=[],
             obstacles=[bottom_wall, top_wall],
-            paths=paths,
+            paths=[],
             region_pairs=region_pairs,
         )

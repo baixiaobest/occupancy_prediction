@@ -43,6 +43,7 @@ class RegionPairSpec:
     destination_region: RegionSpec
     startup_agent_count: int = 0
     path_index: int | None = None
+    velocity_range: Tuple[float, float] | None = None
 
 
 @dataclass

@@ -190,43 +190,6 @@ def animate_rollout(
     plt.show()
 
     _ = (anim_traj, anim_occ)
-
-
-def get_L_shape_scene() -> Scene:
-    corridor_obstacles = [
-        ObstacleSpec(vertices=[(-15.0, -4.4), (4.4, -4.4), (4.4, -4.0), (-15.0, -4.0)]),
-        ObstacleSpec(vertices=[(-15.0, 4.0), (-4.0, 4.0), (-4.0, 4.4), (-15.0, 4.4)]),
-        ObstacleSpec(vertices=[(-15.4, -4.4), (-15.0, -4.4), (-15.0, 4.4), (-15.4, 4.4)]),
-        ObstacleSpec(vertices=[(4.0, -4.4), (4.4, -4.4), (4.4, 15.4), (4.0, 15.4)]),
-        ObstacleSpec(vertices=[(-4.4, 4.4), (-4.0, 4.4), (-4.0, 15.4), (-4.4, 15.4)]),
-        ObstacleSpec(vertices=[(-4.4, 15.0), (4.4, 15.0), (4.4, 15.4), (-4.4, 15.4)]),
-    ]
-    corridor_paths = [
-        PathSpec(points=[(-15.0, 0.0), (0.0, 0.0), (0.0, 15.0)]),
-        PathSpec(points=[(0.0, 15.0), (0.0, 0.0), (-15.0, 0.0)]),
-    ]
-
-    scene = Scene(
-            agents=[],
-            obstacles=corridor_obstacles,
-            paths=corridor_paths,
-            region_pairs=[
-                RegionPairSpec(
-                    spawn_region=RegionSpec(min_corner=(-14.5, -2.0), max_corner=(-10.0, 2.0)),
-                    destination_region=RegionSpec(min_corner=(-2.0, 13.0), max_corner=(2.0, 14.5)),
-                    startup_agent_count=8,
-                    path_index=0,
-                ),
-                RegionPairSpec(
-                    spawn_region=RegionSpec(min_corner=(-2.0, 10.0), max_corner=(2.0, 14.5)),
-                    destination_region=RegionSpec(min_corner=(-14.5, -2.0), max_corner=(-13.0, 2.0)),
-                    startup_agent_count=8,
-                    path_index=1,
-                ),
-            ],
-        )
-    return scene
-
 def main() -> None:
     """Run an ORCA rollout with optional animation and occupancy-map generation."""
     parser = argparse.ArgumentParser(description="Run an ORCA pedestrian rollout.")
@@ -241,7 +204,8 @@ def main() -> None:
     template = StraightCorridorTemplate(
         width_range=(3.0, 6.0),
         length_range=(8.0, 15.0),
-        startup_agent_count_per_pair=8,
+        spawn_density_range=(1.0, 1.0),
+        spawn_velocity_range=(0.8, 2.6),
         num_region_pairs=1,
     )
     scenes = template.generate(num_levels=4)
