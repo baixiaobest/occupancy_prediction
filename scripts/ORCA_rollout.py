@@ -303,7 +303,7 @@ def main() -> None:
     # ORCASim configuration constants
     TIME_STEP = 0.1
     NUM_STEPS = 150
-    NEIGHBOR_DIST = 3.0
+    NEIGHBOR_DIST = 2.0
     MAX_NEIGHBORS = 5
     TIME_HORIZON = 3.0
     TIME_HORIZON_OBST = 5.0
@@ -315,11 +315,14 @@ def main() -> None:
     PREF_VELOCITY_NOISE_STD = 0.02
     PREF_VELOCITY_NOISE_INTERVAL = 3
     PREF_VELOCITY_NOISE_SEED = 0
+    NUM_LEVELS_PER_TEMPLATE = 5
 
     # Occupancy settings
     OCC_RESOLUTION = 0.1
     OCC_MARGIN = 0.2
     OCC_AGENT_RADIUS = 0.2
+    OCC_LENGTH = 12.8
+    OCC_WIDTH = 12.8
 
     # premade templates are provided by `src.templates.default_templates()`
     rollout_setting = RollOutSetting(
@@ -333,7 +336,7 @@ def main() -> None:
     for tpl in rollout_setting.templates:
         template_name = tpl.get_name()
         template_rollouts: List[RollOutData] = []
-        scenes = tpl.generate(num_levels=5)
+        scenes = tpl.generate(num_levels=NUM_LEVELS_PER_TEMPLATE)
         print(
             f"generated {len(scenes)} scenes from {tpl.__class__.__name__} "
             f"(name={template_name})"
@@ -368,8 +371,8 @@ def main() -> None:
                 resolution=OCC_RESOLUTION,
                 margin=OCC_MARGIN,
                 agent_radius=OCC_AGENT_RADIUS,
-                occupancy_width=10.0,
-                occupancy_length=10.0,
+                occupancy_width=OCC_WIDTH,
+                occupancy_length=OCC_LENGTH,
             )
 
             if SAVE_ROLLOUTS:
