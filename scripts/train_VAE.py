@@ -514,7 +514,7 @@ def main() -> None:
             )
 
             if wandb_run is not None:
-                wandb.log(
+                wandb_run.log(
                     {
                         "epoch": epoch,
                         "train/loss": train_loss,
@@ -545,9 +545,27 @@ def main() -> None:
                 torch.save(checkpoint, epoch_ckpt)
                 torch.save(checkpoint, args.output)
                 print(f"Saved checkpoint: {epoch_ckpt}")
+
+                if wandb_run is not None:
+                    # Save checkpoint files to the run's Files tab for easier discoverability.
+                    wandb_run.save(str(epoch_ckpt), base_path=str(args.output.parent), policy="now")
+                    wandb_run.save(str(args.output), base_path=str(args.output.parent), policy="now")
+
+                    # Also track them as versioned model artifacts.
+                    artifact = wandb.Artifact(
+                        name=f"vae-checkpoint-{wandb_run.id}",
+                        type="model",
+                        metadata={"epoch": epoch},
+                    )
+                    artifact.add_file(str(epoch_ckpt), name=epoch_ckpt.name)
+                    artifact.add_file(str(args.output), name=args.output.name)
+                    wandb_run.log_artifact(
+                        artifact,
+                        aliases=["latest", f"epoch-{epoch:03d}"],
+                    )
     finally:
         if wandb_run is not None:
-            wandb.finish()
+            wandb_run.finish()
 
 
 if __name__ == "__main__":
