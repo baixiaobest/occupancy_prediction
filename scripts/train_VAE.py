@@ -4,6 +4,7 @@ import argparse
 import os
 import random
 import sys
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
@@ -12,6 +13,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 # Ensure project root is on sys.path so `from src...` works when running this script.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -379,6 +385,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/vae_prediction.pt"))
+    parser.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable Weights & Biases logging",
+    )
+    parser.add_argument("--wandb-project", type=str, default="occupancy-prediction")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
     return parser.parse_args()
 
 
@@ -434,13 +449,13 @@ def main() -> None:
         input_shape=input_shape,
         latent_channel=args.latent_channel,
         base_channels=args.base_channels,
-        downsample_strides=[(4, 4, 4), (1, 4, 4), (1, 4, 4)]
+        downsample_strides=[(2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)]
     ).to(device)
     decoder = VAEPredictionDecoder(
         latent_dim=args.latent_channel,
         output_shape=output_shape,
-        upsample_strides=[(4, 4, 4), (1, 4, 4), (1, 4, 4)],
-        upsample_channels=(128, 32, 16, 8),
+        upsample_strides=[(2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)],
+        upsample_channels=(128, 64, 32, 16, 8, 4, 2),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -456,52 +471,83 @@ def main() -> None:
         f"train_samples={stats.num_train_samples}, val_samples={stats.num_val_samples}"
     )
 
-    best_val = float("inf")
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_recon, train_kl = run_epoch(
-            encoder,
-            decoder,
-            train_loader,
-            optimizer,
-            device,
-            occupied_weight=args.occupied_weight,
-            kl_weight=args.kl_weight,
+    wandb_run = None
+    if args.wandb:
+        if wandb is None:
+            raise ImportError("wandb is not installed. Install it with: pip install wandb")
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+            config=vars(args),
         )
 
-        with torch.no_grad():
-            val_loss, val_recon, val_kl = run_epoch(
+    try:
+        for epoch in range(1, args.epochs + 1):
+            train_loss, train_recon, train_kl = run_epoch(
                 encoder,
                 decoder,
-                val_loader,
-                optimizer=None,
-                device=device,
+                train_loader,
+                optimizer,
+                device,
                 occupied_weight=args.occupied_weight,
                 kl_weight=args.kl_weight,
             )
 
-        print(
-            f"Epoch {epoch:03d} | "
-            f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, kl={train_kl:.6f} | "
-            f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f}"
-        )
+            with torch.no_grad():
+                val_loss, val_recon, val_kl = run_epoch(
+                    encoder,
+                    decoder,
+                    val_loader,
+                    optimizer=None,
+                    device=device,
+                    occupied_weight=args.occupied_weight,
+                    kl_weight=args.kl_weight,
+                )
 
-        current_val = val_loss if len(val_dataset) > 0 else train_loss
-        if current_val < best_val:
-            best_val = current_val
-            torch.save(
-                {
+            print(
+                f"Epoch {epoch:03d} | "
+                f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, kl={train_kl:.6f} | "
+                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f}"
+            )
+
+            if wandb_run is not None:
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "train/loss": train_loss,
+                        "train/recon": train_recon,
+                        "train/kl": train_kl,
+                        "val/loss": val_loss,
+                        "val/recon": val_recon,
+                        "val/kl": val_kl,
+                    },
+                    step=epoch,
+                )
+
+            # Save checkpoint at epoch 1 and then every 5 epochs.
+            if epoch == 1 or (epoch % 5 == 0):
+                epoch_ckpt = args.output.parent / f"{args.output.stem}_epoch_{epoch:03d}{args.output.suffix}"
+                checkpoint = {
                     "encoder": encoder.state_dict(),
                     "decoder": decoder.state_dict(),
                     "args": vars(args),
                     "input_shape": input_shape,
                     "output_shape": output_shape,
-                    "best_val": best_val,
-                },
-                args.output,
-            )
-            print(f"Saved checkpoint: {args.output}")
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_kl": train_kl,
+                    "val_kl": val_kl,
+                }
+                torch.save(checkpoint, epoch_ckpt)
+                torch.save(checkpoint, args.output)
+                print(f"Saved checkpoint: {epoch_ckpt}")
+    finally:
+        if wandb_run is not None:
+            wandb.finish()
 
 
 if __name__ == "__main__":
