@@ -383,20 +383,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kl-weight", type=float, default=1e-3)
     parser.add_argument("--latent-channel", type=int, default=128)
     parser.add_argument("--base-channels", type=int, default=32)
-    parser.add_argument(
-        "--upsample-method",
-        type=str,
-        default="transpose",
-        choices=["transpose", "interpolate"],
-        help="Decoder upsampling method. 'interpolate' treats stride as interpolation scale_factor.",
-    )
-    parser.add_argument(
-        "--upsample-interp-mode",
-        type=str,
-        default="trilinear",
-        choices=["nearest", "trilinear"],
-        help="Interpolation mode when --upsample-method=interpolate.",
-    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/vae_prediction.pt"))
@@ -479,8 +465,6 @@ def main() -> None:
         output_shape=output_shape,
         upsample_strides=[(2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)],
         upsample_channels=(128, 64, 32, 16, 8, 4, 2),
-        upsample_method=args.upsample_method,
-        upsample_interp_mode=args.upsample_interp_mode,
     ).to(device)
 
     optimizer = torch.optim.AdamW(

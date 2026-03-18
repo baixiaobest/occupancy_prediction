@@ -126,40 +126,6 @@ class _UpsampleResBlock3d(nn.Module):
         return out
 
 
-class _UpsampleInterpResBlock3d(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        stride: int | Sequence[int] = 2,
-        mode: str = "trilinear",
-    ) -> None:
-        super().__init__()
-        self.scale_factor = _to_stride3(stride)
-        self.mode = str(mode).lower()
-        if self.mode not in {"nearest", "trilinear"}:
-            raise ValueError("mode must be either 'nearest' or 'trilinear'")
-
-        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm3d(out_channels)
-        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm3d(out_channels)
-        self.skip = nn.Conv3d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.skip_bn = nn.BatchNorm3d(out_channels)
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.mode == "trilinear":
-            x_up = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode, align_corners=False)
-        else:
-            x_up = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
-        residual = self.skip_bn(self.skip(x_up))
-        out = self.act(self.bn1(self.conv1(x_up)))
-        out = self.bn2(self.conv2(out))
-        out = self.act(out + residual)
-        return out
-
-
 class VAEPredictionEncoder(nn.Module):
     """Fixed ResNet-style 3D CNN encoder for occupancy prediction VAE."""
 
@@ -279,8 +245,6 @@ class VAEPredictionDecoder(nn.Module):
             (1, 2, 2),
             (1, 2, 2),
         ),
-        upsample_method: str = "transpose",
-        upsample_interp_mode: str = "trilinear",
     ) -> None:
         super().__init__()
 
@@ -301,13 +265,6 @@ class VAEPredictionDecoder(nn.Module):
         if len(upsample_strides) == 0:
             raise ValueError("upsample_strides must contain at least 1 stride entry")
         upsample_stride_list = [_to_stride3(s) for s in upsample_strides]
-
-        self.upsample_method = str(upsample_method).lower()
-        if self.upsample_method not in {"transpose", "interpolate"}:
-            raise ValueError("upsample_method must be either 'transpose' or 'interpolate'")
-        self.upsample_interp_mode = str(upsample_interp_mode).lower()
-        if self.upsample_interp_mode not in {"nearest", "trilinear"}:
-            raise ValueError("upsample_interp_mode must be either 'nearest' or 'trilinear'")
 
         upsample_channels = [int(c) for c in upsample_channels]
         if len(upsample_channels) != len(upsample_stride_list) + 1:
@@ -330,28 +287,12 @@ class VAEPredictionDecoder(nn.Module):
         self.res_in = _ResidualBlock3d(decoder_in_channels)
         self.input_proj = nn.Conv3d(decoder_in_channels, upsample_channels[0], kernel_size=1)
 
-        upsample_block_cls = (
-            _UpsampleInterpResBlock3d if self.upsample_method == "interpolate" else _UpsampleResBlock3d
+        self.upsample_blocks = nn.ModuleList(
+            [
+                _UpsampleResBlock3d(upsample_channels[i], upsample_channels[i + 1], stride=s)
+                for i, s in enumerate(upsample_stride_list)
+            ]
         )
-        if self.upsample_method == "interpolate":
-            self.upsample_blocks = nn.ModuleList(
-                [
-                    upsample_block_cls(
-                        upsample_channels[i],
-                        upsample_channels[i + 1],
-                        stride=s,
-                        mode=self.upsample_interp_mode,
-                    )
-                    for i, s in enumerate(upsample_stride_list)
-                ]
-            )
-        else:
-            self.upsample_blocks = nn.ModuleList(
-                [
-                    upsample_block_cls(upsample_channels[i], upsample_channels[i + 1], stride=s)
-                    for i, s in enumerate(upsample_stride_list)
-                ]
-            )
         self.res_out = _ResidualBlock3d(upsample_channels[-1])
 
         self.to_output = nn.Conv3d(upsample_channels[-1], self.output_shape[0], kernel_size=3, padding=1)
