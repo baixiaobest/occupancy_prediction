@@ -331,6 +331,12 @@ def main() -> None:
         default=None,
         help="Directory to save rollout .pt files (defaults to ../data)",
     )
+    parser.add_argument(
+        "--num-levels",
+        type=int,
+        default=5,
+        help="Number of levels to generate per template (default: 5)",
+    )
     args = parser.parse_args()
 
     SAVE_ROLLOUTS = bool(args.save_rollouts)
@@ -360,7 +366,7 @@ def main() -> None:
     PREF_VELOCITY_NOISE_STD = 0.02
     PREF_VELOCITY_NOISE_INTERVAL = 3
     PREF_VELOCITY_NOISE_SEED = 0
-    NUM_LEVELS_PER_TEMPLATE = 5
+    NUM_LEVELS_PER_TEMPLATE = int(args.num_levels)
 
     # Occupancy settings
     OCC_RESOLUTION = 0.1
