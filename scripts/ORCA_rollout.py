@@ -325,10 +325,21 @@ def main() -> None:
         action="store_true",
         help="Save generated rollouts to the data directory as .pt files.",
     )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Directory to save rollout .pt files (defaults to ../data)",
+    )
     args = parser.parse_args()
 
     SAVE_ROLLOUTS = bool(args.save_rollouts)
-    DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+
+    if args.data_dir is None:
+        DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+    else:
+        DATA_DIR = os.path.abspath(os.path.expanduser(args.data_dir))
+
     if SAVE_ROLLOUTS:
         os.makedirs(DATA_DIR, exist_ok=True)
 
