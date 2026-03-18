@@ -472,13 +472,13 @@ def main() -> None:
         input_shape=input_shape,
         latent_channel=args.latent_channel,
         base_channels=args.base_channels,
-        downsample_strides=[(2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)]
+        downsample_strides=[(2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)]
     ).to(device)
     decoder = VAEPredictionDecoder(
         latent_dim=args.latent_channel,
         output_shape=output_shape,
-        upsample_strides=[(2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)],
-        upsample_channels=(128, 64, 32, 16, 8, 4, 2),
+        upsample_strides=[(2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)],
+        upsample_channels=(128, 64, 32, 16, 8, 4),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
