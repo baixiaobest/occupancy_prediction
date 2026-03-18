@@ -406,6 +406,20 @@ def _format_hhmmss(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+def _log_message(message: str, wandb_run: object | None = None) -> None:
+    """Log to terminal reliably and mirror to W&B when enabled.
+
+    Using ``sys.__stdout__`` bypasses wrappers that can swallow output in
+    hosted environments.
+    """
+    stream = sys.__stdout__ if getattr(sys, "__stdout__", None) is not None else sys.stdout
+    stream.write(f"{message}\n")
+    stream.flush()
+
+    if wandb_run is not None and wandb is not None:
+        wandb.termlog(message)
+
+
 def main() -> None:
     """Entry point for training the VAE model.
 
@@ -473,11 +487,11 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
-    print(
+    _log_message(
         "Dataset summary: "
         f"files={stats.num_scene_files}, "
         f"train_origins={stats.num_train_origins}, val_origins={stats.num_val_origins}, "
-        f"train_samples={stats.num_train_samples}, val_samples={stats.num_val_samples}"
+        f"train_samples={stats.num_train_samples}, val_samples={stats.num_val_samples}",
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -527,11 +541,12 @@ def main() -> None:
             epochs_left = args.epochs - epoch
             eta_seconds = avg_epoch_duration * epochs_left
 
-            print(
+            _log_message(
                 f"Epoch {epoch:03d} | "
                 f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, kl={train_kl:.6f} | "
                 f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f} | "
-                f"epoch_time={_format_hhmmss(epoch_duration)}, eta={_format_hhmmss(eta_seconds)}"
+                f"epoch_time={_format_hhmmss(epoch_duration)}, eta={_format_hhmmss(eta_seconds)}",
+                wandb_run=wandb_run,
             )
 
             if wandb_run is not None:
@@ -571,9 +586,10 @@ def main() -> None:
                 }
                 torch.save(checkpoint, epoch_ckpt)
                 torch.save(checkpoint, args.output)
-                print(
+                _log_message(
                     f"Validation improved to {best_val_loss:.6f}; "
-                    f"saved checkpoint: {epoch_ckpt}"
+                    f"saved checkpoint: {epoch_ckpt}",
+                    wandb_run=wandb_run,
                 )
 
                 if wandb_run is not None:
@@ -594,9 +610,10 @@ def main() -> None:
                         aliases=["best", "latest", f"epoch-{epoch:03d}"],
                     )
             else:
-                print(
+                _log_message(
                     f"No validation improvement (best={best_val_loss:.6f} at epoch {best_epoch:03d}); "
-                    "checkpoint not updated."
+                    "checkpoint not updated.",
+                    wandb_run=wandb_run,
                 )
     finally:
         if wandb_run is not None:
