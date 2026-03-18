@@ -4,6 +4,7 @@ import argparse
 import os
 import random
 import sys
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -388,13 +389,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wandb",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable/disable Weights & Biases logging",
     )
     parser.add_argument("--wandb-project", type=str, default="occupancy-prediction")
     parser.add_argument("--wandb-entity", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     return parser.parse_args()
+
+
+def _format_hhmmss(seconds: float) -> str:
+    """Format seconds to HH:MM:SS."""
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def main() -> None:
@@ -485,7 +494,10 @@ def main() -> None:
         )
 
     try:
+        total_epoch_time = 0.0
         for epoch in range(1, args.epochs + 1):
+            epoch_start = time.perf_counter()
+
             train_loss, train_recon, train_kl = run_epoch(
                 encoder,
                 decoder,
@@ -507,10 +519,17 @@ def main() -> None:
                     kl_weight=args.kl_weight,
                 )
 
+            epoch_duration = time.perf_counter() - epoch_start
+            total_epoch_time += epoch_duration
+            avg_epoch_duration = total_epoch_time / epoch
+            epochs_left = args.epochs - epoch
+            eta_seconds = avg_epoch_duration * epochs_left
+
             print(
                 f"Epoch {epoch:03d} | "
                 f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, kl={train_kl:.6f} | "
-                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f}"
+                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f} | "
+                f"epoch_time={_format_hhmmss(epoch_duration)}, eta={_format_hhmmss(eta_seconds)}"
             )
 
             if wandb_run is not None:
