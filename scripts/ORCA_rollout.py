@@ -344,6 +344,11 @@ def main() -> None:
         default=5,
         help="Number of levels to generate per template (default: 5)",
     )
+    parser.add_argument(
+        "--disable-data-aug",
+        action="store_true",
+        help="Disable occupancy data augmentation (mirror + rotations).",
+    )
     args = parser.parse_args()
 
     SAVE_ROLLOUTS = bool(args.save_rollouts)
@@ -357,6 +362,7 @@ def main() -> None:
         os.makedirs(DATA_DIR, exist_ok=True)
 
     ANIMATE = bool(args.animate)
+    DATA_AUG_ENABLED = not bool(args.disable_data_aug)
 
     # ORCASim configuration constants
     TIME_STEP = 0.1
@@ -436,34 +442,47 @@ def main() -> None:
                 occupancy_width=OCC_WIDTH,
                 occupancy_length=OCC_LENGTH,
             )
-            (
-                occupancy_original,
-                occupancy_mirrored,
-                occupancy_rot90,
-                occupancy_rot180,
-                occupancy_rot270,
-            ) = data_augmentation(occupancy_grids)
+            if DATA_AUG_ENABLED:
+                (
+                    occupancy_original,
+                    occupancy_mirrored,
+                    occupancy_rot90,
+                    occupancy_rot180,
+                    occupancy_rot270,
+                ) = data_augmentation(occupancy_grids)
+            else:
+                occupancy_original = occupancy_grids
+                occupancy_mirrored = []
+                occupancy_rot90 = []
+                occupancy_rot180 = []
+                occupancy_rot270 = []
 
             if SAVE_ROLLOUTS:
                 template_rollouts_original.append(
                     RollOutData(occupancy_grids=occupancy_original, dt=TIME_STEP)
                 )
-                template_rollouts_mirrored.append(
-                    RollOutData(occupancy_grids=occupancy_mirrored, dt=TIME_STEP)
-                )
-                template_rollouts_rot90.append(
-                    RollOutData(occupancy_grids=occupancy_rot90, dt=TIME_STEP)
-                )
-                template_rollouts_rot180.append(
-                    RollOutData(occupancy_grids=occupancy_rot180, dt=TIME_STEP)
-                )
-                template_rollouts_rot270.append(
-                    RollOutData(occupancy_grids=occupancy_rot270, dt=TIME_STEP)
-                )
-                print(
-                    f"scene[{scene_index}] queued split rollout data for template "
-                    f"{template_name} (orig/mirror/rot90/rot180/rot270)"
-                )
+                if DATA_AUG_ENABLED:
+                    template_rollouts_mirrored.append(
+                        RollOutData(occupancy_grids=occupancy_mirrored, dt=TIME_STEP)
+                    )
+                    template_rollouts_rot90.append(
+                        RollOutData(occupancy_grids=occupancy_rot90, dt=TIME_STEP)
+                    )
+                    template_rollouts_rot180.append(
+                        RollOutData(occupancy_grids=occupancy_rot180, dt=TIME_STEP)
+                    )
+                    template_rollouts_rot270.append(
+                        RollOutData(occupancy_grids=occupancy_rot270, dt=TIME_STEP)
+                    )
+                    print(
+                        f"scene[{scene_index}] queued split rollout data for template "
+                        f"{template_name} (orig/mirror/rot90/rot180/rot270)"
+                    )
+                else:
+                    print(
+                        f"scene[{scene_index}] queued rollout data for template "
+                        f"{template_name} (orig only, data aug disabled)"
+                    )
 
             print(
                 f"scene[{scene_index}] startup spawn: total agents={traj.shape[1]}, "
@@ -507,13 +526,16 @@ def main() -> None:
             global_scene_index += 1
 
         if SAVE_ROLLOUTS:
-            outputs = [
-                (f"rollout_{template_name}_orig.pt", template_rollouts_original),
-                (f"rollout_{template_name}_mirror.pt", template_rollouts_mirrored),
-                (f"rollout_{template_name}_rot90.pt", template_rollouts_rot90),
-                (f"rollout_{template_name}_rot180.pt", template_rollouts_rot180),
-                (f"rollout_{template_name}_rot270.pt", template_rollouts_rot270),
-            ]
+            outputs = [(f"rollout_{template_name}_orig.pt", template_rollouts_original)]
+            if DATA_AUG_ENABLED:
+                outputs.extend(
+                    [
+                        (f"rollout_{template_name}_mirror.pt", template_rollouts_mirrored),
+                        (f"rollout_{template_name}_rot90.pt", template_rollouts_rot90),
+                        (f"rollout_{template_name}_rot180.pt", template_rollouts_rot180),
+                        (f"rollout_{template_name}_rot270.pt", template_rollouts_rot270),
+                    ]
+                )
             for file_name, payload in outputs:
                 data_path = os.path.join(DATA_DIR, file_name)
                 torch.save(payload, data_path)
