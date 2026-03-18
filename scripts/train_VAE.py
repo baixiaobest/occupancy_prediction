@@ -511,6 +511,8 @@ def main() -> None:
 
     try:
         total_epoch_time = 0.0
+        best_val_loss = float("inf")
+        best_epoch = 0
         for epoch in range(1, args.epochs + 1):
             epoch_start = time.perf_counter()
 
@@ -558,45 +560,59 @@ def main() -> None:
                         "val/loss": val_loss,
                         "val/recon": val_recon,
                         "val/kl": val_kl,
+                        "best/val_loss": min(best_val_loss, val_loss),
                     },
                     step=epoch,
                     commit=True,
                 )
 
-            # Save checkpoint 
-            epoch_ckpt = args.output.parent / f"{args.output.stem}_epoch_{epoch:03d}{args.output.suffix}"
-            checkpoint = {
-                "encoder": encoder.state_dict(),
-                "decoder": decoder.state_dict(),
-                "args": vars(args),
-                "input_shape": input_shape,
-                "output_shape": output_shape,
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "train_kl": train_kl,
-                "val_kl": val_kl,
-            }
-            torch.save(checkpoint, epoch_ckpt)
-            torch.save(checkpoint, args.output)
-            print(f"Saved checkpoint: {epoch_ckpt}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_epoch = epoch
 
-            if wandb_run is not None:
-                # Save checkpoint files to the run's Files tab for easier discoverability.
-                wandb_run.save(str(epoch_ckpt), base_path=str(args.output.parent), policy="now")
-                wandb_run.save(str(args.output), base_path=str(args.output.parent), policy="now")
-
-                # Also track them as versioned model artifacts.
-                artifact = wandb.Artifact(
-                    name=f"vae-checkpoint-{wandb_run.id}",
-                    type="model",
-                    metadata={"epoch": epoch},
+                epoch_ckpt = args.output.parent / f"{args.output.stem}_epoch_{epoch:03d}{args.output.suffix}"
+                checkpoint = {
+                    "encoder": encoder.state_dict(),
+                    "decoder": decoder.state_dict(),
+                    "args": vars(args),
+                    "input_shape": input_shape,
+                    "output_shape": output_shape,
+                    "epoch": epoch,
+                    "best_epoch": best_epoch,
+                    "best_val_loss": best_val_loss,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_kl": train_kl,
+                    "val_kl": val_kl,
+                }
+                torch.save(checkpoint, epoch_ckpt)
+                torch.save(checkpoint, args.output)
+                print(
+                    f"Validation improved to {best_val_loss:.6f}; "
+                    f"saved checkpoint: {epoch_ckpt}"
                 )
-                artifact.add_file(str(epoch_ckpt), name=epoch_ckpt.name)
-                artifact.add_file(str(args.output), name=args.output.name)
-                wandb_run.log_artifact(
-                    artifact,
-                    aliases=["latest", f"epoch-{epoch:03d}"],
+
+                if wandb_run is not None:
+                    # Save checkpoint files to the run's Files tab for easier discoverability.
+                    wandb_run.save(str(epoch_ckpt), base_path=str(args.output.parent), policy="now")
+                    wandb_run.save(str(args.output), base_path=str(args.output.parent), policy="now")
+
+                    # Also track them as versioned model artifacts.
+                    artifact = wandb.Artifact(
+                        name=f"vae-checkpoint-{epoch}",
+                        type="model",
+                        metadata={"epoch": epoch, "best_val_loss": best_val_loss},
+                    )
+                    artifact.add_file(str(epoch_ckpt), name=epoch_ckpt.name)
+                    artifact.add_file(str(args.output), name=args.output.name)
+                    wandb_run.log_artifact(
+                        artifact,
+                        aliases=["best", "latest", f"epoch-{epoch:03d}"],
+                    )
+            else:
+                print(
+                    f"No validation improvement (best={best_val_loss:.6f} at epoch {best_epoch:03d}); "
+                    "checkpoint not updated."
                 )
     finally:
         if wandb_run is not None:
