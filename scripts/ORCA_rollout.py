@@ -125,14 +125,26 @@ def build_occupancy_maps(
     return all_grids, origins, (resolution, resolution)
 
 
-def data_augmentation(occupancy_grids: List[List[torch.Tensor]]) -> List[List[torch.Tensor]]:
-    """Return original, mirrored, and clockwise-rotated occupancy sequences.
+def data_augmentation(
+    occupancy_grids: List[List[torch.Tensor]],
+) -> Tuple[
+    List[List[torch.Tensor]],
+    List[List[torch.Tensor]],
+    List[List[torch.Tensor]],
+    List[List[torch.Tensor]],
+    List[List[torch.Tensor]],
+]:
+    """Return split occupancy variants: original, mirror, rot90, rot180, rot270.
 
-    For each input sequence this function appends 5 variants in order:
-    original, mirrored (left-right), rotated 90/180/270 degrees clockwise.
+    Rotations are clockwise around the grid center.
     """
 
-    augmented: List[List[torch.Tensor]] = []
+    original: List[List[torch.Tensor]] = []
+    mirrored: List[List[torch.Tensor]] = []
+    rot90: List[List[torch.Tensor]] = []
+    rot180: List[List[torch.Tensor]] = []
+    rot270: List[List[torch.Tensor]] = []
+
     for sequence in occupancy_grids:
         if not sequence:
             continue
@@ -140,18 +152,13 @@ def data_augmentation(occupancy_grids: List[List[torch.Tensor]]) -> List[List[to
         # Stack once so transforms are applied consistently to all timesteps.
         seq_tensor = torch.stack([torch.as_tensor(frame) for frame in sequence], dim=0)
 
-        variants = [
-            seq_tensor,
-            torch.flip(seq_tensor, dims=(-1,)),
-            torch.rot90(seq_tensor, k=-1, dims=(-2, -1)),
-            torch.rot90(seq_tensor, k=2, dims=(-2, -1)),
-            torch.rot90(seq_tensor, k=-3, dims=(-2, -1)),
-        ]
+        original.append([frame.clone() for frame in seq_tensor])
+        mirrored.append([frame.clone() for frame in torch.flip(seq_tensor, dims=(-1,))])
+        rot90.append([frame.clone() for frame in torch.rot90(seq_tensor, k=-1, dims=(-2, -1))])
+        rot180.append([frame.clone() for frame in torch.rot90(seq_tensor, k=2, dims=(-2, -1))])
+        rot270.append([frame.clone() for frame in torch.rot90(seq_tensor, k=-3, dims=(-2, -1))])
 
-        for variant in variants:
-            augmented.append([frame.clone() for frame in variant])
-
-    return augmented
+    return original, mirrored, rot90, rot180, rot270
 
 
 def animate_rollout(
@@ -386,7 +393,11 @@ def main() -> None:
     global_scene_index = 0
     for tpl in rollout_setting.templates:
         template_name = tpl.get_name()
-        template_rollouts: List[RollOutData] = []
+        template_rollouts_original: List[RollOutData] = []
+        template_rollouts_mirrored: List[RollOutData] = []
+        template_rollouts_rot90: List[RollOutData] = []
+        template_rollouts_rot180: List[RollOutData] = []
+        template_rollouts_rot270: List[RollOutData] = []
         scenes = tpl.generate(num_levels=NUM_LEVELS_PER_TEMPLATE)
         print(
             f"generated {len(scenes)} scenes from {tpl.__class__.__name__} "
@@ -425,18 +436,33 @@ def main() -> None:
                 occupancy_width=OCC_WIDTH,
                 occupancy_length=OCC_LENGTH,
             )
-            occupancy_grids = data_augmentation(occupancy_grids)
-            occupancy_origin = [origin.copy() for origin in occupancy_origin for _ in range(5)]
+            (
+                occupancy_original,
+                occupancy_mirrored,
+                occupancy_rot90,
+                occupancy_rot180,
+                occupancy_rot270,
+            ) = data_augmentation(occupancy_grids)
 
             if SAVE_ROLLOUTS:
-                rollout_data = RollOutData(
-                    occupancy_grids=occupancy_grids,
-                    dt=TIME_STEP,
+                template_rollouts_original.append(
+                    RollOutData(occupancy_grids=occupancy_original, dt=TIME_STEP)
                 )
-                template_rollouts.append(rollout_data)
+                template_rollouts_mirrored.append(
+                    RollOutData(occupancy_grids=occupancy_mirrored, dt=TIME_STEP)
+                )
+                template_rollouts_rot90.append(
+                    RollOutData(occupancy_grids=occupancy_rot90, dt=TIME_STEP)
+                )
+                template_rollouts_rot180.append(
+                    RollOutData(occupancy_grids=occupancy_rot180, dt=TIME_STEP)
+                )
+                template_rollouts_rot270.append(
+                    RollOutData(occupancy_grids=occupancy_rot270, dt=TIME_STEP)
+                )
                 print(
-                    f"scene[{scene_index}] queued rollout data for template "
-                    f"{template_name}"
+                    f"scene[{scene_index}] queued split rollout data for template "
+                    f"{template_name} (orig/mirror/rot90/rot180/rot270)"
                 )
 
             print(
@@ -446,9 +472,10 @@ def main() -> None:
             
             title_prefix = f"{tpl.__class__.__name__} {local_idx + 1}/{len(scenes)}"
             if ANIMATE:
+                # Keep visualization focused on original maps.
                 occupancy_grids_np = [
                 [grid.detach().cpu().numpy() for grid in per_center_grids]
-                for per_center_grids in occupancy_grids
+                for per_center_grids in occupancy_original
                 ]
 
                 animate_rollout(
@@ -469,20 +496,31 @@ def main() -> None:
                         f"({pos[0]:.2f}, {pos[1]:.2f})"
                     )
                 print(
-                    f"scene[{scene_index}] occupancy generated: {len(occupancy_grids)} maps, "
-                    f"{len(occupancy_grids[0])} frames each, "
-                    f"grid shape {occupancy_grids[0][0].shape}"
+                    f"scene[{scene_index}] occupancy generated: "
+                    f"orig={len(occupancy_original)}, mirror={len(occupancy_mirrored)}, "
+                    f"rot90={len(occupancy_rot90)}, rot180={len(occupancy_rot180)}, "
+                    f"rot270={len(occupancy_rot270)} maps; "
+                    f"{len(occupancy_original[0])} frames each, "
+                    f"grid shape {occupancy_original[0][0].shape}"
                 )
 
             global_scene_index += 1
 
         if SAVE_ROLLOUTS:
-            data_path = os.path.join(DATA_DIR, f"rollout_{template_name}.pt")
-            torch.save(template_rollouts, data_path)
-            print(
-                f"saved template rollout data: {data_path} "
-                f"({len(template_rollouts)} scenes)"
-            )
+            outputs = [
+                (f"rollout_{template_name}_orig.pt", template_rollouts_original),
+                (f"rollout_{template_name}_mirror.pt", template_rollouts_mirrored),
+                (f"rollout_{template_name}_rot90.pt", template_rollouts_rot90),
+                (f"rollout_{template_name}_rot180.pt", template_rollouts_rot180),
+                (f"rollout_{template_name}_rot270.pt", template_rollouts_rot270),
+            ]
+            for file_name, payload in outputs:
+                data_path = os.path.join(DATA_DIR, file_name)
+                torch.save(payload, data_path)
+                print(
+                    f"saved template rollout data: {data_path} "
+                    f"({len(payload)} scenes)"
+                )
 
 
 if __name__ == "__main__":
