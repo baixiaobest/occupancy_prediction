@@ -125,6 +125,35 @@ def build_occupancy_maps(
     return all_grids, origins, (resolution, resolution)
 
 
+def data_augmentation(occupancy_grids: List[List[torch.Tensor]]) -> List[List[torch.Tensor]]:
+    """Return original, mirrored, and clockwise-rotated occupancy sequences.
+
+    For each input sequence this function appends 5 variants in order:
+    original, mirrored (left-right), rotated 90/180/270 degrees clockwise.
+    """
+
+    augmented: List[List[torch.Tensor]] = []
+    for sequence in occupancy_grids:
+        if not sequence:
+            continue
+
+        # Stack once so transforms are applied consistently to all timesteps.
+        seq_tensor = torch.stack([torch.as_tensor(frame) for frame in sequence], dim=0)
+
+        variants = [
+            seq_tensor,
+            torch.flip(seq_tensor, dims=(-1,)),
+            torch.rot90(seq_tensor, k=-1, dims=(-2, -1)),
+            torch.rot90(seq_tensor, k=2, dims=(-2, -1)),
+            torch.rot90(seq_tensor, k=-3, dims=(-2, -1)),
+        ]
+
+        for variant in variants:
+            augmented.append([frame.clone() for frame in variant])
+
+    return augmented
+
+
 def animate_rollout(
     traj: np.ndarray,
     goals: np.ndarray,
@@ -291,14 +320,19 @@ def main() -> None:
         action="store_true",
         help="Display a matplotlib animation of the agents.",
     )
+    parser.add_argument(
+        "--save-rollouts",
+        action="store_true",
+        help="Save generated rollouts to the data directory as .pt files.",
+    )
     args = parser.parse_args()
 
-    SAVE_ROLLOUTS = True
+    SAVE_ROLLOUTS = bool(args.save_rollouts)
     DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
     if SAVE_ROLLOUTS:
         os.makedirs(DATA_DIR, exist_ok=True)
 
-    ANIMATE = False
+    ANIMATE = bool(args.animate)
 
     # ORCASim configuration constants
     TIME_STEP = 0.1
@@ -374,6 +408,8 @@ def main() -> None:
                 occupancy_width=OCC_WIDTH,
                 occupancy_length=OCC_LENGTH,
             )
+            occupancy_grids = data_augmentation(occupancy_grids)
+            occupancy_origin = [origin.copy() for origin in occupancy_origin for _ in range(5)]
 
             if SAVE_ROLLOUTS:
                 rollout_data = RollOutData(
