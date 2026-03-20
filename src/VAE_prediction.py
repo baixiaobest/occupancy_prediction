@@ -134,6 +134,7 @@ class VAEPredictionEncoder(nn.Module):
         input_shape: Sequence[int],
         latent_channel: int,
         base_channels: int = 32,
+        static_stem_channels: int = 8,
         downsample_strides: Sequence[int | Sequence[int]] = (
             (2, 2, 2),
             (2, 2, 2),
@@ -153,10 +154,14 @@ class VAEPredictionEncoder(nn.Module):
         self.latent_channel = int(latent_channel)
         if self.latent_channel <= 0:
             raise ValueError("latent_dim must be > 0")
+        self.static_stem_channels = int(static_stem_channels)
+        if self.static_stem_channels <= 0:
+            raise ValueError("static_stem_channels must be > 0")
 
         c1 = int(base_channels)
         c2 = c1 * 2
         c3 = c2 * 2
+        c_merge = c1 + self.static_stem_channels
 
         if len(downsample_strides) < 2:
             raise ValueError("downsample_strides must contain at least 2 stride entries")
@@ -164,44 +169,65 @@ class VAEPredictionEncoder(nn.Module):
         stride_list = [_to_stride3(s) for s in downsample_strides]
         s1, s2 = stride_list[0], stride_list[1]
 
-        self.stem = nn.Sequential(
+        self.dynamic_stem = nn.Sequential(
             nn.Conv3d(in_channels, c1, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm3d(c1),
             nn.ReLU(inplace=True),
         )
-        # Input `x` shape: (B, C, T, H, W)
-        # After `stem`: (B, c1, T, H, W)
-        self.res1 = _ResidualBlock3d(c1)
-        # After `res1`: (B, c1, T, H, W)
-        self.down1 = _DownsampleResBlock3d(c1, c2, stride=s1)
-        # After `down1`: (B, c2, T/s1_t, H/s1_h, W/s1_w)
+        self.static_stem = nn.Sequential(
+            nn.Conv3d(1, self.static_stem_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(self.static_stem_channels),
+            nn.ReLU(inplace=True),
+        )
+        # dynamic_x: (B, C, T, H, W)
+        # static_x: (B, 1, T, H, W)
+        # after stems + concat: (B, c1 + static_c, T, H, W)
+        self.res1 = _ResidualBlock3d(c_merge)
+        self.down1 = _DownsampleResBlock3d(c_merge, c2, stride=s1)
         self.res2 = _ResidualBlock3d(c2)
-        # After `res2`: (B, c2, T/s1_t, H/s1_h, W/s1_w)
         self.down2 = _DownsampleResBlock3d(c2, c3, stride=s2)
-        # After `down2`: (B, c3, T/(s1_t*s2_t), H/(s1_h*s2_h), W/(s1_w*s2_w))
         self.res3 = _ResidualBlock3d(c3)
-        # After `res3`: same as after `down2`
         self.extra_spatial_down = nn.ModuleList(
             [_DownsampleResBlock3d(c3, c3, stride=s) for s in stride_list[2:]]
         )
-        # With default `downsample_strides`, shape progression is:
-        # (2,2,2), (2,2,2), then four (1,2,2)
-        # -> (B, c3, T/4, H/64, W/64)
+        # default strides -> latent map: (B, c3, T/4, H/64, W/64)
 
         # Mu is map via 1x1x1 conv.
         # Sigma is a same-shape positive map via 1x1x1 conv + softplus.
         self.mu_head = nn.Conv3d(c3, self.latent_channel, kernel_size=1)
         self.sigma_head = nn.Conv3d(c3, self.latent_channel, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.stem(x)
-        h = self.res1(h)    # (B, c1, T, H, W)
-        h = self.down1(h)   # (B, c2, T/s1_t, H/s1_h, W/s1_w)
-        h = self.res2(h)    # (B, c2, T/s1_t, H/s1_h, W/s1_w)
-        h = self.down2(h)   # (B, c3, T/(s1_t*s2_t), H/(s1_h*s2_h), W/(s1_w*s2_w))
-        h = self.res3(h)    # (B, c3, T/(s1_t*s2_t), H/(s1_h*s2_h), W/(s1_w*s2_w))
+    def forward(self, dynamic_x: torch.Tensor, static_x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if dynamic_x.ndim != 5:
+            raise ValueError("dynamic_x must have shape (B, C, T, H, W)")
+
+        if static_x.ndim == 4:
+            # (B, 1, H, W) -> (B, 1, 1, H, W)
+            static_x = static_x.unsqueeze(2)
+        if static_x.ndim != 5:
+            raise ValueError("static_x must have shape (B, 1, H, W) or (B, 1, T, H, W)")
+        if static_x.shape[1] != 1:
+            raise ValueError("static_x channel dimension must be 1")
+
+        if static_x.shape[-2:] != dynamic_x.shape[-2:]:
+            raise ValueError("static_x and dynamic_x must share H/W")
+
+        if static_x.shape[2] == 1 and dynamic_x.shape[2] > 1:
+            static_x = static_x.expand(-1, -1, dynamic_x.shape[2], -1, -1)
+        elif static_x.shape[2] != dynamic_x.shape[2]:
+            raise ValueError("static_x time dimension must be 1 or match dynamic_x")
+
+        h_dyn = self.dynamic_stem(dynamic_x)
+        h_static = self.static_stem(static_x)
+        h = torch.cat([h_dyn, h_static], dim=1)
+
+        h = self.res1(h)
+        h = self.down1(h)
+        h = self.res2(h)
+        h = self.down2(h)
+        h = self.res3(h)
         for down_block in self.extra_spatial_down:
-            h = down_block(h)  # Additional blocks follow remaining entries in `downsample_strides`.
+            h = down_block(h)
 
         mu = self.mu_head(h)
         sigma = F.softplus(self.sigma_head(h)) + 1e-6

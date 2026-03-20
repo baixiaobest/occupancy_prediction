@@ -37,14 +37,20 @@ class DatasetStats:
 
 
 class OccupancyWindowDataset(Dataset):
-    """Sliding-window dataset over occupancy sequences.
+    """Sliding-window dataset over dynamic occupancy sequences.
 
-    Each sample uses first `history_len` frames as input and predicts the next frame.
-    Input shape:  (1, history_len, H, W)
+    Each sample uses dynamic history + static map and predicts next dynamic frame.
+    Dynamic input shape: (1, history_len, H, W)
+    Static input shape:  (1, H, W)
     Target shape: (1, 1, H, W)
     """
 
-    def __init__(self, sequences: Sequence[torch.Tensor], history_len: int = 16, stride: int = 1) -> None:
+    def __init__(
+        self,
+        sequences: Sequence[tuple[torch.Tensor, torch.Tensor]],
+        history_len: int = 16,
+        stride: int = 1,
+    ) -> None:
         if history_len <= 0:
             raise ValueError("history_len must be > 0")
         if stride <= 0:
@@ -53,8 +59,8 @@ class OccupancyWindowDataset(Dataset):
         """Create a sliding-window dataset from a list of occupancy sequences.
 
         Args:
-            sequences: Iterable of tensors with shape `(T, H, W)` representing
-                binary occupancy frames for one origin.
+            sequences: Iterable of `(dynamic_seq, static_map)` tuples where
+                `dynamic_seq` is `(T, H, W)` and `static_map` is `(H, W)`.
             history_len: Number of past frames used as input (the target is the
                 next single frame).
             stride: Step size between window starts when creating samples.
@@ -69,9 +75,13 @@ class OccupancyWindowDataset(Dataset):
         self.sequences = list(sequences)
         self.samples: list[tuple[int, int]] = []
 
-        for seq_idx, seq in enumerate(self.sequences):
+        for seq_idx, (seq, static_map) in enumerate(self.sequences):
             if seq.ndim != 3:
                 raise ValueError("Each sequence must have shape (T, H, W)")
+            if static_map.ndim != 2:
+                raise ValueError("Each static map must have shape (H, W)")
+            if static_map.shape != seq.shape[-2:]:
+                raise ValueError("Static map shape must match sequence spatial shape")
             t = seq.shape[0]
             if t < self.window_size:
                 continue
@@ -82,36 +92,36 @@ class OccupancyWindowDataset(Dataset):
         """Return the number of sliding-window samples available."""
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the (input, target) pair for the sample at `index`.
 
         Returns:
-            A tuple `(x, y)` where `x` has shape `(1, history_len, H, W)` and
+            A tuple `(x_dynamic, x_static, y)` where `x_dynamic` has shape
+            `(1, history_len, H, W)`, `x_static` has shape `(1, H, W)`, and
             `y` has shape `(1, 1, H, W)`.
         """
         seq_idx, start = self.samples[index]
-        seq = self.sequences[seq_idx]
+        seq, static_map = self.sequences[seq_idx]
 
         past = seq[start : start + self.history_len]  # (history_len, H, W)
         future = seq[start + self.history_len : start + self.window_size]  # (1, H, W)
 
-        x = past.unsqueeze(0)  # (1, history_len, H, W)
+        x_dynamic = past.unsqueeze(0)  # (1, history_len, H, W)
+        x_static = static_map.unsqueeze(0)  # (1, H, W)
         y = future.unsqueeze(0)  # (1, 1, H, W)
-        return x, y
+        return x_dynamic, x_static, y
 
 
-def _load_scene_origins(pt_path: Path) -> list[torch.Tensor]:
+def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Load occupancy sequences from a .pt rollout file.
 
-    Supports loading `RollOutData` instances, dict payloads containing the
-    key `"occupancy_grids"`, or plain lists of per-origin frame sequences.
+    Supports only `static_maps` + `dynamic_grids` payloads.
 
     Args:
         pt_path: Path to the .pt file to load.
 
     Returns:
-        A list of tensors where each tensor has shape `(T, H, W)` and contains
-        binary values in {0., 1.}.
+        A list of `(dynamic_seq, static_map)` tuples.
 
     Raises:
         ValueError: If the payload format is not recognized or if frames are
@@ -119,51 +129,62 @@ def _load_scene_origins(pt_path: Path) -> list[torch.Tensor]:
     """
     payload = torch.load(pt_path, map_location="cpu")
 
-    # Normalize payload into an iterable of per-origin frame lists.
+    def _to_2d(frame: object) -> torch.Tensor:
+        tensor = torch.as_tensor(frame, dtype=torch.float32)
+        if tensor.ndim == 3 and tensor.shape[0] == 1:
+            tensor = tensor[0]
+        if tensor.ndim != 2:
+            raise ValueError(f"Occupancy frame must be 2D, got shape {tuple(tensor.shape)}")
+        return (tensor > 0).float()
+
+    def _from_rollout_obj(obj: RollOutData) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        if hasattr(obj, "dynamic_grids") and hasattr(obj, "static_maps"):
+            if len(obj.dynamic_grids) != len(obj.static_maps):
+                raise ValueError("dynamic_grids and static_maps must have same length")
+
+            out: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for dyn_series, static_map in zip(obj.dynamic_grids, obj.static_maps):
+                dyn_frames = [_to_2d(frame) for frame in dyn_series]
+                if not dyn_frames:
+                    continue
+                dynamic_seq = torch.stack(dyn_frames, dim=0)
+                out.append((dynamic_seq, _to_2d(static_map)))
+            return out
+
+        raise ValueError("Unsupported RollOutData schema")
+
+    sequences: list[tuple[torch.Tensor, torch.Tensor]] = []
     if isinstance(payload, RollOutData):
-        occupancy_items = payload.occupancy_grids
-    elif isinstance(payload, dict) and "occupancy_grids" in payload:
-        occupancy_items = payload["occupancy_grids"]
-    elif isinstance(payload, list):
-        # The file may contain a list of origin-series or a list of RollOutData
-        # objects (e.g., multiple scenes). If it's a list of RollOutData, extract
-        # their `occupancy_grids` and flatten; otherwise treat the list as the
-        # occupancy container.
-        if all(isinstance(x, RollOutData) for x in payload):
-            occupancy_items = []
-            for r in payload:
-                occupancy_items.extend(r.occupancy_grids)
+        sequences.extend(_from_rollout_obj(payload))
+    elif isinstance(payload, dict):
+        if "dynamic_grids" in payload and "static_maps" in payload:
+            pseudo = RollOutData(
+                static_maps=payload["static_maps"],
+                dynamic_grids=payload["dynamic_grids"],
+                dt=float(payload.get("dt", 0.0)),
+            )
+            sequences.extend(_from_rollout_obj(pseudo))
         else:
-            occupancy_items = payload
+            raise ValueError(f"Unsupported payload format in {pt_path}")
+    elif isinstance(payload, list):
+        if all(isinstance(x, RollOutData) for x in payload):
+            for item in payload:
+                sequences.extend(_from_rollout_obj(item))
+        else:
+            raise ValueError(
+                "List payload must contain RollOutData objects with dynamic_grids/static_maps"
+            )
     else:
         raise ValueError(f"Unsupported payload format in {pt_path}")
-
-    sequences: list[torch.Tensor] = []
-    for origin_series in occupancy_items:
-        frames: list[torch.Tensor] = []
-        for frame in origin_series:
-            tensor = torch.as_tensor(frame, dtype=torch.float32)
-            if tensor.ndim == 3 and tensor.shape[0] == 1:
-                tensor = tensor[0]
-            if tensor.ndim != 2:
-                raise ValueError(f"Occupancy frame must be 2D, got shape {tuple(tensor.shape)}")
-            frames.append(tensor)
-
-        if not frames:
-            continue
-
-        seq = torch.stack(frames, dim=0)  # (T, H, W)
-        seq = (seq > 0).float()  # ensure binary {0,1}
-        sequences.append(seq)
 
     return sequences
 
 
 def _split_origins(
-    sequences: Sequence[torch.Tensor],
+    sequences: Sequence[tuple[torch.Tensor, torch.Tensor]],
     val_ratio: float,
     rng: random.Random,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], list[tuple[torch.Tensor, torch.Tensor]]]:
     """Split a sequence list into train and validation subsets.
 
     The split is performed at the origin (sequence) level using a provided
@@ -225,8 +246,8 @@ def build_datasets(
     """
     rng = random.Random(seed)
 
-    all_train_sequences: list[torch.Tensor] = []
-    all_val_sequences: list[torch.Tensor] = []
+    all_train_sequences: list[tuple[torch.Tensor, torch.Tensor]] = []
+    all_val_sequences: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     pt_files = sorted(data_dir.glob("*.pt"))
     if not pt_files:
@@ -329,14 +350,15 @@ def run_epoch(
     total_kl = 0.0
     total_batches = 0
 
-    for x, y in loader:
-        x = x.to(device)
+    for x_dynamic, x_static, y in loader:
+        x_dynamic = x_dynamic.to(device)
+        x_static = x_static.to(device)
         y = y.to(device)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
-        mu, sigma = encoder(x)
+        mu, sigma = encoder(x_dynamic, x_static)
         z = encoder.sample(mu, sigma)
         logits = decoder(z)
 
@@ -383,6 +405,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kl-weight", type=float, default=1e-3)
     parser.add_argument("--latent-channel", type=int, default=128)
     parser.add_argument("--base-channels", type=int, default=32)
+    parser.add_argument("--static-stem-channels", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/vae_prediction.pt"))
@@ -463,8 +486,8 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    sample_x, sample_y = train_dataset[0]
-    _, hist_t, h, w = sample_x.shape
+    sample_x_dynamic, sample_x_static, sample_y = train_dataset[0]
+    _, hist_t, h, w = sample_x_dynamic.shape
     input_shape = (1, hist_t, h, w)
     output_shape = (1, 1, h, w)
 
@@ -472,6 +495,7 @@ def main() -> None:
         input_shape=input_shape,
         latent_channel=args.latent_channel,
         base_channels=args.base_channels,
+        static_stem_channels=args.static_stem_channels,
         downsample_strides=[(2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)]
     ).to(device)
     decoder = VAEPredictionDecoder(

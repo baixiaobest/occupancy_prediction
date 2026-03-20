@@ -36,42 +36,82 @@ def parse_channel_list(text: str) -> list[int]:
     return channels
 
 
-def load_scene_origins(pt_path: Path) -> list[torch.Tensor]:
-    """Load occupancy time-series per scene/origin from a .pt file.
+def load_scene_origins(pt_path: Path) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Load dynamic time-series and static maps per scene/origin from a .pt file.
 
-    Returns list of tensors with shape (T, H, W), binary in {0,1}.
+    Returns:
+        dynamic_sequences: list of tensors with shape (T, H, W)
+        static_maps: list of tensors with shape (H, W)
     """
     payload = torch.load(pt_path, map_location="cpu")
 
+    def _to_2d(frame: object) -> torch.Tensor:
+        tensor = torch.as_tensor(frame, dtype=torch.float32)
+        if tensor.ndim == 3 and tensor.shape[0] == 1:
+            tensor = tensor[0]
+        if tensor.ndim != 2:
+            raise ValueError(f"Occupancy frame must be 2D, got shape {tuple(tensor.shape)}")
+        return (tensor > 0).float()
+
+    dynamic_sequences: list[torch.Tensor] = []
+    static_maps: list[torch.Tensor] = []
+
+    def _collect_from_rollout_obj(obj: RollOutData) -> None:
+        if hasattr(obj, "dynamic_grids") and hasattr(obj, "static_maps"):
+            if len(obj.dynamic_grids) != len(obj.static_maps):
+                raise ValueError("dynamic_grids and static_maps must have same length")
+            for dyn_series, static_map in zip(obj.dynamic_grids, obj.static_maps):
+                dyn_frames = [_to_2d(frame) for frame in dyn_series]
+                if not dyn_frames:
+                    continue
+                dynamic_sequences.append(torch.stack(dyn_frames, dim=0))
+                static_maps.append(_to_2d(static_map))
+            return
+
+        if hasattr(obj, "occupancy_grids"):
+            for origin_series in obj.occupancy_grids:
+                frames = [_to_2d(frame) for frame in origin_series]
+                if not frames:
+                    continue
+                full_seq = torch.stack(frames, dim=0)
+                dynamic_sequences.append(full_seq)
+                static_maps.append(torch.zeros_like(full_seq[0]))
+            return
+
+        raise ValueError("Unsupported RollOutData schema")
+
     if isinstance(payload, RollOutData):
-        occupancy_items = payload.occupancy_grids
-    elif isinstance(payload, dict) and "occupancy_grids" in payload:
-        occupancy_items = payload["occupancy_grids"]
+        _collect_from_rollout_obj(payload)
+    elif isinstance(payload, dict):
+        if "dynamic_grids" in payload and "static_maps" in payload:
+            pseudo = RollOutData(
+                static_maps=payload["static_maps"],
+                dynamic_grids=payload["dynamic_grids"],
+                dt=float(payload.get("dt", 0.0)),
+            )
+            _collect_from_rollout_obj(pseudo)
+        elif "occupancy_grids" in payload:
+            pseudo = RollOutData(static_maps=[], dynamic_grids=[], dt=float(payload.get("dt", 0.0)))
+            setattr(pseudo, "occupancy_grids", payload["occupancy_grids"])
+            _collect_from_rollout_obj(pseudo)
+        else:
+            raise ValueError(f"Unsupported payload format in {pt_path}")
     elif isinstance(payload, list):
         if all(isinstance(x, RollOutData) for x in payload):
-            occupancy_items = []
-            for r in payload:
-                occupancy_items.extend(r.occupancy_grids)
+            for item in payload:
+                _collect_from_rollout_obj(item)
         else:
-            occupancy_items = payload
+            for origin_series in payload:
+                frames = [_to_2d(frame) for frame in origin_series]
+                if not frames:
+                    continue
+                full_seq = torch.stack(frames, dim=0)
+                dynamic_sequences.append(full_seq)
+                static_maps.append(torch.zeros_like(full_seq[0]))
     else:
         raise ValueError(f"Unsupported payload format in {pt_path}")
 
-    sequences: list[torch.Tensor] = []
-    for origin_series in occupancy_items:
-        frames: list[torch.Tensor] = []
-        for frame in origin_series:
-            tensor = torch.as_tensor(frame, dtype=torch.float32)
-            if tensor.ndim == 3 and tensor.shape[0] == 1:
-                tensor = tensor[0]
-            if tensor.ndim != 2:
-                raise ValueError(f"Occupancy frame must be 2D, got shape {tuple(tensor.shape)}")
-            frames.append((tensor > 0).float())
-
-        if frames:
-            sequences.append(torch.stack(frames, dim=0))
-
-    return sequences
+    return dynamic_sequences, static_maps
 
 
 def build_models(
@@ -89,6 +129,7 @@ def build_models(
 
     latent_channel = int(args.get("latent_channel", upsample_channels[0]))
     base_channels = int(args.get("base_channels", 32))
+    static_stem_channels = int(args.get("static_stem_channels", 8))
 
     input_shape = tuple(ckpt.get("input_shape", fallback_input_shape))
     output_shape = tuple(ckpt.get("output_shape", fallback_output_shape))
@@ -97,6 +138,7 @@ def build_models(
         input_shape=input_shape,
         latent_channel=latent_channel,
         base_channels=base_channels,
+        static_stem_channels=static_stem_channels,
         downsample_strides=downsample_strides,
     ).to(device)
 
@@ -119,7 +161,8 @@ def build_models(
 
 
 def autoregressive_predict(
-    sequence: torch.Tensor,
+    dynamic_sequence: torch.Tensor,
+    static_map: torch.Tensor,
     encoder: VAEPredictionEncoder,
     decoder: VAEPredictionDecoder,
     history_len: int,
@@ -132,7 +175,7 @@ def autoregressive_predict(
 
     Returns tensor of shape (T-history_len, horizon, H, W).
     """
-    t_total, h, w = sequence.shape
+    t_total, h, w = dynamic_sequence.shape
     if t_total <= history_len:
         return torch.zeros((0, horizon, h, w), dtype=torch.float32)
 
@@ -140,11 +183,12 @@ def autoregressive_predict(
 
     with torch.no_grad():
         for anchor_t in range(history_len, t_total):
-            context = sequence[anchor_t - history_len : anchor_t].clone()  # (history_len, H, W)
+            context = dynamic_sequence[anchor_t - history_len : anchor_t].clone()  # (history_len, H, W)
             pred_frames: list[torch.Tensor] = []
             for _ in range(horizon):
-                x = context[-history_len:].unsqueeze(0).unsqueeze(0).to(device)  # (1,1,history,H,W)
-                mu, _ = encoder(x)
+                x_dynamic = context[-history_len:].unsqueeze(0).unsqueeze(0).to(device)  # (1,1,history,H,W)
+                x_static = static_map.unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
+                mu, _ = encoder(x_dynamic, x_static)
                 logits = decoder(mu)
                 prob = torch.sigmoid(logits)[0, 0, 0].detach().cpu()
                 pred_frames.append(prob)
@@ -201,7 +245,7 @@ def main() -> None:
     upsample_strides = parse_stride_list(args.upsample_strides)
     upsample_channels = parse_channel_list(args.upsample_channels)
 
-    sequences = load_scene_origins(args.data_file)
+    sequences, static_maps = load_scene_origins(args.data_file)
     if not sequences:
         raise ValueError(f"No scene sequences found in {args.data_file}")
 
@@ -235,8 +279,10 @@ def main() -> None:
         if key not in cache:
             print(f"Running inference for origin={origin_idx}, horizon={horizon} ...")
             seq = sequences[origin_idx]
+            static_map = static_maps[origin_idx]
             cache[key] = autoregressive_predict(
-                sequence=seq,
+                dynamic_sequence=seq,
+                static_map=static_map,
                 encoder=encoder,
                 decoder=decoder,
                 history_len=args.history_len,
