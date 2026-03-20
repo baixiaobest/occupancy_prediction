@@ -8,7 +8,8 @@ import torch
 
 @dataclass
 class RollOutData:
-    """Stored rollout data containing occupancy tensors and timestep length."""
+    """Stored rollout data containing static+dynamic occupancy and timestep length."""
 
-    occupancy_grids: List[List[torch.Tensor]]
+    static_maps: List[torch.Tensor]
+    dynamic_grids: List[List[torch.Tensor]]
     dt: float
