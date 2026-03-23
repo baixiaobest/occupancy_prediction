@@ -55,10 +55,18 @@ class OccupancyWindowDataset(Dataset):
         self,
         sequences: Sequence[tuple[torch.Tensor, torch.Tensor]],
         history_len: int = 16,
+        future_len: int = 8,
+        decoder_context_len: int = 8,
         stride: int = 1,
     ) -> None:
         if history_len <= 0:
             raise ValueError("history_len must be > 0")
+        if future_len <= 0:
+            raise ValueError("future_len must be > 0")
+        if decoder_context_len <= 0:
+            raise ValueError("decoder_context_len must be > 0")
+        if decoder_context_len > history_len:
+            raise ValueError("decoder_context_len must be <= history_len")
         if stride <= 0:
             raise ValueError("stride must be > 0")
 
@@ -77,7 +85,9 @@ class OccupancyWindowDataset(Dataset):
         """
 
         self.history_len = int(history_len)
-        self.window_size = self.history_len + 1
+        self.future_len = int(future_len)
+        self.decoder_context_len = int(decoder_context_len)
+        self.window_size = self.history_len + self.future_len
         self.sequences = list(sequences)
         self.samples: list[tuple[int, int]] = []
 
@@ -98,24 +108,27 @@ class OccupancyWindowDataset(Dataset):
         """Return the number of sliding-window samples available."""
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the (input, target) pair for the sample at `index`.
 
         Returns:
-            A tuple `(x_dynamic, x_static, y)` where `x_dynamic` has shape
-            `(1, history_len, H, W)`, `x_static` has shape `(1, H, W)`, and
-            `y` has shape `(1, 1, H, W)`.
+            A tuple `(x_encoder_dynamic, x_decoder_dynamic, x_static, y)` where
+            `x_encoder_dynamic` has shape `(1, history_len + future_len, H, W)`,
+            `x_decoder_dynamic` has shape `(1, decoder_context_len, H, W)`,
+            `x_static` has shape `(1, H, W)`, and `y` has shape
+            `(1, future_len, H, W)`.
         """
         seq_idx, start = self.samples[index]
         seq, static_map = self.sequences[seq_idx]
 
         past = seq[start : start + self.history_len]  # (history_len, H, W)
-        future = seq[start + self.history_len : start + self.window_size]  # (1, H, W)
+        future = seq[start + self.history_len : start + self.window_size]  # (future_len, H, W)
 
-        x_dynamic = past.unsqueeze(0)  # (1, history_len, H, W)
+        x_encoder_dynamic = torch.cat([past, future], dim=0).unsqueeze(0)
+        x_decoder_dynamic = past[-self.decoder_context_len :].unsqueeze(0)
         x_static = static_map.unsqueeze(0)  # (1, H, W)
-        y = future.unsqueeze(0)  # (1, 1, H, W)
-        return x_dynamic, x_static, y
+        y = future.unsqueeze(0)  # (1, future_len, H, W)
+        return x_encoder_dynamic, x_decoder_dynamic, x_static, y
 
 
 def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -231,6 +244,8 @@ def build_datasets(
     data_dir: Path,
     val_ratio: float,
     history_len: int,
+    future_len: int,
+    decoder_context_len: int,
     window_stride: int,
     seed: int,
 ) -> tuple[OccupancyWindowDataset, OccupancyWindowDataset, DatasetStats]:
@@ -265,8 +280,20 @@ def build_datasets(
         all_train_sequences.extend(train_seq)
         all_val_sequences.extend(val_seq)
 
-    train_dataset = OccupancyWindowDataset(all_train_sequences, history_len=history_len, stride=window_stride)
-    val_dataset = OccupancyWindowDataset(all_val_sequences, history_len=history_len, stride=window_stride)
+    train_dataset = OccupancyWindowDataset(
+        all_train_sequences,
+        history_len=history_len,
+        future_len=future_len,
+        decoder_context_len=decoder_context_len,
+        stride=window_stride,
+    )
+    val_dataset = OccupancyWindowDataset(
+        all_val_sequences,
+        history_len=history_len,
+        future_len=future_len,
+        decoder_context_len=decoder_context_len,
+        stride=window_stride,
+    )
 
     stats = DatasetStats(
         num_scene_files=len(pt_files),
@@ -386,17 +413,18 @@ def run_epoch(
     total_kl = 0.0
     total_batches = 0
 
-    for x_dynamic, x_static, y in loader:
-        x_dynamic = x_dynamic.to(device)
+    for x_encoder_dynamic, x_decoder_dynamic, x_static, y in loader:
+        x_encoder_dynamic = x_encoder_dynamic.to(device)
+        x_decoder_dynamic = x_decoder_dynamic.to(device)
         x_static = x_static.to(device)
         y = y.to(device)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
-        mu, sigma = encoder(x_dynamic, x_static)
+        mu, sigma = encoder(x_encoder_dynamic, x_static)
         z = encoder.sample(mu, sigma)
-        logits = decoder(z)
+        logits = decoder(z, x_decoder_dynamic, x_static)
 
         if recon_loss_type == "focal":
             recon = weighted_focal_recon_loss(
@@ -444,7 +472,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train occupancy prediction VAE")
     parser.add_argument("--data-dir", type=Path, default=Path("data"), help="Directory containing rollout .pt files")
     parser.add_argument("--history-len", type=int, default=16, help="Number of past frames as encoder input")
-    parser.add_argument("--window-size", type=int, default=17, help="Total window length (history + target)")
+    parser.add_argument("--future-len", type=int, default=8, help="Number of future frames to predict")
+    parser.add_argument("--decoder-context-len", type=int, default=8, help="Number of past/current frames used to condition decoder")
     parser.add_argument("--window-stride", type=int, default=1, help="Sliding window stride")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation ratio for origin-level split")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -468,6 +497,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kl-weight", type=float, default=1e-3)
     parser.add_argument("--latent-channel", type=int, default=128)
     parser.add_argument("--base-channels", type=int, default=32)
+    parser.add_argument("--decoder-base-channels", type=int, default=8)
+    parser.add_argument(
+        "--decoder-context-latent-channel",
+        type=int,
+        default=32,
+        help="Context branch latent channels in decoder (defaults to latent-channel)",
+    )
     parser.add_argument("--static-stem-channels", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -515,8 +551,8 @@ def main() -> None:
     """
     args = parse_args()
 
-    if args.window_size != args.history_len + 1:
-        raise ValueError("window_size must be history_len + 1")
+    if args.decoder_context_len > args.history_len:
+        raise ValueError("decoder_context_len must be <= history_len")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -527,6 +563,8 @@ def main() -> None:
         data_dir=args.data_dir,
         val_ratio=args.val_ratio,
         history_len=args.history_len,
+        future_len=args.future_len,
+        decoder_context_len=args.decoder_context_len,
         window_stride=args.window_stride,
         seed=args.seed,
     )
@@ -549,22 +587,32 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    sample_x_dynamic, sample_x_static, sample_y = train_dataset[0]
-    _, hist_t, h, w = sample_x_dynamic.shape
-    input_shape = (1, hist_t, h, w)
-    output_shape = (1, 1, h, w)
+    sample_x_encoder_dynamic, sample_x_decoder_dynamic, sample_x_static, sample_y = train_dataset[0]
+    _, enc_t, h, w = sample_x_encoder_dynamic.shape
+    _, dec_ctx_t, _, _ = sample_x_decoder_dynamic.shape
+    input_shape = (1, enc_t, h, w)
+    output_shape = (1, sample_y.shape[1], h, w)
 
     downsample_strides = list(DEFAULT_DOWNSAMPLE_STRIDES)
     upsample_strides = list(DEFAULT_UPSAMPLE_STRIDES)
     upsample_channels = list(DEFAULT_UPSAMPLE_CHANNELS)
+    decoder_context_latent_channel = (
+        args.decoder_context_latent_channel
+        if args.decoder_context_latent_channel is not None
+        else args.latent_channel
+    )
 
     encoder, decoder = build_prediction_vae_models(
         input_shape=input_shape,
         output_shape=output_shape,
         latent_channel=args.latent_channel,
         base_channels=args.base_channels,
+        decoder_base_channels=args.decoder_base_channels,
+        decoder_context_latent_channel=decoder_context_latent_channel,
         static_stem_channels=args.static_stem_channels,
+        decoder_context_frames=dec_ctx_t,
         downsample_strides=downsample_strides,
+        decoder_context_downsample_strides=downsample_strides,
         upsample_strides=upsample_strides,
         upsample_channels=upsample_channels,
         device=device,
@@ -669,8 +717,12 @@ def main() -> None:
                     "args": vars(args),
                     "model_config": {
                         "history_len": args.history_len,
+                        "future_len": args.future_len,
+                        "decoder_context_len": args.decoder_context_len,
                         "latent_channel": args.latent_channel,
                         "base_channels": args.base_channels,
+                        "decoder_base_channels": args.decoder_base_channels,
+                        "decoder_context_latent_channel": decoder_context_latent_channel,
                         "static_stem_channels": args.static_stem_channels,
                         "downsample_strides": downsample_strides,
                         "upsample_strides": upsample_strides,

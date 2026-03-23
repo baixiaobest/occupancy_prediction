@@ -260,7 +260,7 @@ class VAEPredictionEncoder(nn.Module):
 
 
 class VAEPredictionDecoder(nn.Module):
-    """Fixed ResNet-style 3D CNN decoder with optional conditioning.
+    """Fixed ResNet-style 3D CNN decoder with convolutional context conditioning.
 
     Expects `z` as a latent feature map with shape
     `(B, C3, T/s_t, H/s_h, W/s_w)` from the encoder.
@@ -270,9 +270,11 @@ class VAEPredictionDecoder(nn.Module):
         self,
         latent_dim: int,
         output_shape: Sequence[int],
-        conditional_dim: int | None = None,
-        condition_embed_dim: int = 16,
-        condition_mlp_hidden_dim: int = 64,
+        context_frames: int = 8,
+        context_latent_channels: int | None = 32,
+        base_channels: int = 8,
+        static_stem_channels: int = 8,
+        context_downsample_strides: Sequence[int | Sequence[int]] = DEFAULT_DOWNSAMPLE_STRIDES,
         upsample_channels: Sequence[int] | None = (
             128,
             64,
@@ -295,17 +297,34 @@ class VAEPredictionDecoder(nn.Module):
 
         if len(output_shape) != 4:
             raise ValueError("output_shape must be (C, T, H, W)")
-        if int(output_shape[1]) != 1:
-            raise ValueError("Decoder output must be one-step prediction, so output_shape[1] must be 1")
 
         self.output_shape = tuple(int(v) for v in output_shape)
-        self.conditional_dim = int(conditional_dim) if conditional_dim is not None else None
-        self.condition_embed_dim = int(condition_embed_dim)
-        self.condition_mlp_hidden_dim = int(condition_mlp_hidden_dim)
+        self.context_frames = int(context_frames)
+        if self.context_frames <= 0:
+            raise ValueError("context_frames must be > 0")
+
+        self.static_stem_channels = int(static_stem_channels)
+        if self.static_stem_channels <= 0:
+            raise ValueError("static_stem_channels must be > 0")
 
         latent_dim = int(latent_dim)
 
         self.latent_channels = latent_dim
+        self.context_latent_channels = (
+            self.latent_channels if context_latent_channels is None else int(context_latent_channels)
+        )
+        if self.context_latent_channels <= 0:
+            raise ValueError("context_latent_channels must be > 0")
+
+        c1 = int(base_channels)
+        c2 = c1 * 2
+        c3 = c2 * 2
+        c_merge = c1 + self.static_stem_channels
+
+        if len(context_downsample_strides) < 2:
+            raise ValueError("context_downsample_strides must contain at least 2 stride entries")
+        context_stride_list = [_to_stride3(s) for s in context_downsample_strides]
+        s1, s2 = context_stride_list[0], context_stride_list[1]
 
         if len(upsample_strides) == 0:
             raise ValueError("upsample_strides must contain at least 1 stride entry")
@@ -318,19 +337,29 @@ class VAEPredictionDecoder(nn.Module):
                 "[input_channels, block1_out, ..., blockN_out]"
             )
 
-        if self.conditional_dim is not None:
-            self.condition_mlp = nn.Sequential(
-                nn.Linear(self.conditional_dim, self.condition_mlp_hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(self.condition_mlp_hidden_dim, self.condition_embed_dim),
-            )
-            decoder_in_channels = self.latent_channels + self.condition_embed_dim
-        else:
-            self.condition_mlp = None
-            decoder_in_channels = self.latent_channels
+        self.context_dynamic_stem = nn.Sequential(
+            nn.Conv3d(1, c1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(c1),
+            nn.ReLU(inplace=True),
+        )
+        self.context_static_stem = nn.Sequential(
+            nn.Conv3d(1, self.static_stem_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(self.static_stem_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.context_res1 = _ResidualBlock3d(c_merge)
+        self.context_down1 = _DownsampleResBlock3d(c_merge, c2, stride=s1)
+        self.context_res2 = _ResidualBlock3d(c2)
+        self.context_down2 = _DownsampleResBlock3d(c2, c3, stride=s2)
+        self.context_res3 = _ResidualBlock3d(c3)
+        self.context_extra_spatial_down = nn.ModuleList(
+            [_DownsampleResBlock3d(c3, c3, stride=s) for s in context_stride_list[2:]]
+        )
+        self.context_to_latent = nn.Conv3d(c3, self.context_latent_channels, kernel_size=1)
 
-        self.res_in = _ResidualBlock3d(decoder_in_channels)
-        self.input_proj = nn.Conv3d(decoder_in_channels, upsample_channels[0], kernel_size=1)
+        merged_channels = self.latent_channels + self.context_latent_channels
+        self.res_in = _ResidualBlock3d(merged_channels)
+        self.input_proj = nn.Conv3d(merged_channels, upsample_channels[0], kernel_size=1)
 
         self.upsample_blocks = nn.ModuleList(
             [
@@ -342,7 +371,12 @@ class VAEPredictionDecoder(nn.Module):
 
         self.to_output = nn.Conv3d(upsample_channels[-1], self.output_shape[0], kernel_size=3, padding=1)
 
-    def forward(self, z: torch.Tensor, condition: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        z: torch.Tensor,
+        dynamic_context: torch.Tensor,
+        static_x: torch.Tensor,
+    ) -> torch.Tensor:
         if z.ndim != 5:
             raise ValueError("z must have shape (B, C3, T/s_t, H/s_h, W/s_w)")
         if z.shape[1] != self.latent_channels:
@@ -350,19 +384,44 @@ class VAEPredictionDecoder(nn.Module):
                 f"Expected z channel dimension {self.latent_channels}, got {z.shape[1]}"
             )
 
-        if self.conditional_dim is not None:
-            if condition.ndim != 2:
-                condition = torch.flatten(condition, start_dim=1)
-            if condition.shape[-1] != self.conditional_dim:
-                raise ValueError(
-                    f"Expected condition last dimension {self.conditional_dim}, got {condition.shape[-1]}"
-                )
-            cond_embed = self.condition_mlp(condition)
-            cond_map = cond_embed.view(cond_embed.shape[0], cond_embed.shape[1], 1, 1, 1)
-            cond_map = cond_map.expand(-1, -1, z.shape[2], z.shape[3], z.shape[4])
-            z = torch.cat([z, cond_map], dim=1)
+        if dynamic_context.ndim != 5:
+            raise ValueError("dynamic_context must have shape (B, 1, T_ctx, H, W)")
+        if dynamic_context.shape[1] != 1:
+            raise ValueError("dynamic_context channel dimension must be 1")
+        if dynamic_context.shape[2] != self.context_frames:
+            raise ValueError(
+                f"Expected dynamic_context time dimension {self.context_frames}, got {dynamic_context.shape[2]}"
+            )
 
-        h = self.res_in(z)
+        if static_x.ndim == 4:
+            static_x = static_x.unsqueeze(2)
+        if static_x.ndim != 5:
+            raise ValueError("static_x must have shape (B, 1, H, W) or (B, 1, T, H, W)")
+        if static_x.shape[1] != 1:
+            raise ValueError("static_x channel dimension must be 1")
+        if static_x.shape[-2:] != dynamic_context.shape[-2:]:
+            raise ValueError("static_x and dynamic_context must share H/W")
+        if static_x.shape[2] == 1 and dynamic_context.shape[2] > 1:
+            static_x = static_x.expand(-1, -1, dynamic_context.shape[2], -1, -1)
+        elif static_x.shape[2] != dynamic_context.shape[2]:
+            raise ValueError("static_x time dimension must be 1 or match dynamic_context")
+
+        cond_dyn = self.context_dynamic_stem(dynamic_context)
+        cond_static = self.context_static_stem(static_x)
+        cond = torch.cat([cond_dyn, cond_static], dim=1)
+        cond = self.context_res1(cond)
+        cond = self.context_down1(cond)
+        cond = self.context_res2(cond)
+        cond = self.context_down2(cond)
+        cond = self.context_res3(cond)
+        for down_block in self.context_extra_spatial_down:
+            cond = down_block(cond)
+        cond = self.context_to_latent(cond)
+        cond = F.interpolate(cond, size=z.shape[2:], mode="trilinear", align_corners=False)
+
+        merged = torch.cat([z, cond], dim=1)
+
+        h = self.res_in(merged)
         h = self.input_proj(h)
         for up_block in self.upsample_blocks:
             h = up_block(h)
@@ -380,13 +439,20 @@ def build_prediction_vae_models(
     output_shape: Sequence[int],
     latent_channel: int,
     base_channels: int = 32,
+    decoder_base_channels: int | None = None,
+    decoder_context_latent_channel: int | None = None,
     static_stem_channels: int = 8,
+    decoder_context_frames: int = 8,
     downsample_strides: Sequence[int | Sequence[int]] = DEFAULT_DOWNSAMPLE_STRIDES,
+    decoder_context_downsample_strides: Sequence[int | Sequence[int]] | None = None,
     upsample_strides: Sequence[int | Sequence[int]] = DEFAULT_UPSAMPLE_STRIDES,
     upsample_channels: Sequence[int] = DEFAULT_UPSAMPLE_CHANNELS,
     device: torch.device | str | None = None,
 ) -> tuple[VAEPredictionEncoder, VAEPredictionDecoder]:
     """Build a consistent encoder/decoder pair for occupancy prediction."""
+    if decoder_base_channels is None:
+        decoder_base_channels = base_channels
+
     encoder = VAEPredictionEncoder(
         input_shape=input_shape,
         latent_channel=latent_channel,
@@ -394,9 +460,17 @@ def build_prediction_vae_models(
         static_stem_channels=static_stem_channels,
         downsample_strides=downsample_strides,
     )
+    context_downsample_strides = (
+        downsample_strides if decoder_context_downsample_strides is None else decoder_context_downsample_strides
+    )
     decoder = VAEPredictionDecoder(
         latent_dim=latent_channel,
         output_shape=output_shape,
+        context_frames=decoder_context_frames,
+        context_latent_channels=decoder_context_latent_channel,
+        base_channels=decoder_base_channels,
+        static_stem_channels=static_stem_channels,
+        context_downsample_strides=context_downsample_strides,
         upsample_channels=upsample_channels,
         upsample_strides=upsample_strides,
     )

@@ -16,7 +16,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.VAE_prediction import (
     VAEPredictionDecoder,
-    VAEPredictionEncoder,
     build_prediction_vae_models,
 )
 from src.rollout_data import RollOutData
@@ -137,8 +136,8 @@ def load_scene_origins(pt_path: Path) -> tuple[list[list[torch.Tensor]], list[li
 def build_models(
     checkpoint_path: Path,
     device: torch.device,
-) -> tuple[VAEPredictionEncoder, VAEPredictionDecoder, int]:
-    """Construct encoder/decoder from checkpoint config and load checkpoint weights."""
+) -> tuple[VAEPredictionDecoder, int, int, tuple[int, int, int], int]:
+    """Construct decoder from checkpoint config and load checkpoint weights."""
     ckpt = torch.load(checkpoint_path, map_location=device)
     if not isinstance(ckpt, dict):
         raise ValueError("Checkpoint must be a dict with model config and state dicts")
@@ -162,8 +161,13 @@ def build_models(
         raise ValueError(f"Checkpoint model_config is missing required keys: {missing}")
 
     history_len = int(model_cfg["history_len"])
+    decoder_context_len = int(model_cfg.get("decoder_context_len", min(8, history_len)))
     latent_channel = int(model_cfg["latent_channel"])
     base_channels = int(model_cfg["base_channels"])
+    decoder_base_channels = int(model_cfg.get("decoder_base_channels", base_channels))
+    decoder_context_latent_channel = int(
+        model_cfg.get("decoder_context_latent_channel", latent_channel)
+    )
     static_stem_channels = int(model_cfg["static_stem_channels"])
 
     input_shape = tuple(model_cfg["input_shape"])
@@ -175,11 +179,13 @@ def build_models(
     if any(v <= 0 for v in input_shape) or any(v <= 0 for v in output_shape):
         raise ValueError("Checkpoint is missing valid input_shape/output_shape for model reconstruction")
 
-    encoder, decoder = build_prediction_vae_models(
+    _encoder, decoder = build_prediction_vae_models(
         input_shape=input_shape,
         output_shape=output_shape,
         latent_channel=latent_channel,
         base_channels=base_channels,
+        decoder_base_channels=decoder_base_channels,
+        decoder_context_latent_channel=decoder_context_latent_channel,
         static_stem_channels=static_stem_channels,
         downsample_strides=model_downsample_strides,
         upsample_strides=model_upsample_strides,
@@ -187,23 +193,30 @@ def build_models(
         device=device,
     )
 
-    if "encoder" not in ckpt or "decoder" not in ckpt:
-        raise ValueError("Checkpoint must contain keys: 'encoder' and 'decoder'")
+    if "decoder" not in ckpt:
+        raise ValueError("Checkpoint must contain key: 'decoder'")
 
-    encoder.load_state_dict(ckpt["encoder"], strict=True)
     decoder.load_state_dict(ckpt["decoder"], strict=True)
 
-    encoder.eval()
     decoder.eval()
-    return encoder, decoder, history_len
+
+    latent_t, latent_h, latent_w = input_shape[1], input_shape[2], input_shape[3]
+    for stride in model_downsample_strides:
+        latent_t = (latent_t + stride[0] - 1) // stride[0]
+        latent_h = (latent_h + stride[1] - 1) // stride[1]
+        latent_w = (latent_w + stride[2] - 1) // stride[2]
+
+    return decoder, history_len, decoder_context_len, (latent_t, latent_h, latent_w), latent_channel
 
 
 def autoregressive_predict(
     dynamic_sequence: torch.Tensor,
     static_map: torch.Tensor,
-    encoder: VAEPredictionEncoder,
     decoder: VAEPredictionDecoder,
     history_len: int,
+    decoder_context_len: int,
+    latent_shape: tuple[int, int, int],
+    latent_channels: int,
     horizon: int,
     device: torch.device,
     binary_feedback: bool,
@@ -222,12 +235,12 @@ def autoregressive_predict(
     with torch.no_grad():
         for anchor_t in range(history_len, t_total):
             context = dynamic_sequence[anchor_t - history_len : anchor_t].clone()  # (history_len, H, W)
+            z = torch.randn((1, latent_channels, latent_shape[0], latent_shape[1], latent_shape[2]), device=device)
             pred_frames: list[torch.Tensor] = []
             for _ in range(horizon):
-                x_dynamic = context[-history_len:].unsqueeze(0).unsqueeze(0).to(device)  # (1,1,history,H,W)
+                x_decoder_dynamic = context[-decoder_context_len:].unsqueeze(0).unsqueeze(0).to(device)
                 x_static = static_map.unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
-                mu, _ = encoder(x_dynamic, x_static)
-                logits = decoder(mu)
+                logits = decoder(z, x_decoder_dynamic, x_static)
                 prob = torch.sigmoid(logits)[0, 0, 0].detach().cpu()
                 pred_frames.append(prob)
 
@@ -280,7 +293,7 @@ def main() -> None:
     init_seq = scene_sequences[init_scene][init_origin]
     _, init_h, init_w = init_seq.shape
 
-    encoder, decoder, history_len = build_models(
+    decoder, history_len, decoder_context_len, latent_shape, latent_channels = build_models(
         checkpoint_path=args.checkpoint,
         device=device,
     )
@@ -297,9 +310,11 @@ def main() -> None:
             cache[key] = autoregressive_predict(
                 dynamic_sequence=seq,
                 static_map=static_map,
-                encoder=encoder,
                 decoder=decoder,
                 history_len=history_len,
+                decoder_context_len=decoder_context_len,
+                latent_shape=latent_shape,
+                latent_channels=latent_channels,
                 horizon=horizon,
                 device=device,
                 binary_feedback=args.binary_feedback,
