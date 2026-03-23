@@ -9,7 +9,7 @@ from typing import Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from matplotlib.widgets import Slider
+from matplotlib.widgets import RadioButtons, Slider
 
 # Ensure project root is on sys.path so `from src...` works when running this script.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -36,12 +36,12 @@ def _coerce_channel_list(raw: object) -> list[int]:
     return [int(c) for c in raw]
 
 
-def load_scene_origins(pt_path: Path) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Load dynamic time-series and static maps per scene/origin from a .pt file.
+def load_scene_origins(pt_path: Path) -> tuple[list[list[torch.Tensor]], list[list[torch.Tensor]]]:
+    """Load dynamic time-series and static maps grouped by scene and origin.
 
     Returns:
-        dynamic_sequences: list of tensors with shape (T, H, W)
-        static_maps: list of tensors with shape (H, W)
+        scene_dynamic_sequences: list[scene] of list[origin] tensors `(T, H, W)`
+        scene_static_maps: list[scene] of list[origin] tensors `(H, W)`
     """
     payload = torch.load(pt_path, map_location="cpu")
 
@@ -53,10 +53,12 @@ def load_scene_origins(pt_path: Path) -> tuple[list[torch.Tensor], list[torch.Te
             raise ValueError(f"Occupancy frame must be 2D, got shape {tuple(tensor.shape)}")
         return (tensor > 0).float()
 
-    dynamic_sequences: list[torch.Tensor] = []
-    static_maps: list[torch.Tensor] = []
+    scene_dynamic_sequences: list[list[torch.Tensor]] = []
+    scene_static_maps: list[list[torch.Tensor]] = []
 
-    def _collect_from_rollout_obj(obj: RollOutData) -> None:
+    def _collect_from_rollout_obj(obj: RollOutData) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        dynamic_sequences: list[torch.Tensor] = []
+        static_maps: list[torch.Tensor] = []
         if hasattr(obj, "dynamic_grids") and hasattr(obj, "static_maps"):
             if len(obj.dynamic_grids) != len(obj.static_maps):
                 raise ValueError("dynamic_grids and static_maps must have same length")
@@ -66,7 +68,7 @@ def load_scene_origins(pt_path: Path) -> tuple[list[torch.Tensor], list[torch.Te
                     continue
                 dynamic_sequences.append(torch.stack(dyn_frames, dim=0))
                 static_maps.append(_to_2d(static_map))
-            return
+            return dynamic_sequences, static_maps
 
         if hasattr(obj, "occupancy_grids"):
             for origin_series in obj.occupancy_grids:
@@ -76,12 +78,15 @@ def load_scene_origins(pt_path: Path) -> tuple[list[torch.Tensor], list[torch.Te
                 full_seq = torch.stack(frames, dim=0)
                 dynamic_sequences.append(full_seq)
                 static_maps.append(torch.zeros_like(full_seq[0]))
-            return
+            return dynamic_sequences, static_maps
 
         raise ValueError("Unsupported RollOutData schema")
 
     if isinstance(payload, RollOutData):
-        _collect_from_rollout_obj(payload)
+        dyn, sta = _collect_from_rollout_obj(payload)
+        if dyn:
+            scene_dynamic_sequences.append(dyn)
+            scene_static_maps.append(sta)
     elif isinstance(payload, dict):
         if "dynamic_grids" in payload and "static_maps" in payload:
             pseudo = RollOutData(
@@ -89,18 +94,30 @@ def load_scene_origins(pt_path: Path) -> tuple[list[torch.Tensor], list[torch.Te
                 dynamic_grids=payload["dynamic_grids"],
                 dt=float(payload.get("dt", 0.0)),
             )
-            _collect_from_rollout_obj(pseudo)
+            dyn, sta = _collect_from_rollout_obj(pseudo)
+            if dyn:
+                scene_dynamic_sequences.append(dyn)
+                scene_static_maps.append(sta)
         elif "occupancy_grids" in payload:
             pseudo = RollOutData(static_maps=[], dynamic_grids=[], dt=float(payload.get("dt", 0.0)))
             setattr(pseudo, "occupancy_grids", payload["occupancy_grids"])
-            _collect_from_rollout_obj(pseudo)
+            dyn, sta = _collect_from_rollout_obj(pseudo)
+            if dyn:
+                scene_dynamic_sequences.append(dyn)
+                scene_static_maps.append(sta)
         else:
             raise ValueError(f"Unsupported payload format in {pt_path}")
     elif isinstance(payload, list):
         if all(isinstance(x, RollOutData) for x in payload):
             for item in payload:
-                _collect_from_rollout_obj(item)
+                dyn, sta = _collect_from_rollout_obj(item)
+                if dyn:
+                    scene_dynamic_sequences.append(dyn)
+                    scene_static_maps.append(sta)
         else:
+            # Treat list-of-origins payload as a single scene with many origins.
+            dynamic_sequences: list[torch.Tensor] = []
+            static_maps: list[torch.Tensor] = []
             for origin_series in payload:
                 frames = [_to_2d(frame) for frame in origin_series]
                 if not frames:
@@ -108,10 +125,13 @@ def load_scene_origins(pt_path: Path) -> tuple[list[torch.Tensor], list[torch.Te
                 full_seq = torch.stack(frames, dim=0)
                 dynamic_sequences.append(full_seq)
                 static_maps.append(torch.zeros_like(full_seq[0]))
+            if dynamic_sequences:
+                scene_dynamic_sequences.append(dynamic_sequences)
+                scene_static_maps.append(static_maps)
     else:
         raise ValueError(f"Unsupported payload format in {pt_path}")
 
-    return dynamic_sequences, static_maps
+    return scene_dynamic_sequences, scene_static_maps
 
 
 def build_models(
@@ -227,7 +247,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Interactive visualizer for VAE occupancy predictions")
     parser.add_argument("--data-file", type=Path, required=True, help="Path to rollout .pt file")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to model checkpoint .pt")
-    parser.add_argument("--origin-index", "--scene-index", dest="origin_index", type=int, default=0, help="Initial origin-center index")
+    parser.add_argument("--scene-index", type=int, default=0, help="Initial scene index")
+    parser.add_argument("--origin-index", type=int, default=0, help="Initial origin index within selected scene")
     parser.add_argument("--horizon", type=int, default=4, help="Initial autoregressive horizon")
     parser.add_argument("--max-horizon", type=int, default=16, help="Max horizon in GUI slider")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -241,16 +262,22 @@ def main() -> None:
 
     device = torch.device(args.device)
 
-    sequences, static_maps = load_scene_origins(args.data_file)
-    if not sequences:
+    scene_sequences, scene_static_maps = load_scene_origins(args.data_file)
+    if not scene_sequences:
         raise ValueError(f"No scene sequences found in {args.data_file}")
 
-    for i, seq in enumerate(sequences):
-        if seq.ndim != 3:
-            raise ValueError(f"Origin {i} has invalid shape {tuple(seq.shape)}; expected (T,H,W)")
+    for scene_idx, origins in enumerate(scene_sequences):
+        if not origins:
+            raise ValueError(f"Scene {scene_idx} has no origins")
+        for origin_idx, seq in enumerate(origins):
+            if seq.ndim != 3:
+                raise ValueError(
+                    f"Scene {scene_idx}, origin {origin_idx} has invalid shape {tuple(seq.shape)}; expected (T,H,W)"
+                )
 
-    init_origin = clamp_int(args.origin_index, 0, len(sequences) - 1)
-    init_seq = sequences[init_origin]
+    init_scene = clamp_int(args.scene_index, 0, len(scene_sequences) - 1)
+    init_origin = clamp_int(args.origin_index, 0, len(scene_sequences[init_scene]) - 1)
+    init_seq = scene_sequences[init_scene][init_origin]
     _, init_h, init_w = init_seq.shape
 
     encoder, decoder, history_len = build_models(
@@ -258,15 +285,15 @@ def main() -> None:
         device=device,
     )
 
-    # Cache by (origin_index, horizon) to avoid recomputing when only t changes.
-    cache: dict[tuple[int, int], torch.Tensor] = {}
+    # Cache by (scene_index, origin_index, horizon) to avoid recomputing when only t changes.
+    cache: dict[tuple[int, int, int], torch.Tensor] = {}
 
-    def get_predictions(origin_idx: int, horizon: int) -> torch.Tensor:
-        key = (origin_idx, horizon)
+    def get_predictions(scene_idx: int, origin_idx: int, horizon: int) -> torch.Tensor:
+        key = (scene_idx, origin_idx, horizon)
         if key not in cache:
-            print(f"Running inference for origin={origin_idx}, horizon={horizon} ...")
-            seq = sequences[origin_idx]
-            static_map = static_maps[origin_idx]
+            print(f"Running inference for scene={scene_idx}, origin={origin_idx}, horizon={horizon} ...")
+            seq = scene_sequences[scene_idx][origin_idx]
+            static_map = scene_static_maps[scene_idx][origin_idx]
             cache[key] = autoregressive_predict(
                 dynamic_sequence=seq,
                 static_map=static_map,
@@ -304,13 +331,26 @@ def main() -> None:
 
     # Sliders.
     slider_color = "lightgoldenrodyellow"
-    ax_origin = plt.axes([0.12, 0.14, 0.78, 0.03], facecolor=slider_color)
+    ax_scene = plt.axes([0.12, 0.12, 0.18, 0.10], facecolor=slider_color)
+    ax_origin = plt.axes([0.34, 0.17, 0.56, 0.03], facecolor=slider_color)
     ax_t = plt.axes([0.12, 0.09, 0.78, 0.03], facecolor=slider_color)
     ax_h = plt.axes([0.12, 0.04, 0.78, 0.03], facecolor=slider_color)
 
-    origin_slider = Slider(ax_origin, "Origin", 0, max(0, len(sequences) - 1), valinit=init_origin, valstep=1)
+    scene_options = [str(i) for i in range(len(scene_sequences))]
+    scene_radio = RadioButtons(ax_scene, labels=scene_options, active=init_scene)
+    ax_scene.set_title("Scene", fontsize=9)
+    scene_state = {"index": init_scene}
 
-    max_t_global = max(seq.shape[0] - 1 for seq in sequences)
+    origin_slider = Slider(
+        ax_origin,
+        "Origin",
+        0,
+        max(0, len(scene_sequences[init_scene]) - 1),
+        valinit=init_origin,
+        valstep=1,
+    )
+
+    max_t_global = max(seq.shape[0] - 1 for origins in scene_sequences for seq in origins)
     t_slider = Slider(ax_t, "t", history_len, max_t_global, valinit=history_len, valstep=1)
 
     h_slider = Slider(
@@ -324,11 +364,29 @@ def main() -> None:
 
     info_text = fig.text(0.02, 0.96, "", fontsize=10, va="top")
 
+    def _on_scene_select(selection: str) -> None:
+        try:
+            scene_state["index"] = int(selection)
+        except ValueError:
+            return
+        refresh(None)
+
     def refresh(_: float | None = None) -> None:
-        origin_idx = int(origin_slider.val)
+        scene_idx = int(scene_state["index"])
+        origin_max = max(0, len(scene_sequences[scene_idx]) - 1)
+        if origin_slider.valmax != origin_max:
+            origin_slider.valmax = origin_max
+            origin_slider.ax.set_xlim(origin_slider.valmin, origin_max)
+
+        origin_req = int(origin_slider.val)
+        origin_idx = clamp_int(origin_req, 0, origin_max)
+        if origin_idx != origin_req:
+            origin_slider.set_val(origin_idx)
+            return
+
         horizon = int(h_slider.val)
 
-        seq = sequences[origin_idx]
+        seq = scene_sequences[scene_idx][origin_idx]
         t_total, h_img, w_img = seq.shape
         t_min = history_len
         t_max = max(t_min, t_total - 1)
@@ -339,7 +397,7 @@ def main() -> None:
             t_slider.set_val(t)
             return
 
-        preds = get_predictions(origin_idx, horizon)
+        preds = get_predictions(scene_idx, origin_idx, horizon)
 
         past = seq[t - history_len : t]  # (history_len, H, W)
         past_stack = past.max(dim=0).values
@@ -374,11 +432,12 @@ def main() -> None:
 
         total_infer = max(t_total - history_len, 0) * horizon
         info_text.set_text(
-            f"origin={origin_idx} | T={t_total} | t={t} | horizon={horizon} | total inferences={(total_infer)}"
+            f"scene={scene_idx} | origin={origin_idx} | T={t_total} | t={t} | horizon={horizon} | total inferences={(total_infer)}"
         )
 
         fig.canvas.draw_idle()
 
+    scene_radio.on_clicked(_on_scene_select)
     origin_slider.on_changed(refresh)
     t_slider.on_changed(refresh)
     h_slider.on_changed(refresh)
