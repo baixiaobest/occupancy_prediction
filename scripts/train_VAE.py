@@ -462,7 +462,8 @@ def main() -> None:
         best_val_loss = float("inf")
         best_epoch = 0
         curriculum_epochs = args.epochs if args.curriculum_epochs <= 0 else args.curriculum_epochs
-
+        print(f"total epochs: {args.epochs}")
+        
         for epoch in range(1, args.epochs + 1):
             epoch_start = time.perf_counter()
 
@@ -525,7 +526,7 @@ def main() -> None:
             )
 
             if epoch % args.save_interval == 0:
-                periodic_ckpt = args.output.parent / f"{args.output.stem}_epoch_{epoch:03d}{args.output.suffix}"
+                periodic_ckpt = args.output.parent / f"{args.output.stem}_periodic_epoch_{epoch:03d}{args.output.suffix}"
                 periodic_checkpoint = build_checkpoint(
                     encoder=encoder,
                     decoder=decoder,
@@ -550,6 +551,10 @@ def main() -> None:
                     f"Periodic checkpoint saved: {periodic_ckpt}",
                     wandb_run=wandb_run,
                 )
+
+                if wandb_run is not None:
+                    # Keep periodic snapshots visible in W&B Files.
+                    wandb_run.save(str(periodic_ckpt), base_path=str(args.output.parent), policy="now")
 
             if wandb_run is not None:
                 wandb_run.log(
