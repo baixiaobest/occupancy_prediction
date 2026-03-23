@@ -395,7 +395,6 @@ def build_prediction_vae_models(
     output_shape: Sequence[int],
     latent_channel: int,
     channels: Sequence[int] = (32, 64, 128, 128, 128, 128),
-    decoder_base_channels: int | None = None,
     decoder_downsample_channels: Sequence[int] | None = None,
     decoder_context_latent_channel: int | None = None,
     static_stem_channels: int = 8,
@@ -415,14 +414,6 @@ def build_prediction_vae_models(
     )
     context_downsample_strides = [_to_stride2(s) for s in context_downsample_strides]
 
-    if decoder_base_channels is None:
-        decoder_base_channels = int(channels[0])
-
-    if decoder_downsample_channels is None:
-        decoder_downsample_channels = [
-            int(decoder_base_channels),
-            int(decoder_base_channels) * 2,
-        ] + [int(decoder_base_channels) * 4] * (len(context_downsample_strides) - 1)
     decoder_downsample_channels = [int(c) for c in decoder_downsample_channels]
     if len(decoder_downsample_channels) != len(context_downsample_strides) + 1:
         raise ValueError("decoder_downsample_channels length must equal len(context_downsample_strides)+1")

@@ -373,6 +373,42 @@ def weighted_focal_recon_loss(
     return (weights * focal_factor * bce_per_cell).mean()
 
 
+def get_rollout_length(
+    epoch: int,
+    start_k: int,
+    target_k: int,
+    ramp_epochs: int,
+) -> int:
+    """Linearly increase rollout length from `start_k` to `target_k`."""
+    if start_k <= 0 or target_k <= 0:
+        raise ValueError("rollout lengths must be > 0")
+    if ramp_epochs <= 1:
+        return int(target_k)
+
+    progress = float(epoch - 1) / float(ramp_epochs - 1)
+    progress = max(0.0, min(1.0, progress))
+    value = start_k + progress * (target_k - start_k)
+    return max(1, int(round(value)))
+
+
+def get_teacher_forcing_prob(
+    epoch: int,
+    start_p: float,
+    end_p: float,
+    ramp_epochs: int,
+) -> float:
+    """Linearly decrease teacher forcing probability from `start_p` to `end_p`."""
+    if not (0.0 <= start_p <= 1.0 and 0.0 <= end_p <= 1.0):
+        raise ValueError("teacher forcing probabilities must be in [0, 1]")
+    if ramp_epochs <= 1:
+        return float(end_p)
+
+    progress = float(epoch - 1) / float(ramp_epochs - 1)
+    progress = max(0.0, min(1.0, progress))
+    value = start_p + progress * (end_p - start_p)
+    return max(0.0, min(1.0, float(value)))
+
+
 def run_epoch(
     encoder: VAEPredictionEncoder,
     decoder: VAEPredictionDecoder,
@@ -383,6 +419,8 @@ def run_epoch(
     occupied_weight: float,
     focal_gamma: float,
     kl_weight: float,
+    rollout_len: int,
+    teacher_forcing_prob: float,
 ) -> tuple[float, float, float]:
     """Run one epoch (training or evaluation) over `loader`.
 
@@ -400,6 +438,8 @@ def run_epoch(
         occupied_weight: Absolute occupied-cell weight for both BCE and focal losses.
         focal_gamma: Focal exponent used to focus on hard examples.
         kl_weight: Weight to scale the KL term when computing total loss.
+        rollout_len: Number of autoregressive steps used for reconstruction loss.
+        teacher_forcing_prob: Probability of feeding GT at each rollout step.
 
     Returns:
         A tuple `(avg_loss, avg_recon, avg_kl)` averaged over batches.
@@ -424,23 +464,45 @@ def run_epoch(
 
         mu, sigma = encoder(x_encoder_dynamic, x_static)
         z = encoder.sample(mu, sigma)
-        logits = decoder(z, x_decoder_dynamic, x_static)
 
-        if recon_loss_type == "focal":
-            recon = weighted_focal_recon_loss(
-                logits,
-                y,
-                occupied_weight=occupied_weight,
-                focal_gamma=focal_gamma,
-            )
-        elif recon_loss_type == "bce":
-            recon = weighted_bernoulli_recon_loss(
-                logits,
-                y,
-                occupied_weight=occupied_weight,
-            )
-        else:
-            raise ValueError(f"Unsupported recon_loss_type: {recon_loss_type}")
+        horizon = int(y.shape[2])
+        effective_k = max(1, min(int(rollout_len), horizon))
+        context = x_decoder_dynamic.clone()
+        step_recons: list[torch.Tensor] = []
+
+        for step in range(effective_k):
+            logits_full = decoder(z, context, x_static)
+            logits_step = logits_full[:, :, :1]
+            target_step = y[:, :, step : step + 1]
+
+            if recon_loss_type == "focal":
+                step_recon = weighted_focal_recon_loss(
+                    logits_step,
+                    target_step,
+                    occupied_weight=occupied_weight,
+                    focal_gamma=focal_gamma,
+                )
+            elif recon_loss_type == "bce":
+                step_recon = weighted_bernoulli_recon_loss(
+                    logits_step,
+                    target_step,
+                    occupied_weight=occupied_weight,
+                )
+            else:
+                raise ValueError(f"Unsupported recon_loss_type: {recon_loss_type}")
+            step_recons.append(step_recon)
+
+            pred_step = torch.sigmoid(logits_step.detach())
+            if is_train and teacher_forcing_prob < 1.0:
+                batch_size = target_step.shape[0]
+                use_gt = (torch.rand((batch_size, 1, 1, 1, 1), device=device) < teacher_forcing_prob).to(target_step.dtype)
+                feedback_step = use_gt * target_step + (1.0 - use_gt) * pred_step
+            else:
+                feedback_step = target_step if teacher_forcing_prob >= 1.0 else pred_step
+
+            context = torch.cat([context[:, :, 1:], feedback_step], dim=2)
+
+        recon = torch.stack(step_recons).mean()
         kl = kl_divergence(mu, sigma)
         loss = recon + kl_weight * kl
 
@@ -474,6 +536,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history-len", type=int, default=16, help="Number of past frames as encoder input")
     parser.add_argument("--future-len", type=int, default=8, help="Number of future frames to predict")
     parser.add_argument("--decoder-context-len", type=int, default=8, help="Number of past/current frames used to condition decoder")
+    parser.add_argument("--rollout-start-k", type=int, default=1, help="Initial autoregressive rollout length")
+    parser.add_argument("--rollout-target-k", type=int, default=8, help="Target autoregressive rollout length")
+    parser.add_argument("--teacher-forcing-start-p", type=float, default=1.0, help="Initial teacher forcing probability")
+    parser.add_argument("--teacher-forcing-end-p", type=float, default=0.2, help="Final teacher forcing probability")
+    parser.add_argument("--curriculum-epochs", type=int, default=0, help="Epochs to ramp curriculum (0 uses total epochs)")
     parser.add_argument("--window-stride", type=int, default=1, help="Sliding window stride")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation ratio for origin-level split")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -566,6 +633,10 @@ def main() -> None:
 
     if args.decoder_context_len > args.history_len:
         raise ValueError("decoder_context_len must be <= history_len")
+    if args.rollout_start_k <= 0 or args.rollout_target_k <= 0:
+        raise ValueError("rollout_start_k and rollout_target_k must be > 0")
+    if not (0.0 <= args.teacher_forcing_start_p <= 1.0 and 0.0 <= args.teacher_forcing_end_p <= 1.0):
+        raise ValueError("teacher forcing probabilities must be in [0, 1]")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -625,7 +696,6 @@ def main() -> None:
         output_shape=output_shape,
         latent_channel=args.latent_channel,
         channels=args.channels,
-        decoder_base_channels=args.decoder_base_channels,
         decoder_downsample_channels=args.decoder_downsample_channels,
         decoder_context_latent_channel=decoder_context_latent_channel,
         static_stem_channels=args.static_stem_channels,
@@ -667,8 +737,23 @@ def main() -> None:
         total_epoch_time = 0.0
         best_val_loss = float("inf")
         best_epoch = 0
+        curriculum_epochs = args.epochs if args.curriculum_epochs <= 0 else args.curriculum_epochs
         for epoch in range(1, args.epochs + 1):
             epoch_start = time.perf_counter()
+
+            current_rollout_k = get_rollout_length(
+                epoch=epoch,
+                start_k=args.rollout_start_k,
+                target_k=args.rollout_target_k,
+                ramp_epochs=curriculum_epochs,
+            )
+            current_rollout_k = min(current_rollout_k, args.future_len)
+            current_teacher_forcing_p = get_teacher_forcing_prob(
+                epoch=epoch,
+                start_p=args.teacher_forcing_start_p,
+                end_p=args.teacher_forcing_end_p,
+                ramp_epochs=curriculum_epochs,
+            )
 
             train_loss, train_recon, train_kl = run_epoch(
                 encoder,
@@ -680,6 +765,8 @@ def main() -> None:
                 occupied_weight=args.occupied_weight,
                 focal_gamma=args.focal_gamma,
                 kl_weight=args.kl_weight,
+                rollout_len=current_rollout_k,
+                teacher_forcing_prob=current_teacher_forcing_p,
             )
 
             with torch.no_grad():
@@ -693,6 +780,8 @@ def main() -> None:
                     occupied_weight=args.occupied_weight,
                     focal_gamma=args.focal_gamma,
                     kl_weight=args.kl_weight,
+                    rollout_len=current_rollout_k,
+                    teacher_forcing_prob=0.0,
                 )
 
             epoch_duration = time.perf_counter() - epoch_start
@@ -703,6 +792,7 @@ def main() -> None:
 
             _log_message(
                 f"Epoch {epoch:03d} | "
+                f"K={current_rollout_k}, tf_p={current_teacher_forcing_p:.3f} | "
                 f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, kl={train_kl:.6f} | "
                 f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f} | "
                 f"epoch_time={_format_hhmmss(epoch_duration)}, eta={_format_hhmmss(eta_seconds)}",
@@ -719,6 +809,8 @@ def main() -> None:
                         "val/loss": val_loss,
                         "val/recon": val_recon,
                         "val/kl": val_kl,
+                        "curriculum/rollout_k": current_rollout_k,
+                        "curriculum/teacher_forcing_p": current_teacher_forcing_p,
                         "best/val_loss": min(best_val_loss, val_loss),
                     },
                     step=epoch,
@@ -738,6 +830,11 @@ def main() -> None:
                         "history_len": args.history_len,
                         "future_len": args.future_len,
                         "decoder_context_len": args.decoder_context_len,
+                        "rollout_start_k": args.rollout_start_k,
+                        "rollout_target_k": args.rollout_target_k,
+                        "teacher_forcing_start_p": args.teacher_forcing_start_p,
+                        "teacher_forcing_end_p": args.teacher_forcing_end_p,
+                        "curriculum_epochs": curriculum_epochs,
                         "latent_channel": args.latent_channel,
                         "channels": list(args.channels),
                         "decoder_base_channels": args.decoder_base_channels,

@@ -203,7 +203,6 @@ def build_models(
         output_shape=output_shape,
         latent_channel=latent_channel,
         channels=channels,
-        decoder_base_channels=decoder_base_channels,
         decoder_downsample_channels=decoder_downsample_channels,
         decoder_context_latent_channel=decoder_context_latent_channel,
         static_stem_channels=static_stem_channels,
