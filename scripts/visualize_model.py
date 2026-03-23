@@ -20,13 +20,19 @@ from src.VAE_prediction import (
 )
 from src.rollout_data import RollOutData
 
-def _coerce_stride_list(raw: object) -> list[tuple[int, int, int]]:
+def _coerce_stride_list(raw: object) -> list[tuple[int, int]]:
     if raw is None:
         raise ValueError("stride config is missing")
-    return [
-        (int(s[0]), int(s[1]), int(s[2]))
-        for s in raw
-    ]
+    stride_list: list[tuple[int, int]] = []
+    for s in raw:
+        if len(s) == 2:
+            stride_list.append((int(s[0]), int(s[1])))
+        elif len(s) == 3:
+            # Backward compatibility for old checkpoints storing (t, h, w).
+            stride_list.append((int(s[1]), int(s[2])))
+        else:
+            raise ValueError("stride entries must have length 2 or 3")
+    return stride_list
 
 
 def _coerce_channel_list(raw: object) -> list[int]:
@@ -148,7 +154,6 @@ def build_models(
     required_keys = [
         "history_len",
         "latent_channel",
-        "base_channels",
         "static_stem_channels",
         "input_shape",
         "output_shape",
@@ -163,8 +168,23 @@ def build_models(
     history_len = int(model_cfg["history_len"])
     decoder_context_len = int(model_cfg.get("decoder_context_len", min(8, history_len)))
     latent_channel = int(model_cfg["latent_channel"])
-    base_channels = int(model_cfg["base_channels"])
-    decoder_base_channels = int(model_cfg.get("decoder_base_channels", base_channels))
+    model_downsample_strides = _coerce_stride_list(model_cfg["downsample_strides"])
+    channels_cfg = model_cfg.get("channels")
+    if channels_cfg is None:
+        # Backward compatibility: reconstruct old channel schedule from base_channels.
+        base_channels = int(model_cfg["base_channels"])
+        channels = [base_channels, base_channels * 2] + [base_channels * 4] * (len(model_downsample_strides) - 1)
+    else:
+        channels = [int(c) for c in channels_cfg]
+
+    decoder_base_channels = int(model_cfg.get("decoder_base_channels", channels[0]))
+    decoder_downsample_channels_cfg = model_cfg.get("decoder_downsample_channels")
+    if decoder_downsample_channels_cfg is None:
+        decoder_downsample_channels = [decoder_base_channels, decoder_base_channels * 2] + [
+            decoder_base_channels * 4
+        ] * (len(model_downsample_strides) - 1)
+    else:
+        decoder_downsample_channels = [int(c) for c in decoder_downsample_channels_cfg]
     decoder_context_latent_channel = int(
         model_cfg.get("decoder_context_latent_channel", latent_channel)
     )
@@ -172,7 +192,6 @@ def build_models(
 
     input_shape = tuple(model_cfg["input_shape"])
     output_shape = tuple(model_cfg["output_shape"])
-    model_downsample_strides = _coerce_stride_list(model_cfg["downsample_strides"])
     model_upsample_strides = _coerce_stride_list(model_cfg["upsample_strides"])
     model_upsample_channels = _coerce_channel_list(model_cfg["upsample_channels"])
 
@@ -183,8 +202,9 @@ def build_models(
         input_shape=input_shape,
         output_shape=output_shape,
         latent_channel=latent_channel,
-        base_channels=base_channels,
+        channels=channels,
         decoder_base_channels=decoder_base_channels,
+        decoder_downsample_channels=decoder_downsample_channels,
         decoder_context_latent_channel=decoder_context_latent_channel,
         static_stem_channels=static_stem_channels,
         downsample_strides=model_downsample_strides,
@@ -200,11 +220,10 @@ def build_models(
 
     decoder.eval()
 
-    latent_t, latent_h, latent_w = input_shape[1], input_shape[2], input_shape[3]
+    latent_t, latent_h, latent_w = 1, input_shape[2], input_shape[3]
     for stride in model_downsample_strides:
-        latent_t = (latent_t + stride[0] - 1) // stride[0]
-        latent_h = (latent_h + stride[1] - 1) // stride[1]
-        latent_w = (latent_w + stride[2] - 1) // stride[2]
+        latent_h = (latent_h + stride[0] - 1) // stride[0]
+        latent_w = (latent_w + stride[1] - 1) // stride[1]
 
     return decoder, history_len, decoder_context_len, (latent_t, latent_h, latent_w), latent_channel
 

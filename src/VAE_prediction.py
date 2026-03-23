@@ -7,141 +7,114 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-DEFAULT_DOWNSAMPLE_STRIDES: tuple[tuple[int, int, int], ...] = (
-    (2, 2, 2),
-    (2, 2, 2),
-    (1, 2, 2),
-    (1, 2, 2),
-    (1, 2, 2),
+DEFAULT_DOWNSAMPLE_STRIDES: tuple[tuple[int, int], ...] = (
+    (2, 2),
+    (2, 2),
+    (2, 2),
+    (2, 2),
+    (2, 2),
 )
 
-DEFAULT_UPSAMPLE_STRIDES: tuple[tuple[int, int, int], ...] = (
-    (2, 2, 2),
-    (2, 2, 2),
-    (1, 2, 2),
-    (1, 2, 2),
-    (1, 2, 2),
+DEFAULT_UPSAMPLE_STRIDES: tuple[tuple[int, int], ...] = (
+    (2, 2),
+    (2, 2),
+    (2, 2),
+    (2, 2),
+    (2, 2),
 )
 
 DEFAULT_UPSAMPLE_CHANNELS: tuple[int, ...] = (128, 64, 32, 16, 8, 4)
 
 
-def _to_stride3(value: int | Sequence[int]) -> tuple[int, int, int]:
+def _to_stride2(value: int | Sequence[int]) -> tuple[int, int]:
     if isinstance(value, int):
-        stride = (int(value), int(value), int(value))
+        stride = (int(value), int(value))
     else:
-        if len(value) != 3:
-            raise ValueError("stride must have 3 values: (t_stride, h_stride, w_stride)")
-        stride = (int(value[0]), int(value[1]), int(value[2]))
+        if len(value) != 2:
+            raise ValueError("stride must have 2 values: (h_stride, w_stride)")
+        stride = (int(value[0]), int(value[1]))
 
     if any(s <= 0 for s in stride):
         raise ValueError("stride values must be > 0")
     return stride
 
 
-def _deconv_params_from_stride(stride: tuple[int, int, int]) -> tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]:
-    # For stride=1: use (k=3, p=1, op=0) to preserve size.
-    # For stride>1: use (k=2s, p=s//2, op=s%2) to approximately scale by stride.
+def _deconv_params_from_stride2(stride: tuple[int, int]) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
     kernel = tuple(3 if s == 1 else 2 * s for s in stride)
     padding = tuple(1 if s == 1 else s // 2 for s in stride)
     output_padding = tuple(0 if s == 1 else s % 2 for s in stride)
     return kernel, padding, output_padding
 
 
-class _ResidualBlock3d(nn.Module):
-    def __init__(self, channels: int) -> None:
+def _pack_video_time_to_channel(x: torch.Tensor) -> torch.Tensor:
+    if x.ndim != 5:
+        raise ValueError("Expected 5D tensor (B, C, T, H, W)")
+    b, c, t, h, w = x.shape
+    return x.reshape(b, c * t, h, w)
+
+
+def _unpack_channel_to_video(x: torch.Tensor, time_steps: int) -> torch.Tensor:
+    if x.ndim != 4:
+        raise ValueError("Expected 4D tensor (B, C, H, W)")
+    if time_steps <= 0:
+        raise ValueError("time_steps must be > 0")
+    b, c, h, w = x.shape
+    if c % time_steps != 0:
+        raise ValueError(
+            f"Channel dimension {c} is not divisible by time_steps={time_steps}"
+        )
+    c_per_t = c // time_steps
+    return x.view(b, c_per_t, time_steps, h, w).contiguous()
+
+
+def _resize_video_spatial(x: torch.Tensor, out_hw: tuple[int, int]) -> torch.Tensor:
+    b, c, t, h, w = x.shape
+    y = F.interpolate(
+        x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w),
+        size=out_hw,
+        mode="bilinear",
+        align_corners=False,
+    )
+    _, c_out, h_out, w_out = y.shape
+    return y.view(b, t, c_out, h_out, w_out).permute(0, 2, 1, 3, 4).contiguous()
+
+
+class _DownsampleBlock2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: tuple[int, int] = (2, 2)) -> None:
         super().__init__()
-        self.conv1 = nn.Conv3d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm3d(channels)
-        self.conv2 = nn.Conv3d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm3d(channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
         out = self.act(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = self.act(out + identity)
+        out = self.act(self.bn2(self.conv2(out)))
         return out
 
 
-class _DownsampleResBlock3d(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        stride: int | Sequence[int] = 2,
-    ) -> None:
+class _UpsampleBlock2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: tuple[int, int] = (2, 2)) -> None:
         super().__init__()
-        stride_3d = _to_stride3(stride)
-        self.conv1 = nn.Conv3d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=stride_3d,
-            padding=1,
-            bias=False,
-        )
-        self.bn1 = nn.BatchNorm3d(out_channels)
-        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm3d(out_channels)
-        self.skip = nn.Conv3d(
-            in_channels,
-            out_channels,
-            kernel_size=1,
-            stride=stride_3d,
-            bias=False,
-        )
-        self.skip_bn = nn.BatchNorm3d(out_channels)
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.skip_bn(self.skip(x))
-        out = self.act(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = self.act(out + residual)
-        return out
-
-
-class _UpsampleResBlock3d(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        stride: int | Sequence[int] = 2,
-    ) -> None:
-        super().__init__()
-        stride_3d = _to_stride3(stride)
-        kernel_size, padding, output_padding = _deconv_params_from_stride(stride_3d)
-        self.conv1 = nn.ConvTranspose3d(
+        kernel_size, padding, output_padding = _deconv_params_from_stride2(stride)
+        self.conv1 = nn.ConvTranspose2d(
             in_channels,
             out_channels,
             kernel_size=kernel_size,
-            stride=stride_3d,
+            stride=stride,
             padding=padding,
             output_padding=output_padding,
             bias=False,
         )
-        self.bn1 = nn.BatchNorm3d(out_channels)
-        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm3d(out_channels)
-        self.skip = nn.ConvTranspose3d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=stride_3d,
-            padding=padding,
-            output_padding=output_padding,
-            bias=False,
-        )
-        self.skip_bn = nn.BatchNorm3d(out_channels)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.skip_bn(self.skip(x))
         out = self.act(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = self.act(out + residual)
+        out = self.act(self.bn2(self.conv2(out)))
         return out
 
 
@@ -152,16 +125,9 @@ class VAEPredictionEncoder(nn.Module):
         self,
         input_shape: Sequence[int],
         latent_channel: int,
-        base_channels: int = 32,
+        channels: Sequence[int] = (32, 64, 128, 128, 128, 128),
         static_stem_channels: int = 8,
-        downsample_strides: Sequence[int | Sequence[int]] = (
-            (2, 2, 2),
-            (2, 2, 2),
-            (1, 2, 2),
-            (1, 2, 2),
-            (1, 2, 2),
-            (1, 2, 2),
-        ),
+        downsample_strides: Sequence[int | Sequence[int]] = DEFAULT_DOWNSAMPLE_STRIDES,
     ) -> None:
         super().__init__()
         if len(input_shape) != 4:
@@ -169,56 +135,56 @@ class VAEPredictionEncoder(nn.Module):
 
         in_channels = int(input_shape[0])
         # Kept for API compatibility. The latent representation is now a feature map
-        # (B, c3, T/4, H/64, W/64), not a flattened vector of size `latent_dim`.
+        # (B, c3, H/64, W/64), not a flattened vector of size `latent_dim`.
         self.latent_channel = int(latent_channel)
         if self.latent_channel <= 0:
             raise ValueError("latent_dim must be > 0")
+        self.input_time_steps = int(input_shape[1])
+        if self.input_time_steps <= 0:
+            raise ValueError("input_shape time dimension must be > 0")
         self.static_stem_channels = int(static_stem_channels)
         if self.static_stem_channels <= 0:
             raise ValueError("static_stem_channels must be > 0")
 
-        c1 = int(base_channels)
-        c2 = c1 * 2
-        c3 = c2 * 2
-        c_merge = c1 + self.static_stem_channels
+        self.channels = [int(c) for c in channels]
+        if len(self.channels) < 2:
+            raise ValueError("channels must contain at least 2 entries")
+        if any(c <= 0 for c in self.channels):
+            raise ValueError("all channels values must be > 0")
 
-        if len(downsample_strides) < 2:
-            raise ValueError("downsample_strides must contain at least 2 stride entries")
+        if len(downsample_strides) != len(self.channels) - 1:
+            raise ValueError("downsample_strides length must equal len(channels)-1")
 
-        stride_list = [_to_stride3(s) for s in downsample_strides]
-        s1, s2 = stride_list[0], stride_list[1]
+        stride_list = [_to_stride2(s) for s in downsample_strides]
 
         self.dynamic_stem = nn.Sequential(
-            nn.Conv3d(in_channels, c1, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(c1),
+            nn.Conv2d(in_channels * self.input_time_steps, self.channels[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(self.channels[0]),
             nn.ReLU(inplace=True),
         )
         self.static_stem = nn.Sequential(
-            nn.Conv3d(1, self.static_stem_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(self.static_stem_channels),
+            nn.Conv2d(self.input_time_steps, self.static_stem_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(self.static_stem_channels),
             nn.ReLU(inplace=True),
         )
-        # dynamic_x: (B, C, T, H, W)
-        # static_x: (B, 1, T, H, W)
-        # after stems + concat: (B, c1 + static_c, T, H, W)
-        self.res1 = _ResidualBlock3d(c_merge)
-        self.down1 = _DownsampleResBlock3d(c_merge, c2, stride=s1)
-        self.res2 = _ResidualBlock3d(c2)
-        self.down2 = _DownsampleResBlock3d(c2, c3, stride=s2)
-        self.res3 = _ResidualBlock3d(c3)
-        self.extra_spatial_down = nn.ModuleList(
-            [_DownsampleResBlock3d(c3, c3, stride=s) for s in stride_list[2:]]
-        )
-        # default strides -> latent map: (B, c3, T/4, H/64, W/64)
+        down_blocks: list[nn.Module] = []
+        in_ch = self.channels[0] + self.static_stem_channels
+        for out_ch, stride in zip(self.channels[1:], stride_list):
+            down_blocks.append(_DownsampleBlock2d(in_ch, out_ch, stride=stride))
+            in_ch = out_ch
+        self.down_blocks = nn.ModuleList(down_blocks)
 
-        # Mu is map via 1x1x1 conv.
-        # Sigma is a same-shape positive map via 1x1x1 conv + softplus.
-        self.mu_head = nn.Conv3d(c3, self.latent_channel, kernel_size=1)
-        self.sigma_head = nn.Conv3d(c3, self.latent_channel, kernel_size=1)
+        # Latent time is collapsed to 1 because temporal information is packed in channels.
+        self.mu_head = nn.Conv2d(self.channels[-1], self.latent_channel, kernel_size=1)
+        self.sigma_head = nn.Conv2d(self.channels[-1], self.latent_channel, kernel_size=1)
 
     def forward(self, dynamic_x: torch.Tensor, static_x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if dynamic_x.ndim != 5:
             raise ValueError("dynamic_x must have shape (B, C, T, H, W)")
+        if dynamic_x.shape[2] != self.input_time_steps:
+            raise ValueError(
+                f"dynamic_x time dimension must be {self.input_time_steps}, got {dynamic_x.shape[2]}"
+            )
 
         if static_x.ndim == 4:
             # (B, 1, H, W) -> (B, 1, 1, H, W)
@@ -231,25 +197,20 @@ class VAEPredictionEncoder(nn.Module):
         if static_x.shape[-2:] != dynamic_x.shape[-2:]:
             raise ValueError("static_x and dynamic_x must share H/W")
 
-        if static_x.shape[2] == 1 and dynamic_x.shape[2] > 1:
-            static_x = static_x.expand(-1, -1, dynamic_x.shape[2], -1, -1)
-        elif static_x.shape[2] != dynamic_x.shape[2]:
+        if static_x.shape[2] == 1 and self.input_time_steps > 1:
+            static_x = static_x.expand(-1, -1, self.input_time_steps, -1, -1)
+        elif static_x.shape[2] != self.input_time_steps:
             raise ValueError("static_x time dimension must be 1 or match dynamic_x")
 
-        h_dyn = self.dynamic_stem(dynamic_x)
-        h_static = self.static_stem(static_x)
+        h_dyn = self.dynamic_stem(_pack_video_time_to_channel(dynamic_x))
+        h_static = self.static_stem(_pack_video_time_to_channel(static_x))
         h = torch.cat([h_dyn, h_static], dim=1)
 
-        h = self.res1(h)
-        h = self.down1(h)
-        h = self.res2(h)
-        h = self.down2(h)
-        h = self.res3(h)
-        for down_block in self.extra_spatial_down:
+        for down_block in self.down_blocks:
             h = down_block(h)
 
-        mu = self.mu_head(h)
-        sigma = F.softplus(self.sigma_head(h)) + 1e-6
+        mu = self.mu_head(h).unsqueeze(2)
+        sigma = (F.softplus(self.sigma_head(h)) + 1e-6).unsqueeze(2)
         return mu, sigma
 
     @staticmethod
@@ -262,8 +223,7 @@ class VAEPredictionEncoder(nn.Module):
 class VAEPredictionDecoder(nn.Module):
     """Fixed ResNet-style 3D CNN decoder with convolutional context conditioning.
 
-    Expects `z` as a latent feature map with shape
-    `(B, C3, T/s_t, H/s_h, W/s_w)` from the encoder.
+    Expects `z` as a latent feature map with shape `(B, C_latent, 1, H, W)`.
     """
 
     def __init__(
@@ -272,7 +232,7 @@ class VAEPredictionDecoder(nn.Module):
         output_shape: Sequence[int],
         context_frames: int = 8,
         context_latent_channels: int | None = 32,
-        base_channels: int = 8,
+        downsample_channels: Sequence[int] = (8, 16, 32, 32, 32, 32),
         static_stem_channels: int = 8,
         context_downsample_strides: Sequence[int | Sequence[int]] = DEFAULT_DOWNSAMPLE_STRIDES,
         upsample_channels: Sequence[int] | None = (
@@ -284,14 +244,7 @@ class VAEPredictionDecoder(nn.Module):
             4,
             2
         ),
-        upsample_strides: Sequence[int | Sequence[int]] = (
-            (2, 2, 2),
-            (2, 2, 2),
-            (1, 2, 2),
-            (1, 2, 2),
-            (1, 2, 2),
-            (1, 2, 2),
-        ),
+        upsample_strides: Sequence[int | Sequence[int]] = DEFAULT_UPSAMPLE_STRIDES,
     ) -> None:
         super().__init__()
 
@@ -316,19 +269,19 @@ class VAEPredictionDecoder(nn.Module):
         if self.context_latent_channels <= 0:
             raise ValueError("context_latent_channels must be > 0")
 
-        c1 = int(base_channels)
-        c2 = c1 * 2
-        c3 = c2 * 2
-        c_merge = c1 + self.static_stem_channels
+        self.downsample_channels = [int(c) for c in downsample_channels]
+        if len(self.downsample_channels) < 2:
+            raise ValueError("downsample_channels must contain at least 2 entries")
+        if any(c <= 0 for c in self.downsample_channels):
+            raise ValueError("all downsample_channels values must be > 0")
 
-        if len(context_downsample_strides) < 2:
-            raise ValueError("context_downsample_strides must contain at least 2 stride entries")
-        context_stride_list = [_to_stride3(s) for s in context_downsample_strides]
-        s1, s2 = context_stride_list[0], context_stride_list[1]
+        if len(context_downsample_strides) != len(self.downsample_channels) - 1:
+            raise ValueError("context_downsample_strides length must equal len(downsample_channels)-1")
+        context_stride_list = [_to_stride2(s) for s in context_downsample_strides]
 
         if len(upsample_strides) == 0:
             raise ValueError("upsample_strides must contain at least 1 stride entry")
-        upsample_stride_list = [_to_stride3(s) for s in upsample_strides]
+        upsample_stride_list = [_to_stride2(s) for s in upsample_strides]
 
         upsample_channels = [int(c) for c in upsample_channels]
         if len(upsample_channels) != len(upsample_stride_list) + 1:
@@ -338,38 +291,46 @@ class VAEPredictionDecoder(nn.Module):
             )
 
         self.context_dynamic_stem = nn.Sequential(
-            nn.Conv3d(1, c1, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(c1),
+            nn.Conv2d(self.context_frames, self.downsample_channels[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(self.downsample_channels[0]),
             nn.ReLU(inplace=True),
         )
         self.context_static_stem = nn.Sequential(
-            nn.Conv3d(1, self.static_stem_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(self.static_stem_channels),
+            nn.Conv2d(self.context_frames, self.static_stem_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(self.static_stem_channels),
             nn.ReLU(inplace=True),
         )
-        self.context_res1 = _ResidualBlock3d(c_merge)
-        self.context_down1 = _DownsampleResBlock3d(c_merge, c2, stride=s1)
-        self.context_res2 = _ResidualBlock3d(c2)
-        self.context_down2 = _DownsampleResBlock3d(c2, c3, stride=s2)
-        self.context_res3 = _ResidualBlock3d(c3)
-        self.context_extra_spatial_down = nn.ModuleList(
-            [_DownsampleResBlock3d(c3, c3, stride=s) for s in context_stride_list[2:]]
+        context_down_blocks: list[nn.Module] = []
+        in_ch = self.downsample_channels[0] + self.static_stem_channels
+        for out_ch, stride in zip(self.downsample_channels[1:], context_stride_list):
+            context_down_blocks.append(_DownsampleBlock2d(in_ch, out_ch, stride=stride))
+            in_ch = out_ch
+        self.context_down_blocks = nn.ModuleList(context_down_blocks)
+        self.context_to_latent = nn.Conv2d(
+            self.downsample_channels[-1],
+            self.context_latent_channels,
+            kernel_size=1,
         )
-        self.context_to_latent = nn.Conv3d(c3, self.context_latent_channels, kernel_size=1)
 
         merged_channels = self.latent_channels + self.context_latent_channels
-        self.res_in = _ResidualBlock3d(merged_channels)
-        self.input_proj = nn.Conv3d(merged_channels, upsample_channels[0], kernel_size=1)
+        self.input_proj = nn.Conv2d(merged_channels, upsample_channels[0], kernel_size=1)
 
         self.upsample_blocks = nn.ModuleList(
             [
-                _UpsampleResBlock3d(upsample_channels[i], upsample_channels[i + 1], stride=s)
+                _UpsampleBlock2d(
+                    upsample_channels[i],
+                    upsample_channels[i + 1],
+                    stride=s,
+                )
                 for i, s in enumerate(upsample_stride_list)
             ]
         )
-        self.res_out = _ResidualBlock3d(upsample_channels[-1])
-
-        self.to_output = nn.Conv3d(upsample_channels[-1], self.output_shape[0], kernel_size=3, padding=1)
+        self.to_output = nn.Conv2d(
+            upsample_channels[-1],
+            self.output_shape[0] * self.output_shape[1],
+            kernel_size=3,
+            padding=1,
+        )
 
     def forward(
         self,
@@ -378,10 +339,14 @@ class VAEPredictionDecoder(nn.Module):
         static_x: torch.Tensor,
     ) -> torch.Tensor:
         if z.ndim != 5:
-            raise ValueError("z must have shape (B, C3, T/s_t, H/s_h, W/s_w)")
+            raise ValueError("z must have shape (B, C_latent, 1, H, W)")
         if z.shape[1] != self.latent_channels:
             raise ValueError(
                 f"Expected z channel dimension {self.latent_channels}, got {z.shape[1]}"
+            )
+        if z.shape[2] != 1:
+            raise ValueError(
+                f"Expected z time dimension 1, got {z.shape[2]}"
             )
 
         if dynamic_context.ndim != 5:
@@ -406,31 +371,22 @@ class VAEPredictionDecoder(nn.Module):
         elif static_x.shape[2] != dynamic_context.shape[2]:
             raise ValueError("static_x time dimension must be 1 or match dynamic_context")
 
-        cond_dyn = self.context_dynamic_stem(dynamic_context)
-        cond_static = self.context_static_stem(static_x)
+        cond_dyn = self.context_dynamic_stem(_pack_video_time_to_channel(dynamic_context))
+        cond_static = self.context_static_stem(_pack_video_time_to_channel(static_x))
         cond = torch.cat([cond_dyn, cond_static], dim=1)
-        cond = self.context_res1(cond)
-        cond = self.context_down1(cond)
-        cond = self.context_res2(cond)
-        cond = self.context_down2(cond)
-        cond = self.context_res3(cond)
-        for down_block in self.context_extra_spatial_down:
+        for down_block in self.context_down_blocks:
             cond = down_block(cond)
-        cond = self.context_to_latent(cond)
-        cond = F.interpolate(cond, size=z.shape[2:], mode="trilinear", align_corners=False)
+        cond = self.context_to_latent(cond).unsqueeze(2)
+        cond = _resize_video_spatial(cond, (z.shape[3], z.shape[4]))
 
         merged = torch.cat([z, cond], dim=1)
 
-        h = self.res_in(merged)
-        h = self.input_proj(h)
+        h = self.input_proj(_pack_video_time_to_channel(merged))
         for up_block in self.upsample_blocks:
             h = up_block(h)
-        h = self.res_out(h)
-        h = self.to_output(h)
+        h = _unpack_channel_to_video(self.to_output(h), self.output_shape[1])
 
-        # Match the requested temporal-spatial size even when strides do not align exactly.
-        # Final output is one-step prediction: (B, C_out, 1, H, W)
-        h = F.interpolate(h, size=self.output_shape[1:], mode="trilinear", align_corners=False)
+        h = _resize_video_spatial(h, (self.output_shape[2], self.output_shape[3]))
         return h
 
 
@@ -438,8 +394,9 @@ def build_prediction_vae_models(
     input_shape: Sequence[int],
     output_shape: Sequence[int],
     latent_channel: int,
-    base_channels: int = 32,
+    channels: Sequence[int] = (32, 64, 128, 128, 128, 128),
     decoder_base_channels: int | None = None,
+    decoder_downsample_channels: Sequence[int] | None = None,
     decoder_context_latent_channel: int | None = None,
     static_stem_channels: int = 8,
     decoder_context_frames: int = 8,
@@ -450,25 +407,39 @@ def build_prediction_vae_models(
     device: torch.device | str | None = None,
 ) -> tuple[VAEPredictionEncoder, VAEPredictionDecoder]:
     """Build a consistent encoder/decoder pair for occupancy prediction."""
+    if any(int(c) <= 0 for c in channels):
+        raise ValueError("channels must contain positive integers")
+
+    context_downsample_strides = (
+        downsample_strides if decoder_context_downsample_strides is None else decoder_context_downsample_strides
+    )
+    context_downsample_strides = [_to_stride2(s) for s in context_downsample_strides]
+
     if decoder_base_channels is None:
-        decoder_base_channels = base_channels
+        decoder_base_channels = int(channels[0])
+
+    if decoder_downsample_channels is None:
+        decoder_downsample_channels = [
+            int(decoder_base_channels),
+            int(decoder_base_channels) * 2,
+        ] + [int(decoder_base_channels) * 4] * (len(context_downsample_strides) - 1)
+    decoder_downsample_channels = [int(c) for c in decoder_downsample_channels]
+    if len(decoder_downsample_channels) != len(context_downsample_strides) + 1:
+        raise ValueError("decoder_downsample_channels length must equal len(context_downsample_strides)+1")
 
     encoder = VAEPredictionEncoder(
         input_shape=input_shape,
         latent_channel=latent_channel,
-        base_channels=base_channels,
+        channels=channels,
         static_stem_channels=static_stem_channels,
         downsample_strides=downsample_strides,
-    )
-    context_downsample_strides = (
-        downsample_strides if decoder_context_downsample_strides is None else decoder_context_downsample_strides
     )
     decoder = VAEPredictionDecoder(
         latent_dim=latent_channel,
         output_shape=output_shape,
         context_frames=decoder_context_frames,
         context_latent_channels=decoder_context_latent_channel,
-        base_channels=decoder_base_channels,
+        downsample_channels=decoder_downsample_channels,
         static_stem_channels=static_stem_channels,
         context_downsample_strides=context_downsample_strides,
         upsample_channels=upsample_channels,

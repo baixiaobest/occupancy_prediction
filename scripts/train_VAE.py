@@ -496,8 +496,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (0 disables focal modulation)")
     parser.add_argument("--kl-weight", type=float, default=1e-3)
     parser.add_argument("--latent-channel", type=int, default=128)
-    parser.add_argument("--base-channels", type=int, default=32)
+    parser.add_argument(
+        "--channels",
+        type=int,
+        nargs="+",
+        default=[32, 64, 128, 128, 128, 128],
+        help="Encoder channel widths. Must have len(downsample_strides)+1 entries.",
+    )
     parser.add_argument("--decoder-base-channels", type=int, default=8)
+    parser.add_argument(
+        "--decoder-downsample-channels",
+        type=int,
+        nargs="+",
+        default=[32, 64, 128, 128, 128, 128],
+        help="Decoder context downsample channel widths. Must have len(DEFAULT_DOWNSAMPLE_STRIDES)+1 entries.",
+    )
     parser.add_argument(
         "--decoder-context-latent-channel",
         type=int,
@@ -596,6 +609,11 @@ def main() -> None:
     downsample_strides = list(DEFAULT_DOWNSAMPLE_STRIDES)
     upsample_strides = list(DEFAULT_UPSAMPLE_STRIDES)
     upsample_channels = list(DEFAULT_UPSAMPLE_CHANNELS)
+    if len(args.channels) != len(downsample_strides) + 1:
+        raise ValueError("channels must have len(DEFAULT_DOWNSAMPLE_STRIDES)+1 entries")
+    if args.decoder_downsample_channels is not None and len(args.decoder_downsample_channels) != len(downsample_strides) + 1:
+        raise ValueError("decoder_downsample_channels must have len(DEFAULT_DOWNSAMPLE_STRIDES)+1 entries")
+
     decoder_context_latent_channel = (
         args.decoder_context_latent_channel
         if args.decoder_context_latent_channel is not None
@@ -606,8 +624,9 @@ def main() -> None:
         input_shape=input_shape,
         output_shape=output_shape,
         latent_channel=args.latent_channel,
-        base_channels=args.base_channels,
+        channels=args.channels,
         decoder_base_channels=args.decoder_base_channels,
+        decoder_downsample_channels=args.decoder_downsample_channels,
         decoder_context_latent_channel=decoder_context_latent_channel,
         static_stem_channels=args.static_stem_channels,
         decoder_context_frames=dec_ctx_t,
@@ -720,8 +739,13 @@ def main() -> None:
                         "future_len": args.future_len,
                         "decoder_context_len": args.decoder_context_len,
                         "latent_channel": args.latent_channel,
-                        "base_channels": args.base_channels,
+                        "channels": list(args.channels),
                         "decoder_base_channels": args.decoder_base_channels,
+                        "decoder_downsample_channels": (
+                            list(args.decoder_downsample_channels)
+                            if args.decoder_downsample_channels is not None
+                            else None
+                        ),
                         "decoder_context_latent_channel": decoder_context_latent_channel,
                         "static_stem_channels": args.static_stem_channels,
                         "downsample_strides": downsample_strides,
