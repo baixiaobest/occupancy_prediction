@@ -6,14 +6,11 @@ import random
 import sys
 import time
 from datetime import datetime
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Sequence
 
 import torch
-import torch.nn.functional as F
-from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 try:
     import wandb
@@ -30,347 +27,8 @@ from src.VAE_prediction import (
     DEFAULT_UPSAMPLE_STRIDES,
     build_prediction_vae_models,
 )
-from src.rollout_data import RollOutData
-
-
-@dataclass
-class DatasetStats:
-    num_scene_files: int
-    num_train_origins: int
-    num_val_origins: int
-    num_train_samples: int
-    num_val_samples: int
-
-
-class OccupancyWindowDataset(Dataset):
-    """Sliding-window dataset over dynamic occupancy sequences.
-
-    Each sample uses dynamic history + static map and predicts next dynamic frame.
-    Dynamic input shape: (1, history_len, H, W)
-    Static input shape:  (1, H, W)
-    Target shape: (1, 1, H, W)
-    """
-
-    def __init__(
-        self,
-        sequences: Sequence[tuple[torch.Tensor, torch.Tensor]],
-        history_len: int = 16,
-        future_len: int = 8,
-        decoder_context_len: int = 8,
-        stride: int = 1,
-    ) -> None:
-        if history_len <= 0:
-            raise ValueError("history_len must be > 0")
-        if future_len <= 0:
-            raise ValueError("future_len must be > 0")
-        if decoder_context_len <= 0:
-            raise ValueError("decoder_context_len must be > 0")
-        if decoder_context_len > history_len:
-            raise ValueError("decoder_context_len must be <= history_len")
-        if stride <= 0:
-            raise ValueError("stride must be > 0")
-
-        """Create a sliding-window dataset from a list of occupancy sequences.
-
-        Args:
-            sequences: Iterable of `(dynamic_seq, static_map)` tuples where
-                `dynamic_seq` is `(T, H, W)` and `static_map` is `(H, W)`.
-            history_len: Number of past frames used as input (the target is the
-                next single frame).
-            stride: Step size between window starts when creating samples.
-
-        Raises:
-            ValueError: If `history_len` or `stride` are non-positive or if
-                any sequence does not have shape `(T, H, W)` during indexing.
-        """
-
-        self.history_len = int(history_len)
-        self.future_len = int(future_len)
-        self.decoder_context_len = int(decoder_context_len)
-        self.window_size = self.history_len + self.future_len
-        self.sequences = list(sequences)
-        self.samples: list[tuple[int, int]] = []
-
-        for seq_idx, (seq, static_map) in enumerate(self.sequences):
-            if seq.ndim != 3:
-                raise ValueError("Each sequence must have shape (T, H, W)")
-            if static_map.ndim != 2:
-                raise ValueError("Each static map must have shape (H, W)")
-            if static_map.shape != seq.shape[-2:]:
-                raise ValueError("Static map shape must match sequence spatial shape")
-            t = seq.shape[0]
-            if t < self.window_size:
-                continue
-            for start in range(0, t - self.window_size + 1, stride):
-                self.samples.append((seq_idx, start))
-
-    def __len__(self) -> int:
-        """Return the number of sliding-window samples available."""
-        return len(self.samples)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the (input, target) pair for the sample at `index`.
-
-        Returns:
-            A tuple `(x_encoder_dynamic, x_decoder_dynamic, x_static, y)` where
-            `x_encoder_dynamic` has shape `(1, history_len + future_len, H, W)`,
-            `x_decoder_dynamic` has shape `(1, decoder_context_len, H, W)`,
-            `x_static` has shape `(1, H, W)`, and `y` has shape
-            `(1, future_len, H, W)`.
-        """
-        seq_idx, start = self.samples[index]
-        seq, static_map = self.sequences[seq_idx]
-
-        past = seq[start : start + self.history_len]  # (history_len, H, W)
-        future = seq[start + self.history_len : start + self.window_size]  # (future_len, H, W)
-
-        x_encoder_dynamic = torch.cat([past, future], dim=0).unsqueeze(0)
-        x_decoder_dynamic = past[-self.decoder_context_len :].unsqueeze(0)
-        x_static = static_map.unsqueeze(0)  # (1, H, W)
-        y = future.unsqueeze(0)  # (1, future_len, H, W)
-        return x_encoder_dynamic, x_decoder_dynamic, x_static, y
-
-
-def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Load occupancy sequences from a .pt rollout file.
-
-    Supports only `static_maps` + `dynamic_grids` payloads.
-
-    Args:
-        pt_path: Path to the .pt file to load.
-
-    Returns:
-        A list of `(dynamic_seq, static_map)` tuples.
-
-    Raises:
-        ValueError: If the payload format is not recognized or if frames are
-            not 2D arrays.
-    """
-    payload = torch.load(pt_path, map_location="cpu")
-
-    def _to_2d(frame: object) -> torch.Tensor:
-        tensor = torch.as_tensor(frame, dtype=torch.float32)
-        if tensor.ndim == 3 and tensor.shape[0] == 1:
-            tensor = tensor[0]
-        if tensor.ndim != 2:
-            raise ValueError(f"Occupancy frame must be 2D, got shape {tuple(tensor.shape)}")
-        return (tensor > 0).float()
-
-    def _from_rollout_obj(obj: RollOutData) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        if hasattr(obj, "dynamic_grids") and hasattr(obj, "static_maps"):
-            if len(obj.dynamic_grids) != len(obj.static_maps):
-                raise ValueError("dynamic_grids and static_maps must have same length")
-
-            out: list[tuple[torch.Tensor, torch.Tensor]] = []
-            for dyn_series, static_map in zip(obj.dynamic_grids, obj.static_maps):
-                dyn_frames = [_to_2d(frame) for frame in dyn_series]
-                if not dyn_frames:
-                    continue
-                dynamic_seq = torch.stack(dyn_frames, dim=0)
-                out.append((dynamic_seq, _to_2d(static_map)))
-            return out
-
-        raise ValueError("Unsupported RollOutData schema")
-
-    sequences: list[tuple[torch.Tensor, torch.Tensor]] = []
-    if isinstance(payload, RollOutData):
-        sequences.extend(_from_rollout_obj(payload))
-    elif isinstance(payload, dict):
-        if "dynamic_grids" in payload and "static_maps" in payload:
-            pseudo = RollOutData(
-                static_maps=payload["static_maps"],
-                dynamic_grids=payload["dynamic_grids"],
-                dt=float(payload.get("dt", 0.0)),
-            )
-            sequences.extend(_from_rollout_obj(pseudo))
-        else:
-            raise ValueError(f"Unsupported payload format in {pt_path}")
-    elif isinstance(payload, list):
-        if all(isinstance(x, RollOutData) for x in payload):
-            for item in payload:
-                sequences.extend(_from_rollout_obj(item))
-        else:
-            raise ValueError(
-                "List payload must contain RollOutData objects with dynamic_grids/static_maps"
-            )
-    else:
-        raise ValueError(f"Unsupported payload format in {pt_path}")
-
-    return sequences
-
-
-def _split_origins(
-    sequences: Sequence[tuple[torch.Tensor, torch.Tensor]],
-    val_ratio: float,
-    rng: random.Random,
-) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], list[tuple[torch.Tensor, torch.Tensor]]]:
-    """Split a sequence list into train and validation subsets.
-
-    The split is performed at the origin (sequence) level using a provided
-    RNG for deterministic shuffling when seeded.
-
-    Args:
-        sequences: Sequence of tensors `(T, H, W)` to split.
-        val_ratio: Fraction of origins to assign to validation (in [0, 1)).
-        rng: Random instance for shuffling.
-
-    Returns:
-        A pair `(train_sequences, val_sequences)`.
-
-    Raises:
-        ValueError: If `val_ratio` is outside the allowed range.
-    """
-    if not 0.0 <= val_ratio < 1.0:
-        raise ValueError("val_ratio must be in [0.0, 1.0)")
-
-    indices = list(range(len(sequences)))
-    rng.shuffle(indices)
-
-    if len(indices) <= 1 or val_ratio == 0.0:
-        train_idx = indices
-        val_idx: list[int] = []
-    else:
-        val_count = max(1, int(round(len(indices) * val_ratio)))
-        val_count = min(val_count, len(indices) - 1)
-        val_idx = indices[:val_count]
-        train_idx = indices[val_count:]
-
-    train_sequences = [sequences[i] for i in train_idx]
-    val_sequences = [sequences[i] for i in val_idx]
-    return train_sequences, val_sequences
-
-
-def build_datasets(
-    data_dir: Path,
-    val_ratio: float,
-    history_len: int,
-    future_len: int,
-    decoder_context_len: int,
-    window_stride: int,
-    seed: int,
-) -> tuple[OccupancyWindowDataset, OccupancyWindowDataset, DatasetStats]:
-    """Discover .pt files in `data_dir` and build train/val datasets.
-
-    This function loads each .pt file's per-origin sequences, performs an
-    origin-level train/validation split, and returns `OccupancyWindowDataset`
-    instances for training and validation along with summary statistics.
-
-    Args:
-        data_dir: Directory containing `.pt` rollouts.
-        val_ratio: Fraction of origins allocated to validation.
-        history_len: Number of past frames used as encoder input.
-        window_stride: Sliding-window stride when creating samples.
-        seed: RNG seed for deterministic splits.
-
-    Returns:
-        `(train_dataset, val_dataset, stats)`.
-    """
-    rng = random.Random(seed)
-
-    all_train_sequences: list[tuple[torch.Tensor, torch.Tensor]] = []
-    all_val_sequences: list[tuple[torch.Tensor, torch.Tensor]] = []
-
-    pt_files = sorted(data_dir.glob("*.pt"))
-    if not pt_files:
-        raise FileNotFoundError(f"No .pt files found in {data_dir}")
-
-    for pt_file in pt_files:
-        scene_sequences = _load_scene_origins(pt_file)
-        train_seq, val_seq = _split_origins(scene_sequences, val_ratio, rng)
-        all_train_sequences.extend(train_seq)
-        all_val_sequences.extend(val_seq)
-
-    train_dataset = OccupancyWindowDataset(
-        all_train_sequences,
-        history_len=history_len,
-        future_len=future_len,
-        decoder_context_len=decoder_context_len,
-        stride=window_stride,
-    )
-    val_dataset = OccupancyWindowDataset(
-        all_val_sequences,
-        history_len=history_len,
-        future_len=future_len,
-        decoder_context_len=decoder_context_len,
-        stride=window_stride,
-    )
-
-    stats = DatasetStats(
-        num_scene_files=len(pt_files),
-        num_train_origins=len(all_train_sequences),
-        num_val_origins=len(all_val_sequences),
-        num_train_samples=len(train_dataset),
-        num_val_samples=len(val_dataset),
-    )
-    return train_dataset, val_dataset, stats
-
-
-def kl_divergence(mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """Compute analytic KL divergence between N(mu, sigma^2) and N(0, I).
-
-    Args:
-        mu: Tensor of shape `(B, C, T, H, W)` representing latent means.
-        sigma: Tensor of the same shape representing standard deviations.
-
-    Returns:
-        Scalar tensor: mean KL divergence across the batch.
-    """
-    var = sigma.pow(2)
-    kl = 0.5 * (mu.pow(2) + var - torch.log(var + 1e-8) - 1)
-    kl = kl.sum(dim=(1,2,3,4)).mean()
-
-    return kl
-
-
-def weighted_bernoulli_recon_loss(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    occupied_weight: float,
-) -> torch.Tensor:
-    """Compute occupied-weighted binary cross-entropy.
-
-    Cells where `target == 1` receive `occupied_weight` and cells where
-    `target == 0` receive weight 1.0.
-
-    Args:
-        logits: Raw model outputs (before sigmoid), shape `(B, C, 1, H, W)`.
-        target: Ground-truth binary targets with same spatial shape.
-        occupied_weight: Absolute multiplier for positive (occupied) cells.
-
-    Returns:
-        Scalar loss tensor averaged over the batch.
-    """
-    if occupied_weight < 1.0:
-        raise ValueError("occupied_weight must be >= 1.0")
-
-    pos_w = torch.tensor(float(occupied_weight), device=target.device, dtype=target.dtype)
-    weights = torch.where(target > 0.5, pos_w, torch.ones_like(target))
-    return F.binary_cross_entropy_with_logits(logits, target, weight=weights, reduction="mean")
-
-
-def weighted_focal_recon_loss(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    occupied_weight: float,
-    focal_gamma: float,
-) -> torch.Tensor:
-    """Compute occupied-weighted focal BCE between `logits` and `target`.
-
-    Focal modulation down-weights easy predictions via `(1 - p_t)^gamma`.
-    """
-    if occupied_weight < 1.0:
-        raise ValueError("occupied_weight must be >= 1.0")
-    if focal_gamma < 0.0:
-        raise ValueError("focal_gamma must be >= 0.0")
-
-    bce_per_cell = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-    probs = torch.sigmoid(logits)
-    p_t = probs * target + (1.0 - probs) * (1.0 - target)
-    focal_factor = (1.0 - p_t).pow(focal_gamma)
-
-    pos_w = torch.tensor(float(occupied_weight), device=target.device, dtype=target.dtype)
-    weights = torch.where(target > 0.5, pos_w, torch.ones_like(target))
-    return (weights * focal_factor * bce_per_cell).mean()
+from src.Dataset import build_datasets
+from src.loss import kl_divergence, weighted_bernoulli_recon_loss, weighted_focal_recon_loss
 
 
 def get_rollout_length(
@@ -628,6 +286,64 @@ def _log_message(message: str, wandb_run: object | None = None) -> None:
         wandb.termlog(message)
 
 
+def build_checkpoint(
+    encoder: VAEPredictionEncoder,
+    decoder: VAEPredictionDecoder,
+    args: argparse.Namespace,
+    curriculum_epochs: int,
+    decoder_context_latent_channel: int,
+    downsample_strides: Sequence[tuple[int, int]],
+    upsample_strides: Sequence[tuple[int, int]],
+    upsample_channels: Sequence[int],
+    input_shape: Sequence[int],
+    output_shape: Sequence[int],
+    epoch: int,
+    best_epoch: int,
+    best_val_loss: float,
+    train_loss: float,
+    val_loss: float,
+    train_kl: float,
+    val_kl: float,
+) -> dict:
+    return {
+        "encoder": encoder.state_dict(),
+        "decoder": decoder.state_dict(),
+        "args": vars(args),
+        "model_config": {
+            "history_len": args.history_len,
+            "future_len": args.future_len,
+            "decoder_context_len": args.decoder_context_len,
+            "rollout_start_k": args.rollout_start_k,
+            "rollout_target_k": args.rollout_target_k,
+            "teacher_forcing_start_p": args.teacher_forcing_start_p,
+            "teacher_forcing_end_p": args.teacher_forcing_end_p,
+            "curriculum_epochs": curriculum_epochs,
+            "latent_channel": args.latent_channel,
+            "channels": list(args.channels),
+            "decoder_base_channels": args.decoder_base_channels,
+            "decoder_downsample_channels": (
+                list(args.decoder_downsample_channels)
+                if args.decoder_downsample_channels is not None
+                else None
+            ),
+            "decoder_context_latent_channel": decoder_context_latent_channel,
+            "static_stem_channels": args.static_stem_channels,
+            "downsample_strides": downsample_strides,
+            "upsample_strides": upsample_strides,
+            "upsample_channels": upsample_channels,
+            "input_shape": input_shape,
+            "output_shape": output_shape,
+        },
+        "epoch": epoch,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "train_kl": train_kl,
+        "val_kl": val_kl,
+    }
+
+
 def main() -> None:
     """Entry point for training the VAE model.
 
@@ -746,6 +462,7 @@ def main() -> None:
         best_val_loss = float("inf")
         best_epoch = 0
         curriculum_epochs = args.epochs if args.curriculum_epochs <= 0 else args.curriculum_epochs
+
         for epoch in range(1, args.epochs + 1):
             epoch_start = time.perf_counter()
 
@@ -809,43 +526,25 @@ def main() -> None:
 
             if epoch % args.save_interval == 0:
                 periodic_ckpt = args.output.parent / f"{args.output.stem}_epoch_{epoch:03d}{args.output.suffix}"
-                periodic_checkpoint = {
-                    "encoder": encoder.state_dict(),
-                    "decoder": decoder.state_dict(),
-                    "args": vars(args),
-                    "model_config": {
-                        "history_len": args.history_len,
-                        "future_len": args.future_len,
-                        "decoder_context_len": args.decoder_context_len,
-                        "rollout_start_k": args.rollout_start_k,
-                        "rollout_target_k": args.rollout_target_k,
-                        "teacher_forcing_start_p": args.teacher_forcing_start_p,
-                        "teacher_forcing_end_p": args.teacher_forcing_end_p,
-                        "curriculum_epochs": curriculum_epochs,
-                        "latent_channel": args.latent_channel,
-                        "channels": list(args.channels),
-                        "decoder_base_channels": args.decoder_base_channels,
-                        "decoder_downsample_channels": (
-                            list(args.decoder_downsample_channels)
-                            if args.decoder_downsample_channels is not None
-                            else None
-                        ),
-                        "decoder_context_latent_channel": decoder_context_latent_channel,
-                        "static_stem_channels": args.static_stem_channels,
-                        "downsample_strides": downsample_strides,
-                        "upsample_strides": upsample_strides,
-                        "upsample_channels": upsample_channels,
-                        "input_shape": input_shape,
-                        "output_shape": output_shape,
-                    },
-                    "epoch": epoch,
-                    "best_epoch": best_epoch,
-                    "best_val_loss": best_val_loss,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "train_kl": train_kl,
-                    "val_kl": val_kl,
-                }
+                periodic_checkpoint = build_checkpoint(
+                    encoder=encoder,
+                    decoder=decoder,
+                    args=args,
+                    curriculum_epochs=curriculum_epochs,
+                    decoder_context_latent_channel=decoder_context_latent_channel,
+                    downsample_strides=downsample_strides,
+                    upsample_strides=upsample_strides,
+                    upsample_channels=upsample_channels,
+                    input_shape=input_shape,
+                    output_shape=output_shape,
+                    epoch=epoch,
+                    best_epoch=best_epoch,
+                    best_val_loss=best_val_loss,
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    train_kl=train_kl,
+                    val_kl=val_kl,
+                )
                 torch.save(periodic_checkpoint, periodic_ckpt)
                 _log_message(
                     f"Periodic checkpoint saved: {periodic_ckpt}",
@@ -875,43 +574,25 @@ def main() -> None:
                 best_epoch = epoch
 
                 epoch_ckpt = args.output.parent / f"{args.output.stem}_epoch_{epoch:03d}{args.output.suffix}"
-                checkpoint = {
-                    "encoder": encoder.state_dict(),
-                    "decoder": decoder.state_dict(),
-                    "args": vars(args),
-                    "model_config": {
-                        "history_len": args.history_len,
-                        "future_len": args.future_len,
-                        "decoder_context_len": args.decoder_context_len,
-                        "rollout_start_k": args.rollout_start_k,
-                        "rollout_target_k": args.rollout_target_k,
-                        "teacher_forcing_start_p": args.teacher_forcing_start_p,
-                        "teacher_forcing_end_p": args.teacher_forcing_end_p,
-                        "curriculum_epochs": curriculum_epochs,
-                        "latent_channel": args.latent_channel,
-                        "channels": list(args.channels),
-                        "decoder_base_channels": args.decoder_base_channels,
-                        "decoder_downsample_channels": (
-                            list(args.decoder_downsample_channels)
-                            if args.decoder_downsample_channels is not None
-                            else None
-                        ),
-                        "decoder_context_latent_channel": decoder_context_latent_channel,
-                        "static_stem_channels": args.static_stem_channels,
-                        "downsample_strides": downsample_strides,
-                        "upsample_strides": upsample_strides,
-                        "upsample_channels": upsample_channels,
-                        "input_shape": input_shape,
-                        "output_shape": output_shape,
-                    },
-                    "epoch": epoch,
-                    "best_epoch": best_epoch,
-                    "best_val_loss": best_val_loss,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "train_kl": train_kl,
-                    "val_kl": val_kl,
-                }
+                checkpoint = build_checkpoint(
+                    encoder=encoder,
+                    decoder=decoder,
+                    args=args,
+                    curriculum_epochs=curriculum_epochs,
+                    decoder_context_latent_channel=decoder_context_latent_channel,
+                    downsample_strides=downsample_strides,
+                    upsample_strides=upsample_strides,
+                    upsample_channels=upsample_channels,
+                    input_shape=input_shape,
+                    output_shape=output_shape,
+                    epoch=epoch,
+                    best_epoch=best_epoch,
+                    best_val_loss=best_val_loss,
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    train_kl=train_kl,
+                    val_kl=val_kl,
+                )
                 torch.save(checkpoint, epoch_ckpt)
                 torch.save(checkpoint, args.output)
                 _log_message(
