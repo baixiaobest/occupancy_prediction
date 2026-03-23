@@ -7,6 +7,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+DEFAULT_DOWNSAMPLE_STRIDES: tuple[tuple[int, int, int], ...] = (
+    (2, 2, 2),
+    (2, 2, 2),
+    (1, 2, 2),
+    (1, 2, 2),
+    (1, 2, 2),
+)
+
+DEFAULT_UPSAMPLE_STRIDES: tuple[tuple[int, int, int], ...] = (
+    (2, 2, 2),
+    (2, 2, 2),
+    (1, 2, 2),
+    (1, 2, 2),
+    (1, 2, 2),
+)
+
+DEFAULT_UPSAMPLE_CHANNELS: tuple[int, ...] = (128, 64, 32, 16, 8, 4)
+
+
 def _to_stride3(value: int | Sequence[int]) -> tuple[int, int, int]:
     if isinstance(value, int):
         stride = (int(value), int(value), int(value))
@@ -354,3 +373,36 @@ class VAEPredictionDecoder(nn.Module):
         # Final output is one-step prediction: (B, C_out, 1, H, W)
         h = F.interpolate(h, size=self.output_shape[1:], mode="trilinear", align_corners=False)
         return h
+
+
+def build_prediction_vae_models(
+    input_shape: Sequence[int],
+    output_shape: Sequence[int],
+    latent_channel: int,
+    base_channels: int = 32,
+    static_stem_channels: int = 8,
+    downsample_strides: Sequence[int | Sequence[int]] = DEFAULT_DOWNSAMPLE_STRIDES,
+    upsample_strides: Sequence[int | Sequence[int]] = DEFAULT_UPSAMPLE_STRIDES,
+    upsample_channels: Sequence[int] = DEFAULT_UPSAMPLE_CHANNELS,
+    device: torch.device | str | None = None,
+) -> tuple[VAEPredictionEncoder, VAEPredictionDecoder]:
+    """Build a consistent encoder/decoder pair for occupancy prediction."""
+    encoder = VAEPredictionEncoder(
+        input_shape=input_shape,
+        latent_channel=latent_channel,
+        base_channels=base_channels,
+        static_stem_channels=static_stem_channels,
+        downsample_strides=downsample_strides,
+    )
+    decoder = VAEPredictionDecoder(
+        latent_dim=latent_channel,
+        output_shape=output_shape,
+        upsample_channels=upsample_channels,
+        upsample_strides=upsample_strides,
+    )
+
+    if device is not None:
+        encoder = encoder.to(device)
+        decoder = decoder.to(device)
+
+    return encoder, decoder

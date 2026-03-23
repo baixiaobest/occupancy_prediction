@@ -14,26 +14,26 @@ from matplotlib.widgets import Slider
 # Ensure project root is on sys.path so `from src...` works when running this script.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.VAE_prediction import VAEPredictionDecoder, VAEPredictionEncoder
+from src.VAE_prediction import (
+    VAEPredictionDecoder,
+    VAEPredictionEncoder,
+    build_prediction_vae_models,
+)
 from src.rollout_data import RollOutData
 
-
-def _parse_stride_token(token: str) -> tuple[int, int, int]:
-    parts = token.strip().split("x")
-    if len(parts) != 3:
-        raise ValueError(f"Invalid stride token '{token}'. Expected format like 2x2x2")
-    return int(parts[0]), int(parts[1]), int(parts[2])
-
-
-def parse_stride_list(text: str) -> list[tuple[int, int, int]]:
-    return [_parse_stride_token(tok) for tok in text.split(",") if tok.strip()]
+def _coerce_stride_list(raw: object) -> list[tuple[int, int, int]]:
+    if raw is None:
+        raise ValueError("stride config is missing")
+    return [
+        (int(s[0]), int(s[1]), int(s[2]))
+        for s in raw
+    ]
 
 
-def parse_channel_list(text: str) -> list[int]:
-    channels = [int(v.strip()) for v in text.split(",") if v.strip()]
-    if not channels:
-        raise ValueError("upsample_channels cannot be empty")
-    return channels
+def _coerce_channel_list(raw: object) -> list[int]:
+    if raw is None:
+        raise ValueError("channel config is missing")
+    return [int(c) for c in raw]
 
 
 def load_scene_origins(pt_path: Path) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -117,39 +117,57 @@ def load_scene_origins(pt_path: Path) -> tuple[list[torch.Tensor], list[torch.Te
 def build_models(
     checkpoint_path: Path,
     device: torch.device,
-    fallback_input_shape: Sequence[int],
-    fallback_output_shape: Sequence[int],
-    downsample_strides: list[tuple[int, int, int]],
-    upsample_strides: list[tuple[int, int, int]],
-    upsample_channels: list[int],
-) -> tuple[VAEPredictionEncoder, VAEPredictionDecoder]:
-    """Construct encoder/decoder and load checkpoint weights."""
+) -> tuple[VAEPredictionEncoder, VAEPredictionDecoder, int]:
+    """Construct encoder/decoder from checkpoint config and load checkpoint weights."""
     ckpt = torch.load(checkpoint_path, map_location=device)
-    args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    if not isinstance(ckpt, dict):
+        raise ValueError("Checkpoint must be a dict with model config and state dicts")
+    model_cfg = ckpt.get("model_config")
+    if not isinstance(model_cfg, dict):
+        raise ValueError("Checkpoint must contain dict key 'model_config'")
 
-    latent_channel = int(args.get("latent_channel", upsample_channels[0]))
-    base_channels = int(args.get("base_channels", 32))
-    static_stem_channels = int(args.get("static_stem_channels", 8))
+    required_keys = [
+        "history_len",
+        "latent_channel",
+        "base_channels",
+        "static_stem_channels",
+        "input_shape",
+        "output_shape",
+        "downsample_strides",
+        "upsample_strides",
+        "upsample_channels",
+    ]
+    missing = [key for key in required_keys if key not in model_cfg]
+    if missing:
+        raise ValueError(f"Checkpoint model_config is missing required keys: {missing}")
 
-    input_shape = tuple(ckpt.get("input_shape", fallback_input_shape))
-    output_shape = tuple(ckpt.get("output_shape", fallback_output_shape))
+    history_len = int(model_cfg["history_len"])
+    latent_channel = int(model_cfg["latent_channel"])
+    base_channels = int(model_cfg["base_channels"])
+    static_stem_channels = int(model_cfg["static_stem_channels"])
 
-    encoder = VAEPredictionEncoder(
+    input_shape = tuple(model_cfg["input_shape"])
+    output_shape = tuple(model_cfg["output_shape"])
+    model_downsample_strides = _coerce_stride_list(model_cfg["downsample_strides"])
+    model_upsample_strides = _coerce_stride_list(model_cfg["upsample_strides"])
+    model_upsample_channels = _coerce_channel_list(model_cfg["upsample_channels"])
+
+    if any(v <= 0 for v in input_shape) or any(v <= 0 for v in output_shape):
+        raise ValueError("Checkpoint is missing valid input_shape/output_shape for model reconstruction")
+
+    encoder, decoder = build_prediction_vae_models(
         input_shape=input_shape,
+        output_shape=output_shape,
         latent_channel=latent_channel,
         base_channels=base_channels,
         static_stem_channels=static_stem_channels,
-        downsample_strides=downsample_strides,
-    ).to(device)
+        downsample_strides=model_downsample_strides,
+        upsample_strides=model_upsample_strides,
+        upsample_channels=model_upsample_channels,
+        device=device,
+    )
 
-    decoder = VAEPredictionDecoder(
-        latent_dim=latent_channel,
-        output_shape=output_shape,
-        upsample_channels=upsample_channels,
-        upsample_strides=upsample_strides,
-    ).to(device)
-
-    if not isinstance(ckpt, dict) or "encoder" not in ckpt or "decoder" not in ckpt:
+    if "encoder" not in ckpt or "decoder" not in ckpt:
         raise ValueError("Checkpoint must contain keys: 'encoder' and 'decoder'")
 
     encoder.load_state_dict(ckpt["encoder"], strict=True)
@@ -157,7 +175,7 @@ def build_models(
 
     encoder.eval()
     decoder.eval()
-    return encoder, decoder
+    return encoder, decoder, history_len
 
 
 def autoregressive_predict(
@@ -210,28 +228,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-file", type=Path, required=True, help="Path to rollout .pt file")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to model checkpoint .pt")
     parser.add_argument("--origin-index", "--scene-index", dest="origin_index", type=int, default=0, help="Initial origin-center index")
-    parser.add_argument("--history-len", type=int, default=16)
     parser.add_argument("--horizon", type=int, default=4, help="Initial autoregressive horizon")
     parser.add_argument("--max-horizon", type=int, default=16, help="Max horizon in GUI slider")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument(
-        "--downsample-strides",
-        type=str,
-        default="2x2x2,2x2x2,1x2x2,1x2x2,1x2x2,1x2x2",
-        help="Comma-separated 3D strides, e.g. 4x4x4,1x4x4,1x4x4",
-    )
-    parser.add_argument(
-        "--upsample-strides",
-        type=str,
-        default="2x2x2,2x2x2,1x2x2,1x2x2,1x2x2,1x2x2",
-        help="Comma-separated 3D strides, e.g. 4x4x4,1x4x4,1x4x4",
-    )
-    parser.add_argument(
-        "--upsample-channels",
-        type=str,
-        default="128,64,32,16,8,4,2",
-        help="Comma-separated channels [input, block1_out, ..., blockN_out]",
-    )
     parser.add_argument("--binary-feedback", action="store_true", help="Feed thresholded predictions back into context")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for binary feedback")
     return parser.parse_args()
@@ -241,9 +240,6 @@ def main() -> None:
     args = parse_args()
 
     device = torch.device(args.device)
-    downsample_strides = parse_stride_list(args.downsample_strides)
-    upsample_strides = parse_stride_list(args.upsample_strides)
-    upsample_channels = parse_channel_list(args.upsample_channels)
 
     sequences, static_maps = load_scene_origins(args.data_file)
     if not sequences:
@@ -257,18 +253,9 @@ def main() -> None:
     init_seq = sequences[init_origin]
     _, init_h, init_w = init_seq.shape
 
-    # Fallback shapes are used when checkpoint metadata does not provide them.
-    fallback_input_shape = (1, args.history_len, init_h, init_w)
-    fallback_output_shape = (1, 1, init_h, init_w)
-
-    encoder, decoder = build_models(
+    encoder, decoder, history_len = build_models(
         checkpoint_path=args.checkpoint,
         device=device,
-        fallback_input_shape=fallback_input_shape,
-        fallback_output_shape=fallback_output_shape,
-        downsample_strides=downsample_strides,
-        upsample_strides=upsample_strides,
-        upsample_channels=upsample_channels,
     )
 
     # Cache by (origin_index, horizon) to avoid recomputing when only t changes.
@@ -285,14 +272,14 @@ def main() -> None:
                 static_map=static_map,
                 encoder=encoder,
                 decoder=decoder,
-                history_len=args.history_len,
+                history_len=history_len,
                 horizon=horizon,
                 device=device,
                 binary_feedback=args.binary_feedback,
                 threshold=args.threshold,
             )
             t_total = seq.shape[0]
-            print(f"Done. Total inferences: {(max(t_total - args.history_len, 0)) * horizon}")
+            print(f"Done. Total inferences: {(max(t_total - history_len, 0)) * horizon}")
         return cache[key]
 
     # Build figure and axes.
@@ -324,7 +311,7 @@ def main() -> None:
     origin_slider = Slider(ax_origin, "Origin", 0, max(0, len(sequences) - 1), valinit=init_origin, valstep=1)
 
     max_t_global = max(seq.shape[0] - 1 for seq in sequences)
-    t_slider = Slider(ax_t, "t", args.history_len, max_t_global, valinit=max(args.history_len, args.history_len), valstep=1)
+    t_slider = Slider(ax_t, "t", history_len, max_t_global, valinit=history_len, valstep=1)
 
     h_slider = Slider(
         ax_h,
@@ -343,7 +330,7 @@ def main() -> None:
 
         seq = sequences[origin_idx]
         t_total, h_img, w_img = seq.shape
-        t_min = args.history_len
+        t_min = history_len
         t_max = max(t_min, t_total - 1)
         t_req = int(t_slider.val)
         t = clamp_int(t_req, t_min, t_max)
@@ -354,11 +341,11 @@ def main() -> None:
 
         preds = get_predictions(origin_idx, horizon)
 
-        past = seq[t - args.history_len : t]  # (history_len, H, W)
+        past = seq[t - history_len : t]  # (history_len, H, W)
         past_stack = past.max(dim=0).values
 
         if preds.shape[0] > 0:
-            pred_index = t - args.history_len
+            pred_index = t - history_len
             pred_seq = preds[pred_index]  # (horizon, H, W)
             pred_stack = pred_seq.max(dim=0).values
         else:
@@ -382,10 +369,10 @@ def main() -> None:
         im_overlay_pred.set_data(np.clip(overlay_pred, 0.0, 1.0))
         im_overlay_gt.set_data(np.clip(overlay_gt, 0.0, 1.0))
 
-        ax_past.set_title(f"Past Stack (t-{args.history_len}..t-1), t={t}")
+        ax_past.set_title(f"Past Stack (t-{history_len}..t-1), t={t}")
         ax_pred.set_title(f"Pred Stack (h={horizon})")
 
-        total_infer = max(t_total - args.history_len, 0) * horizon
+        total_infer = max(t_total - history_len, 0) * horizon
         info_text.set_text(
             f"origin={origin_idx} | T={t_total} | t={t} | horizon={horizon} | total inferences={(total_infer)}"
         )

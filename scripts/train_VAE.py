@@ -24,6 +24,12 @@ except ImportError:
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.VAE_prediction import VAEPredictionDecoder, VAEPredictionEncoder
+from src.VAE_prediction import (
+    DEFAULT_DOWNSAMPLE_STRIDES,
+    DEFAULT_UPSAMPLE_CHANNELS,
+    DEFAULT_UPSAMPLE_STRIDES,
+    build_prediction_vae_models,
+)
 from src.rollout_data import RollOutData
 
 
@@ -491,19 +497,21 @@ def main() -> None:
     input_shape = (1, hist_t, h, w)
     output_shape = (1, 1, h, w)
 
-    encoder = VAEPredictionEncoder(
+    downsample_strides = list(DEFAULT_DOWNSAMPLE_STRIDES)
+    upsample_strides = list(DEFAULT_UPSAMPLE_STRIDES)
+    upsample_channels = list(DEFAULT_UPSAMPLE_CHANNELS)
+
+    encoder, decoder = build_prediction_vae_models(
         input_shape=input_shape,
+        output_shape=output_shape,
         latent_channel=args.latent_channel,
         base_channels=args.base_channels,
         static_stem_channels=args.static_stem_channels,
-        downsample_strides=[(2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)]
-    ).to(device)
-    decoder = VAEPredictionDecoder(
-        latent_dim=args.latent_channel,
-        output_shape=output_shape,
-        upsample_strides=[(2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)],
-        upsample_channels=(128, 64, 32, 16, 8, 4),
-    ).to(device)
+        downsample_strides=downsample_strides,
+        upsample_strides=upsample_strides,
+        upsample_channels=upsample_channels,
+        device=device,
+    )
 
     optimizer = torch.optim.AdamW(
         list(encoder.parameters()) + list(decoder.parameters()),
@@ -598,8 +606,17 @@ def main() -> None:
                     "encoder": encoder.state_dict(),
                     "decoder": decoder.state_dict(),
                     "args": vars(args),
-                    "input_shape": input_shape,
-                    "output_shape": output_shape,
+                    "model_config": {
+                        "history_len": args.history_len,
+                        "latent_channel": args.latent_channel,
+                        "base_channels": args.base_channels,
+                        "static_stem_channels": args.static_stem_channels,
+                        "downsample_strides": downsample_strides,
+                        "upsample_strides": upsample_strides,
+                        "upsample_channels": upsample_channels,
+                        "input_shape": input_shape,
+                        "output_shape": output_shape,
+                    },
                     "epoch": epoch,
                     "best_epoch": best_epoch,
                     "best_val_loss": best_val_loss,
