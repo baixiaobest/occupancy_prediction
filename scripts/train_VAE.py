@@ -589,6 +589,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/vae_prediction.pt"))
     parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=5,
+        help="Save an epoch checkpoint every N epochs",
+    )
+    parser.add_argument(
         "--wandb",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -633,6 +639,8 @@ def main() -> None:
 
     if args.decoder_context_len > args.history_len:
         raise ValueError("decoder_context_len must be <= history_len")
+    if args.save_interval <= 0:
+        raise ValueError("save_interval must be > 0")
     if args.rollout_start_k <= 0 or args.rollout_target_k <= 0:
         raise ValueError("rollout_start_k and rollout_target_k must be > 0")
     if not (0.0 <= args.teacher_forcing_start_p <= 1.0 and 0.0 <= args.teacher_forcing_end_p <= 1.0):
@@ -798,6 +806,51 @@ def main() -> None:
                 f"epoch_time={_format_hhmmss(epoch_duration)}, eta={_format_hhmmss(eta_seconds)}",
                 wandb_run=wandb_run,
             )
+
+            if epoch % args.save_interval == 0:
+                periodic_ckpt = args.output.parent / f"{args.output.stem}_epoch_{epoch:03d}{args.output.suffix}"
+                periodic_checkpoint = {
+                    "encoder": encoder.state_dict(),
+                    "decoder": decoder.state_dict(),
+                    "args": vars(args),
+                    "model_config": {
+                        "history_len": args.history_len,
+                        "future_len": args.future_len,
+                        "decoder_context_len": args.decoder_context_len,
+                        "rollout_start_k": args.rollout_start_k,
+                        "rollout_target_k": args.rollout_target_k,
+                        "teacher_forcing_start_p": args.teacher_forcing_start_p,
+                        "teacher_forcing_end_p": args.teacher_forcing_end_p,
+                        "curriculum_epochs": curriculum_epochs,
+                        "latent_channel": args.latent_channel,
+                        "channels": list(args.channels),
+                        "decoder_base_channels": args.decoder_base_channels,
+                        "decoder_downsample_channels": (
+                            list(args.decoder_downsample_channels)
+                            if args.decoder_downsample_channels is not None
+                            else None
+                        ),
+                        "decoder_context_latent_channel": decoder_context_latent_channel,
+                        "static_stem_channels": args.static_stem_channels,
+                        "downsample_strides": downsample_strides,
+                        "upsample_strides": upsample_strides,
+                        "upsample_channels": upsample_channels,
+                        "input_shape": input_shape,
+                        "output_shape": output_shape,
+                    },
+                    "epoch": epoch,
+                    "best_epoch": best_epoch,
+                    "best_val_loss": best_val_loss,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_kl": train_kl,
+                    "val_kl": val_kl,
+                }
+                torch.save(periodic_checkpoint, periodic_ckpt)
+                _log_message(
+                    f"Periodic checkpoint saved: {periodic_ckpt}",
+                    wandb_run=wandb_run,
+                )
 
             if wandb_run is not None:
                 wandb_run.log(
