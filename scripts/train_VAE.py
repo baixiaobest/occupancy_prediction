@@ -300,24 +300,50 @@ def weighted_bernoulli_recon_loss(
     target: torch.Tensor,
     occupied_weight: float,
 ) -> torch.Tensor:
-    """Compute weighted binary cross-entropy between `logits` and `target`.
+    """Compute occupied-weighted binary cross-entropy.
 
-    Cells where `target == 1` receive `occupied_weight` to emphasize occupied
-    cells; other cells get weight 1.0.
+    Cells where `target == 1` receive `occupied_weight` and cells where
+    `target == 0` receive weight 1.0.
 
     Args:
         logits: Raw model outputs (before sigmoid), shape `(B, C, 1, H, W)`.
         target: Ground-truth binary targets with same spatial shape.
-        occupied_weight: Weight multiplier for positive (occupied) cells.
+        occupied_weight: Absolute multiplier for positive (occupied) cells.
 
     Returns:
         Scalar loss tensor averaged over the batch.
     """
     if occupied_weight < 1.0:
         raise ValueError("occupied_weight must be >= 1.0")
+
     pos_w = torch.tensor(float(occupied_weight), device=target.device, dtype=target.dtype)
     weights = torch.where(target > 0.5, pos_w, torch.ones_like(target))
     return F.binary_cross_entropy_with_logits(logits, target, weight=weights, reduction="mean")
+
+
+def weighted_focal_recon_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    occupied_weight: float,
+    focal_gamma: float,
+) -> torch.Tensor:
+    """Compute occupied-weighted focal BCE between `logits` and `target`.
+
+    Focal modulation down-weights easy predictions via `(1 - p_t)^gamma`.
+    """
+    if occupied_weight < 1.0:
+        raise ValueError("occupied_weight must be >= 1.0")
+    if focal_gamma < 0.0:
+        raise ValueError("focal_gamma must be >= 0.0")
+
+    bce_per_cell = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    probs = torch.sigmoid(logits)
+    p_t = probs * target + (1.0 - probs) * (1.0 - target)
+    focal_factor = (1.0 - p_t).pow(focal_gamma)
+
+    pos_w = torch.tensor(float(occupied_weight), device=target.device, dtype=target.dtype)
+    weights = torch.where(target > 0.5, pos_w, torch.ones_like(target))
+    return (weights * focal_factor * bce_per_cell).mean()
 
 
 def run_epoch(
@@ -326,7 +352,9 @@ def run_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
+    recon_loss_type: str,
     occupied_weight: float,
+    focal_gamma: float,
     kl_weight: float,
 ) -> tuple[float, float, float]:
     """Run one epoch (training or evaluation) over `loader`.
@@ -341,7 +369,9 @@ def run_epoch(
         loader: DataLoader yielding `(x, y)` pairs.
         optimizer: Optimizer to use for training, or `None` for evaluation.
         device: Device to run tensors on.
-        occupied_weight: Weighting used in reconstruction loss for occupied cells.
+        recon_loss_type: Reconstruction loss type: `bce` or `focal`.
+        occupied_weight: Absolute occupied-cell weight for both BCE and focal losses.
+        focal_gamma: Focal exponent used to focus on hard examples.
         kl_weight: Weight to scale the KL term when computing total loss.
 
     Returns:
@@ -368,7 +398,21 @@ def run_epoch(
         z = encoder.sample(mu, sigma)
         logits = decoder(z)
 
-        recon = weighted_bernoulli_recon_loss(logits, y, occupied_weight=occupied_weight)
+        if recon_loss_type == "focal":
+            recon = weighted_focal_recon_loss(
+                logits,
+                y,
+                occupied_weight=occupied_weight,
+                focal_gamma=focal_gamma,
+            )
+        elif recon_loss_type == "bce":
+            recon = weighted_bernoulli_recon_loss(
+                logits,
+                y,
+                occupied_weight=occupied_weight,
+            )
+        else:
+            raise ValueError(f"Unsupported recon_loss_type: {recon_loss_type}")
         kl = kl_divergence(mu, sigma)
         loss = recon + kl_weight * kl
 
@@ -407,7 +451,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--occupied-weight", type=float, default=5.0, help="Weight for cells where target=1")
+    parser.add_argument(
+        "--recon-loss-type",
+        type=str,
+        default="focal",
+        choices=("bce", "focal"),
+        help="Reconstruction loss type",
+    )
+    parser.add_argument(
+        "--occupied-weight",
+        type=float,
+        default=5.0,
+        help="Absolute occupied-cell weight for BCE/focal losses (>=1)",
+    )
+    parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (0 disables focal modulation)")
     parser.add_argument("--kl-weight", type=float, default=1e-3)
     parser.add_argument("--latent-channel", type=int, default=128)
     parser.add_argument("--base-channels", type=int, default=32)
@@ -552,7 +609,9 @@ def main() -> None:
                 train_loader,
                 optimizer,
                 device,
+                recon_loss_type=args.recon_loss_type,
                 occupied_weight=args.occupied_weight,
+                focal_gamma=args.focal_gamma,
                 kl_weight=args.kl_weight,
             )
 
@@ -563,7 +622,9 @@ def main() -> None:
                     val_loader,
                     optimizer=None,
                     device=device,
+                    recon_loss_type=args.recon_loss_type,
                     occupied_weight=args.occupied_weight,
+                    focal_gamma=args.focal_gamma,
                     kl_weight=args.kl_weight,
                 )
 
