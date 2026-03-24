@@ -486,12 +486,7 @@ def main() -> None:
         default=None,
         help="Directory to save rollout .pt files (defaults to ../data)",
     )
-    parser.add_argument(
-        "--num-levels",
-        type=int,
-        default=5,
-        help="Number of levels to generate per template (default: 5)",
-    )
+
     parser.add_argument(
         "--disable-data-aug",
         action="store_true",
@@ -533,8 +528,6 @@ def main() -> None:
     PREF_VELOCITY_NOISE_STD = 0.02
     PREF_VELOCITY_NOISE_INTERVAL = 3
     PREF_VELOCITY_NOISE_SEED = 0
-    NUM_LEVELS_PER_TEMPLATE = int(args.num_levels)
-
     # Occupancy settings
     OCC_RESOLUTION = 0.1
     OCC_MARGIN = 0.2
@@ -558,10 +551,10 @@ def main() -> None:
         template_rollouts_rot90: List[RollOutData] = []
         template_rollouts_rot180: List[RollOutData] = []
         template_rollouts_rot270: List[RollOutData] = []
-        scenes = tpl.generate(num_levels=NUM_LEVELS_PER_TEMPLATE)
+        scenes = tpl.generate()
         print(
             f"generated {len(scenes)} scenes from {tpl.__class__.__name__} "
-            f"(name={template_name})"
+            f"(name={template_name}, num_levels={int(tpl.num_levels)})"
         )
 
         for local_idx, scene in enumerate(scenes):
