@@ -91,42 +91,42 @@ def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor]
         return (tensor > 0).float()
 
     def _from_rollout_obj(obj: RollOutData) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        if hasattr(obj, "dynamic_grids") and hasattr(obj, "static_maps"):
-            if len(obj.dynamic_grids) != len(obj.static_maps):
-                raise ValueError("dynamic_grids and static_maps must have same length")
+        if not hasattr(obj, "agents"):
+            raise ValueError("RollOutData.agents is required")
 
-            out: list[tuple[torch.Tensor, torch.Tensor]] = []
-            for dyn_series, static_map in zip(obj.dynamic_grids, obj.static_maps):
-                dyn_frames = [_to_2d(frame) for frame in dyn_series]
-                if not dyn_frames:
+        out: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for agent_idx in sorted(obj.agents.keys()):
+            agent_data = obj.agents[agent_idx]
+            anchor_grids: list[torch.Tensor] = []
+            anchor_static_maps: list[torch.Tensor] = []
+            for anchor_time in sorted(agent_data.anchors.keys()):
+                anchor_data = agent_data.anchors[anchor_time]
+                if not anchor_data.frames:
                     continue
-                dynamic_seq = torch.stack(dyn_frames, dim=0)
-                out.append((dynamic_seq, _to_2d(static_map)))
-            return out
+                if not hasattr(anchor_data, "static_map"):
+                    raise ValueError("AnchorRollOutData.static_map is required")
+                frame_stack = torch.stack([_to_2d(frame) for frame in anchor_data.frames], dim=0)
+                anchor_grids.append(frame_stack.amax(dim=0))
+                anchor_static_maps.append(_to_2d(anchor_data.static_map))
 
-        raise ValueError("Unsupported RollOutData schema")
+            if not anchor_grids:
+                continue
+
+            dynamic_seq = torch.stack(anchor_grids, dim=0)
+            static_map = torch.stack(anchor_static_maps, dim=0).amax(dim=0)
+            out.append((dynamic_seq, static_map))
+
+        return out
 
     sequences: list[tuple[torch.Tensor, torch.Tensor]] = []
     if isinstance(payload, RollOutData):
         sequences.extend(_from_rollout_obj(payload))
-    elif isinstance(payload, dict):
-        if "dynamic_grids" in payload and "static_maps" in payload:
-            pseudo = RollOutData(
-                static_maps=payload["static_maps"],
-                dynamic_grids=payload["dynamic_grids"],
-                dt=float(payload.get("dt", 0.0)),
-            )
-            sequences.extend(_from_rollout_obj(pseudo))
-        else:
-            raise ValueError(f"Unsupported payload format in {pt_path}")
     elif isinstance(payload, list):
         if all(isinstance(x, RollOutData) for x in payload):
             for item in payload:
                 sequences.extend(_from_rollout_obj(item))
         else:
-            raise ValueError(
-                "List payload must contain RollOutData objects with dynamic_grids/static_maps"
-            )
+            raise ValueError("List payload must contain RollOutData objects")
     else:
         raise ValueError(f"Unsupported payload format in {pt_path}")
 
