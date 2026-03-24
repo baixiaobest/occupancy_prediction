@@ -756,13 +756,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Future frame count rendered on each anchor occupancy grid.",
     )
     parser.add_argument(
-        "--occ-agent-chunk-size",
-        type=int,
-        default=0,
-        help=(
-            "Process centered agents in chunks to reduce peak RAM. "
-            "0 means process all agents at once."
-        ),
+        "--save-every-scene",
+        action="store_true",
+        help="Save each scene immediately as its own .pt file.",
     )
     return parser
 
@@ -875,12 +871,11 @@ def _save_template_rollouts(
         print(f"saved template rollout data: {data_path} ({len(payload)} scenes)")
 
 
-def _save_scene_chunk_rollouts(
+def _save_scene_rollouts(
     *,
     data_dir: str,
     template_name: str,
     scene_index: int,
-    chunk_index: int,
     variants: Dict[str, Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]]],
     dt: float,
     occupancy_resolution: Tuple[float, float],
@@ -889,7 +884,6 @@ def _save_scene_chunk_rollouts(
     anchor_steps: List[int],
     data_aug_enabled: bool,
 ) -> None:
-    chunk_tag = f"scene{scene_index:05d}_chunk{chunk_index:03d}"
     for name in _variant_names(data_aug_enabled):
         payload = _build_rollout_data_from_variant(
             dt=dt,
@@ -899,13 +893,10 @@ def _save_scene_chunk_rollouts(
             anchor_steps=anchor_steps,
             variant=variants[name],
         )
-        file_name = f"rollout_{template_name}_{chunk_tag}_{name}.pt"
+        file_name = f"rollout_{template_name}_scene{scene_index:05d}_{name}.pt"
         data_path = os.path.join(data_dir, file_name)
         torch.save([payload], data_path)
-        print(
-            f"saved rollout chunk: {data_path} "
-            f"(scene={scene_index}, chunk={chunk_index})"
-        )
+        print(f"saved scene rollout: {data_path}")
 
 
 def _prepare_animation_grids(
@@ -1089,102 +1080,26 @@ def main() -> None:
                 global_scene_index += 1
                 continue
 
-            num_agents = int(traj.shape[1])
-            requested_chunk_size = int(args.occ_agent_chunk_size)
-            if requested_chunk_size <= 0:
-                chunk_size = num_agents
-            else:
-                chunk_size = min(requested_chunk_size, num_agents)
-            chunked_file_save_mode = SAVE_ROLLOUTS and (chunk_size < num_agents)
-
-            scene_dynamic_windows: List[List[List[torch.Tensor]]] = []
-            scene_static_maps: List[List[torch.Tensor]] = []
-            scene_current_velocities: List[torch.Tensor] = []
-            scene_occupancy_origin: List[np.ndarray] = []
-            scene_anchor_steps: List[int] | None = None
-            scene_frame_offsets: List[int] | None = None
-            scene_occupancy_resolution: Tuple[float, float] | None = None
-
-            for chunk_start in range(0, num_agents, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, num_agents)
-                center_agent_indices = list(range(chunk_start, chunk_end))
-                chunk_index = chunk_start // chunk_size
-                (
-                    chunk_dynamic_windows,
-                    chunk_static_maps,
-                    chunk_current_velocities,
-                    chunk_occupancy_origin,
-                    chunk_occupancy_resolution,
-                    chunk_anchor_steps,
-                    chunk_frame_offsets,
-                ) = build_agent_centric_occupancy_sequences(
-                    traj=traj,
-                    velocities=vel_traj,
-                    obstacles=scene.obstacles,
-                    resolution=OCC_RESOLUTION,
-                    agent_radius=OCC_AGENT_RADIUS,
-                    occupancy_width=OCC_WIDTH,
-                    occupancy_length=OCC_LENGTH,
-                    sample_interval=int(args.occ_sample_interval),
-                    past_frames=int(args.occ_past_frames),
-                    future_frames=int(args.occ_future_frames),
-                    center_agent_indices=center_agent_indices,
-                )
-
-                if scene_anchor_steps is None:
-                    scene_anchor_steps = chunk_anchor_steps
-                elif scene_anchor_steps != chunk_anchor_steps:
-                    raise ValueError("anchor_steps mismatch across chunks")
-
-                if scene_frame_offsets is None:
-                    scene_frame_offsets = chunk_frame_offsets
-                elif scene_frame_offsets != chunk_frame_offsets:
-                    raise ValueError("frame_offsets mismatch across chunks")
-
-                if scene_occupancy_resolution is None:
-                    scene_occupancy_resolution = chunk_occupancy_resolution
-                elif scene_occupancy_resolution != chunk_occupancy_resolution:
-                    raise ValueError("occupancy_resolution mismatch across chunks")
-
-                scene_dynamic_windows.extend(chunk_dynamic_windows)
-                scene_static_maps.extend(chunk_static_maps)
-                scene_current_velocities.extend(chunk_current_velocities)
-                scene_occupancy_origin.extend(chunk_occupancy_origin)
-
-                if chunked_file_save_mode:
-                    chunk_variants = _compute_variant_sets(
-                        chunk_static_maps,
-                        chunk_dynamic_windows,
-                        chunk_current_velocities,
-                        DATA_AUG_ENABLED,
-                    )
-                    _save_scene_chunk_rollouts(
-                        data_dir=DATA_DIR,
-                        template_name=template_name,
-                        scene_index=scene_index,
-                        chunk_index=chunk_index,
-                        variants=chunk_variants,
-                        dt=TIME_STEP,
-                        occupancy_resolution=chunk_occupancy_resolution,
-                        occupancy_origin=(
-                            float(chunk_occupancy_origin[0][0]),
-                            float(chunk_occupancy_origin[0][1]),
-                        ),
-                        frame_offsets=chunk_frame_offsets,
-                        anchor_steps=chunk_anchor_steps,
-                        data_aug_enabled=DATA_AUG_ENABLED,
-                    )
-
-            if scene_anchor_steps is None or scene_frame_offsets is None or scene_occupancy_resolution is None:
-                raise RuntimeError("failed to generate occupancy chunks")
-
-            dynamic_windows = scene_dynamic_windows
-            static_maps = scene_static_maps
-            current_velocities = scene_current_velocities
-            occupancy_origin = scene_occupancy_origin
-            occupancy_resolution = scene_occupancy_resolution
-            anchor_steps = scene_anchor_steps
-            frame_offsets = scene_frame_offsets
+            (
+                dynamic_windows,
+                static_maps,
+                current_velocities,
+                occupancy_origin,
+                occupancy_resolution,
+                anchor_steps,
+                frame_offsets,
+            ) = build_agent_centric_occupancy_sequences(
+                traj=traj,
+                velocities=vel_traj,
+                obstacles=scene.obstacles,
+                resolution=OCC_RESOLUTION,
+                agent_radius=OCC_AGENT_RADIUS,
+                occupancy_width=OCC_WIDTH,
+                occupancy_length=OCC_LENGTH,
+                sample_interval=int(args.occ_sample_interval),
+                past_frames=int(args.occ_past_frames),
+                future_frames=int(args.occ_future_frames),
+            )
 
             dynamic_grids = collapse_windows_to_grids(dynamic_windows)
             static_maps_display = collapse_static_series(static_maps)
@@ -1195,27 +1110,41 @@ def main() -> None:
                 DATA_AUG_ENABLED,
             )
 
-            if SAVE_ROLLOUTS and not chunked_file_save_mode:
-                _append_scene_rollouts_to_template(
-                    template_rollouts=template_rollouts,
-                    variants=variants,
-                    dt=TIME_STEP,
-                    occupancy_resolution=occupancy_resolution,
-                    occupancy_origin=(float(occupancy_origin[0][0]), float(occupancy_origin[0][1])),
-                    frame_offsets=frame_offsets,
-                    anchor_steps=anchor_steps,
-                    data_aug_enabled=DATA_AUG_ENABLED,
-                )
-                if DATA_AUG_ENABLED:
-                    print(
-                        f"scene[{scene_index}] queued split rollout data for template "
-                        f"{template_name} (orig/mirror/rot90/rot180/rot270)"
+            if SAVE_ROLLOUTS:
+                if args.save_every_scene:
+                    _save_scene_rollouts(
+                        data_dir=DATA_DIR,
+                        template_name=template_name,
+                        scene_index=scene_index,
+                        variants=variants,
+                        dt=TIME_STEP,
+                        occupancy_resolution=occupancy_resolution,
+                        occupancy_origin=(float(occupancy_origin[0][0]), float(occupancy_origin[0][1])),
+                        frame_offsets=frame_offsets,
+                        anchor_steps=anchor_steps,
+                        data_aug_enabled=DATA_AUG_ENABLED,
                     )
                 else:
-                    print(
-                        f"scene[{scene_index}] queued rollout data for template "
-                        f"{template_name} (orig only, data aug disabled)"
+                    _append_scene_rollouts_to_template(
+                        template_rollouts=template_rollouts,
+                        variants=variants,
+                        dt=TIME_STEP,
+                        occupancy_resolution=occupancy_resolution,
+                        occupancy_origin=(float(occupancy_origin[0][0]), float(occupancy_origin[0][1])),
+                        frame_offsets=frame_offsets,
+                        anchor_steps=anchor_steps,
+                        data_aug_enabled=DATA_AUG_ENABLED,
                     )
+                    if DATA_AUG_ENABLED:
+                        print(
+                            f"scene[{scene_index}] queued split rollout data for template "
+                            f"{template_name} (orig/mirror/rot90/rot180/rot270)"
+                        )
+                    else:
+                        print(
+                            f"scene[{scene_index}] queued rollout data for template "
+                            f"{template_name} (orig only, data aug disabled)"
+                        )
 
             print(
                 f"scene[{scene_index}] startup spawn: total agents={traj.shape[1]}, "
@@ -1260,7 +1189,7 @@ def main() -> None:
 
             global_scene_index += 1
 
-        if SAVE_ROLLOUTS and len(template_rollouts["orig"]) > 0:
+        if SAVE_ROLLOUTS and (not args.save_every_scene) and len(template_rollouts["orig"]) > 0:
             _save_template_rollouts(
                 data_dir=DATA_DIR,
                 template_name=template_name,
