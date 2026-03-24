@@ -24,7 +24,7 @@ def default_templates() -> List[SceneTemplate]:
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
         num_region_pairs=2,
-        num_levels=15,
+        num_levels=20,
     )
     l_template = LShapeCorridorTemplate(
         width_range=(3.0, 10.0),
@@ -36,7 +36,7 @@ def default_templates() -> List[SceneTemplate]:
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
         num_region_pairs=2,
-        num_levels=10,
+        num_levels=15,
     )
     t_template = TShapeCorridorTemplate(
         width_range=(3.0, 10.0),
@@ -49,7 +49,7 @@ def default_templates() -> List[SceneTemplate]:
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
         num_enabled_start_regions=3,
-        num_levels=5,
+        num_levels=10,
     )
     cross_template = CrossShapeCorridorTemplate(
         width_range=(3.0, 10.0),
@@ -62,7 +62,7 @@ def default_templates() -> List[SceneTemplate]:
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
         num_enabled_start_regions=4,
-        num_levels=5,
+        num_levels=10,
     )
 
     return [straight_template, l_template, t_template, cross_template]
