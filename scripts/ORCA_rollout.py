@@ -648,13 +648,13 @@ def main() -> None:
     parser.add_argument(
         "--occ-past-frames",
         type=int,
-        default=8,
+        default=16,
         help="Past frame count rendered on each anchor occupancy grid.",
     )
     parser.add_argument(
         "--occ-future-frames",
         type=int,
-        default=8,
+        default=16,
         help="Future frame count rendered on each anchor occupancy grid.",
     )
     args = parser.parse_args()
@@ -736,12 +736,24 @@ def main() -> None:
                 pref_velocity_noise_interval=PREF_VELOCITY_NOISE_INTERVAL,
                 pref_velocity_noise_seed=PREF_VELOCITY_NOISE_SEED + scene_index,
             )
+            min_steps_for_occupancy = int(args.occ_past_frames) + int(args.occ_future_frames) + 1
             traj, vel_traj = orca_sim.simulate(
                 steps=NUM_STEPS,
+                min_steps=min_steps_for_occupancy,
                 stop_on_goal=True,
                 return_velocities=True,
             )
             goals = np.array([agent.goal for agent in scene.agents], dtype=np.float32)
+            required_steps = int(args.occ_past_frames) + int(args.occ_future_frames) + 1
+            if traj.shape[0] < required_steps:
+                print(
+                    f"scene[{scene_index}] skipped: steps={traj.shape[0]} < required "
+                    f"{required_steps} (past={int(args.occ_past_frames)}, "
+                    f"future={int(args.occ_future_frames)})"
+                )
+                global_scene_index += 1
+                continue
+
             (
                 dynamic_windows,
                 static_maps,

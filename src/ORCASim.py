@@ -332,19 +332,22 @@ class ORCASim:
     def simulate(
         self,
         steps: int,
+        min_steps: int = 0,
         stop_on_goal: bool = False,
         return_velocities: bool = False,
     ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """Run the simulation for up to `steps` steps.
 
         If `stop_on_goal` is True the simulation will stop early when all agents
-        are within `goal_tolerance` of their goals. Returns a numpy array of
-        shape (T, N, 2) where T is the number of executed steps (<= steps).
+        are within `goal_tolerance` of their goals, but never before `min_steps`
+        have been executed. Returns a numpy array of shape (T, N, 2) where T is
+        the number of executed steps (<= steps).
 
         When `return_velocities` is True, returns a tuple `(positions, velocities)`
         where `velocities` has the same shape `(T, N, 2)` and values are from
         ORCA's per-agent velocity state after each simulation step.
         """
+
         traj = np.zeros((steps, len(self.agent_ids), 2), dtype=np.float32)
         vel_traj = np.zeros((steps, len(self.agent_ids), 2), dtype=np.float32)
         for step in range(steps):
@@ -354,7 +357,7 @@ class ORCASim:
                 traj[step, j] = np.array(self.sim.getAgentPosition(agent_id), dtype=np.float32)
                 vel_traj[step, j] = np.array(self.sim.getAgentVelocity(agent_id), dtype=np.float32)
 
-            if stop_on_goal:
+            if stop_on_goal and (step + 1) >= min_steps:
                 # Check whether all agents are within tolerance to their goals
                 all_reached = True
                 for idx in range(len(self.agent_ids)):
