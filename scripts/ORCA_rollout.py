@@ -680,14 +680,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "0 means process all agents at once."
         ),
     )
-    parser.add_argument(
-        "--save-per-scene",
-        action="store_true",
-        help=(
-            "When saving rollouts, write scene/chunk files immediately instead of "
-            "buffering all scenes per template in memory."
-        ),
-    )
     return parser
 
 
@@ -784,6 +776,21 @@ def _append_scene_rollouts_to_template(
         template_rollouts[name].append(rollout)
 
 
+def _save_template_rollouts(
+    *,
+    data_dir: str,
+    template_name: str,
+    template_rollouts: Dict[str, List[RollOutData]],
+    data_aug_enabled: bool,
+) -> None:
+    for name in _variant_names(data_aug_enabled):
+        file_name = f"rollout_{template_name}_{name}.pt"
+        payload = template_rollouts[name]
+        data_path = os.path.join(data_dir, file_name)
+        torch.save(payload, data_path)
+        print(f"saved template rollout data: {data_path} ({len(payload)} scenes)")
+
+
 def _save_scene_chunk_rollouts(
     *,
     data_dir: str,
@@ -811,22 +818,10 @@ def _save_scene_chunk_rollouts(
         file_name = f"rollout_{template_name}_{chunk_tag}_{name}.pt"
         data_path = os.path.join(data_dir, file_name)
         torch.save([payload], data_path)
-        print(f"saved rollout chunk: {data_path} (scene={scene_index})")
-
-
-def _save_template_rollouts(
-    *,
-    data_dir: str,
-    template_name: str,
-    template_rollouts: Dict[str, List[RollOutData]],
-    data_aug_enabled: bool,
-) -> None:
-    for name in _variant_names(data_aug_enabled):
-        file_name = f"rollout_{template_name}_{name}.pt"
-        payload = template_rollouts[name]
-        data_path = os.path.join(data_dir, file_name)
-        torch.save(payload, data_path)
-        print(f"saved template rollout data: {data_path} ({len(payload)} scenes)")
+        print(
+            f"saved rollout chunk: {data_path} "
+            f"(scene={scene_index}, chunk={chunk_index})"
+        )
 
 
 def _prepare_animation_grids(
@@ -985,6 +980,7 @@ def main() -> None:
                 chunk_size = num_agents
             else:
                 chunk_size = min(requested_chunk_size, num_agents)
+            chunked_file_save_mode = SAVE_ROLLOUTS and (chunk_size < num_agents)
 
             scene_dynamic_windows: List[List[List[torch.Tensor]]] = []
             scene_static_maps: List[List[torch.Tensor]] = []
@@ -1040,16 +1036,12 @@ def main() -> None:
                 scene_current_velocities.extend(chunk_current_velocities)
                 scene_occupancy_origin.extend(chunk_occupancy_origin)
 
-                if SAVE_ROLLOUTS and args.save_per_scene:
+                if chunked_file_save_mode:
                     chunk_variants = _compute_variant_sets(
                         chunk_static_maps,
                         chunk_dynamic_windows,
                         chunk_current_velocities,
                         DATA_AUG_ENABLED,
-                    )
-                    chunk_origin_tuple = (
-                        float(chunk_occupancy_origin[0][0]),
-                        float(chunk_occupancy_origin[0][1]),
                     )
                     _save_scene_chunk_rollouts(
                         data_dir=DATA_DIR,
@@ -1059,7 +1051,10 @@ def main() -> None:
                         variants=chunk_variants,
                         dt=TIME_STEP,
                         occupancy_resolution=chunk_occupancy_resolution,
-                        occupancy_origin=chunk_origin_tuple,
+                        occupancy_origin=(
+                            float(chunk_occupancy_origin[0][0]),
+                            float(chunk_occupancy_origin[0][1]),
+                        ),
                         frame_offsets=chunk_frame_offsets,
                         anchor_steps=chunk_anchor_steps,
                         data_aug_enabled=DATA_AUG_ENABLED,
@@ -1085,7 +1080,7 @@ def main() -> None:
                 DATA_AUG_ENABLED,
             )
 
-            if SAVE_ROLLOUTS and not args.save_per_scene:
+            if SAVE_ROLLOUTS and not chunked_file_save_mode:
                 _append_scene_rollouts_to_template(
                     template_rollouts=template_rollouts,
                     variants=variants,
@@ -1144,7 +1139,7 @@ def main() -> None:
 
             global_scene_index += 1
 
-        if SAVE_ROLLOUTS and not args.save_per_scene:
+        if SAVE_ROLLOUTS and len(template_rollouts["orig"]) > 0:
             _save_template_rollouts(
                 data_dir=DATA_DIR,
                 template_name=template_name,
