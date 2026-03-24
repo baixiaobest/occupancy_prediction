@@ -109,23 +109,28 @@ def build_agent_centric_occupancy_sequences(
             )
             static_grid = static_occ.generate(center_offset=ego_pos)[0].to(dtype=torch.float32)
 
-            anchor_frames: List[torch.Tensor] = []
-            for dt in frame_offsets:
-                t = anchor_t + dt
-                if other_agent_indices:
-                    other_traj = traj[t, other_agent_indices].astype(np.float32)[None, :, :]
-                else:
-                    other_traj = np.zeros((1, 0, 2), dtype=np.float32)
+            window_start = anchor_t - past_frames
+            window_end = anchor_t + future_frames + 1
+            if other_agent_indices:
+                other_traj = traj[window_start:window_end, other_agent_indices].astype(np.float32)
+            else:
+                other_traj = None
 
-                dynamic_occ = Occupancy2d(
-                    resolution=(resolution, resolution),
-                    size=(float(size_xy[0]), float(size_xy[1])),
-                    trajectory=other_traj,
-                    static_obstacles=None,
-                    agent_radius=agent_radius,
-                )
-                dynamic_grid = dynamic_occ.generate(center_offset=ego_pos)[0].to(dtype=torch.float32)
-                anchor_frames.append(dynamic_grid)
+            dynamic_occ = Occupancy2d(
+                resolution=(resolution, resolution),
+                size=(float(size_xy[0]), float(size_xy[1])),
+                trajectory=other_traj,
+                static_obstacles=None,
+                agent_radius=agent_radius,
+            )
+            generated_frames = dynamic_occ.generate(center_offset=ego_pos)
+            if other_traj is None:
+                # Occupancy2d returns one static-only frame when trajectory is None.
+                # Repeat it so each anchor still has a full temporal window.
+                base_grid = generated_frames[0].to(dtype=torch.float32)
+                anchor_frames = [base_grid.clone() for _ in frame_offsets]
+            else:
+                anchor_frames = [grid.to(dtype=torch.float32) for grid in generated_frames]
 
             sequence_windows.append(anchor_frames)
             static_series.append(static_grid)
@@ -642,7 +647,7 @@ def main() -> None:
     parser.add_argument(
         "--occ-sample-interval",
         type=int,
-        default=2,
+        default=1,
         help="Anchor timestep interval for occupancy generation.",
     )
     parser.add_argument(
@@ -698,6 +703,7 @@ def main() -> None:
     # premade templates are provided by `src.templates.default_templates()`
     rollout_setting = RollOutSetting(
         templates=default_templates(),
+        # templates=test_templates(),
         mirror=False,
         rotate=False,
         name="default",
