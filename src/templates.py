@@ -62,3 +62,20 @@ def default_templates() -> List[SceneTemplate]:
     )
 
     return [straight_template, l_template, t_template, cross_template]
+
+
+def test_templates():
+    t_template = TShapeCorridorTemplate(
+        width_range=(2.0, 10.0),
+        horizontal_length_range=(8.0, 20.0),
+        vertical_length_range=(5.0, 15.0),
+        spawn_density_range=(0.05, 0.05),
+        spawn_velocity_range=(0.3, 3.0),
+        spawn_depth_ratio=0.3,
+        turn_radius_ratio=1.2,
+        ego_center_spacing=2.0,
+        ego_center_noise_std=0.1,
+        num_enabled_start_regions=1,
+    )
+
+    return [t_template]

@@ -236,36 +236,39 @@ def autoregressive_predict(
     latent_shape: tuple[int, int, int],
     latent_channels: int,
     horizon: int,
+    num_modalities: int,
     device: torch.device,
     binary_feedback: bool,
     threshold: float,
 ) -> torch.Tensor:
     """Compute predictions for all anchors t in [history_len, T-1].
 
-    Returns tensor of shape (T-history_len, horizon, H, W).
+    Returns tensor of shape (M, T-history_len, horizon, H, W), where M is
+    the number of selected modalities.
     """
     t_total, h, w = dynamic_sequence.shape
     if t_total <= history_len:
-        return torch.zeros((0, horizon, h, w), dtype=torch.float32)
+        return torch.zeros((num_modalities, 0, horizon, h, w), dtype=torch.float32)
 
-    all_preds = torch.zeros((t_total - history_len, horizon, h, w), dtype=torch.float32)
+    all_preds = torch.zeros((num_modalities, t_total - history_len, horizon, h, w), dtype=torch.float32)
 
     with torch.no_grad():
         for anchor_t in range(history_len, t_total):
-            context = dynamic_sequence[anchor_t - history_len : anchor_t].clone()  # (history_len, H, W)
-            z = torch.randn((1, latent_channels, latent_shape[0], latent_shape[1], latent_shape[2]), device=device)
-            pred_frames: list[torch.Tensor] = []
-            for _ in range(horizon):
-                x_decoder_dynamic = context[-decoder_context_len:].unsqueeze(0).unsqueeze(0).to(device)
-                x_static = static_map.unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
-                logits = decoder(z, x_decoder_dynamic, x_static)
-                prob = torch.sigmoid(logits)[0, 0, 0].detach().cpu()
-                pred_frames.append(prob)
+            for modality_idx in range(num_modalities):
+                context = dynamic_sequence[anchor_t - history_len : anchor_t].clone()  # (history_len, H, W)
+                z = torch.randn((1, latent_channels, latent_shape[0], latent_shape[1], latent_shape[2]), device=device)
+                pred_frames: list[torch.Tensor] = []
+                for _ in range(horizon):
+                    x_decoder_dynamic = context[-decoder_context_len:].unsqueeze(0).unsqueeze(0).to(device)
+                    x_static = static_map.unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
+                    logits = decoder(z, x_decoder_dynamic, x_static)
+                    prob = torch.sigmoid(logits)[0, 0, 0].detach().cpu()
+                    pred_frames.append(prob)
 
-                feedback = (prob >= threshold).float() if binary_feedback else prob
-                context = torch.cat([context, feedback.unsqueeze(0)], dim=0)
+                    feedback = (prob >= threshold).float() if binary_feedback else prob
+                    context = torch.cat([context, feedback.unsqueeze(0)], dim=0)
 
-            all_preds[anchor_t - history_len] = torch.stack(pred_frames, dim=0)
+                all_preds[modality_idx, anchor_t - history_len] = torch.stack(pred_frames, dim=0)
 
     return all_preds
 
@@ -316,13 +319,16 @@ def main() -> None:
         device=device,
     )
 
-    # Cache by (scene_index, origin_index, horizon) to avoid recomputing when only t changes.
-    cache: dict[tuple[int, int, int], torch.Tensor] = {}
+    # Cache by (scene_index, origin_index, horizon, num_modalities) to avoid recompute when only t changes.
+    cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
-    def get_predictions(scene_idx: int, origin_idx: int, horizon: int) -> torch.Tensor:
-        key = (scene_idx, origin_idx, horizon)
+    def get_predictions(scene_idx: int, origin_idx: int, horizon: int, num_modalities: int) -> torch.Tensor:
+        key = (scene_idx, origin_idx, horizon, num_modalities)
         if key not in cache:
-            print(f"Running inference for scene={scene_idx}, origin={origin_idx}, horizon={horizon} ...")
+            print(
+                f"Running inference for scene={scene_idx}, origin={origin_idx}, "
+                f"horizon={horizon}, modalities={num_modalities} ..."
+            )
             seq = scene_sequences[scene_idx][origin_idx]
             static_map = scene_static_maps[scene_idx][origin_idx]
             cache[key] = autoregressive_predict(
@@ -334,28 +340,33 @@ def main() -> None:
                 latent_shape=latent_shape,
                 latent_channels=latent_channels,
                 horizon=horizon,
+                num_modalities=num_modalities,
                 device=device,
                 binary_feedback=args.binary_feedback,
                 threshold=args.threshold,
             )
             t_total = seq.shape[0]
-            print(f"Done. Total inferences: {(max(t_total - history_len, 0)) * horizon}")
+            print(
+                "Done. Total inferences: "
+                f"{(max(t_total - history_len, 0)) * horizon * num_modalities}"
+            )
         return cache[key]
 
     # Build figure and axes.
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     ax_past, ax_pred, ax_overlay_pred, ax_overlay_gt = axes.flatten()
-    plt.subplots_adjust(bottom=0.22)
+    plt.subplots_adjust(bottom=0.25)
 
     zero_img = np.zeros((init_h, init_w), dtype=np.float32)
+    zero_rgb = np.zeros((init_h, init_w, 3), dtype=np.float32)
     im_past = ax_past.imshow(zero_img, cmap="Blues", vmin=0.0, vmax=1.0)
-    im_pred = ax_pred.imshow(zero_img, cmap="Reds", vmin=0.0, vmax=1.0)
-    im_overlay_pred = ax_overlay_pred.imshow(np.zeros((init_h, init_w, 3), dtype=np.float32), vmin=0.0, vmax=1.0)
-    im_overlay_gt = ax_overlay_gt.imshow(np.zeros((init_h, init_w, 3), dtype=np.float32), vmin=0.0, vmax=1.0)
+    im_pred = ax_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0)
+    im_overlay_pred = ax_overlay_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0)
+    im_overlay_gt = ax_overlay_gt.imshow(zero_rgb, vmin=0.0, vmax=1.0)
 
     ax_past.set_title("Past 16 Stack")
-    ax_pred.set_title("Predicted Horizon Stack")
-    ax_overlay_pred.set_title("Overlay: Past (Blue) + Pred (Red)")
+    ax_pred.set_title("Predicted Horizon Stack (Mode1=Red, Mode2=Green)")
+    ax_overlay_pred.set_title("Overlay: Past (Blue) + Pred1 (Red) + Pred2 (Green)")
     ax_overlay_gt.set_title("Overlay: Past (Blue) + GT Future (Green)")
 
     for ax in [ax_past, ax_pred, ax_overlay_pred, ax_overlay_gt]:
@@ -364,10 +375,15 @@ def main() -> None:
 
     # Sliders.
     slider_color = "lightgoldenrodyellow"
+    ax_mode = plt.axes([0.02, 0.12, 0.08, 0.10], facecolor=slider_color)
     ax_scene = plt.axes([0.12, 0.12, 0.18, 0.10], facecolor=slider_color)
     ax_origin = plt.axes([0.34, 0.17, 0.56, 0.03], facecolor=slider_color)
     ax_t = plt.axes([0.12, 0.09, 0.78, 0.03], facecolor=slider_color)
     ax_h = plt.axes([0.12, 0.04, 0.78, 0.03], facecolor=slider_color)
+
+    mode_radio = RadioButtons(ax_mode, labels=["1", "2"], active=0)
+    ax_mode.set_title("Modes", fontsize=9)
+    mode_state = {"count": 1}
 
     scene_options = [str(i) for i in range(len(scene_sequences))]
     scene_radio = RadioButtons(ax_scene, labels=scene_options, active=init_scene)
@@ -404,6 +420,13 @@ def main() -> None:
             return
         refresh(None)
 
+    def _on_mode_select(selection: str) -> None:
+        try:
+            mode_state["count"] = int(selection)
+        except ValueError:
+            return
+        refresh(None)
+
     def refresh(_: float | None = None) -> None:
         scene_idx = int(scene_state["index"])
         origin_max = max(0, len(scene_sequences[scene_idx]) - 1)
@@ -418,6 +441,7 @@ def main() -> None:
             return
 
         horizon = int(h_slider.val)
+        num_modalities = int(mode_state["count"])
 
         seq = scene_sequences[scene_idx][origin_idx]
         t_total, h_img, w_img = seq.shape
@@ -430,17 +454,20 @@ def main() -> None:
             t_slider.set_val(t)
             return
 
-        preds = get_predictions(scene_idx, origin_idx, horizon)
+        preds = get_predictions(scene_idx, origin_idx, horizon, num_modalities)
 
         past = seq[t - history_len : t]  # (history_len, H, W)
         past_stack = past.max(dim=0).values
 
-        if preds.shape[0] > 0:
+        pred_stack_1 = torch.zeros((h_img, w_img), dtype=torch.float32)
+        pred_stack_2 = torch.zeros((h_img, w_img), dtype=torch.float32)
+        if preds.shape[1] > 0:
             pred_index = t - history_len
-            pred_seq = preds[pred_index]  # (horizon, H, W)
-            pred_stack = pred_seq.max(dim=0).values
-        else:
-            pred_stack = torch.zeros((h_img, w_img), dtype=torch.float32)
+            pred_seq_1 = preds[0, pred_index]  # (horizon, H, W)
+            pred_stack_1 = pred_seq_1.max(dim=0).values
+            if num_modalities > 1 and preds.shape[0] > 1:
+                pred_seq_2 = preds[1, pred_index]
+                pred_stack_2 = pred_seq_2.max(dim=0).values
 
         gt_future = seq[t : min(t + horizon, t_total)]
         if gt_future.shape[0] > 0:
@@ -449,27 +476,31 @@ def main() -> None:
             gt_stack = torch.zeros((h_img, w_img), dtype=torch.float32)
 
         past_np = past_stack.numpy()
-        pred_np = pred_stack.numpy()
+        pred1_np = pred_stack_1.numpy()
+        pred2_np = pred_stack_2.numpy()
         gt_np = gt_stack.numpy()
 
-        overlay_pred = np.stack([pred_np, np.zeros_like(pred_np), past_np], axis=-1)
+        pred_viz = np.stack([pred1_np, pred2_np, np.zeros_like(pred1_np)], axis=-1)
+        overlay_pred = np.stack([pred1_np, pred2_np, past_np], axis=-1)
         overlay_gt = np.stack([np.zeros_like(gt_np), gt_np, past_np], axis=-1)
 
         im_past.set_data(past_np)
-        im_pred.set_data(pred_np)
+        im_pred.set_data(np.clip(pred_viz, 0.0, 1.0))
         im_overlay_pred.set_data(np.clip(overlay_pred, 0.0, 1.0))
         im_overlay_gt.set_data(np.clip(overlay_gt, 0.0, 1.0))
 
         ax_past.set_title(f"Past Stack (t-{history_len}..t-1), t={t}")
-        ax_pred.set_title(f"Pred Stack (h={horizon})")
+        ax_pred.set_title(f"Pred Stack (h={horizon}, modes={num_modalities})")
 
-        total_infer = max(t_total - history_len, 0) * horizon
+        total_infer = max(t_total - history_len, 0) * horizon * num_modalities
         info_text.set_text(
-            f"scene={scene_idx} | origin={origin_idx} | T={t_total} | t={t} | horizon={horizon} | total inferences={(total_infer)}"
+            f"scene={scene_idx} | origin={origin_idx} | T={t_total} | t={t} | horizon={horizon} | "
+            f"modes={num_modalities} | total inferences={total_infer}"
         )
 
         fig.canvas.draw_idle()
 
+    mode_radio.on_clicked(_on_mode_select)
     scene_radio.on_clicked(_on_scene_select)
     origin_slider.on_changed(refresh)
     t_slider.on_changed(refresh)

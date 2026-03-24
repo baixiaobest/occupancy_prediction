@@ -16,7 +16,7 @@ from src.ORCASim import ORCASim
 from src.occupancy2d import Occupancy2d
 from src.rollout_data import RollOutData
 from src.rollout_setting import RollOutSetting
-from src.templates import default_templates
+from src.templates import default_templates, test_templates
 
 
 # RollOutSetting is defined in src.rollout_setting
