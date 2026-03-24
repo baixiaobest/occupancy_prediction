@@ -111,16 +111,17 @@ def run_epoch(
     total_kl = 0.0
     total_batches = 0
 
-    for x_encoder_dynamic, x_decoder_dynamic, x_static, y in loader:
+    for x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y in loader:
         x_encoder_dynamic = x_encoder_dynamic.to(device)
         x_decoder_dynamic = x_decoder_dynamic.to(device)
         x_static = x_static.to(device)
+        current_velocity = current_velocity.to(device)
         y = y.to(device)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
-        mu, sigma = encoder(x_encoder_dynamic, x_static)
+        mu, sigma = encoder(x_encoder_dynamic, x_static, current_velocity)
         z = encoder.sample(mu, sigma)
 
         horizon = int(y.shape[2])
@@ -129,7 +130,7 @@ def run_epoch(
         step_recons: list[torch.Tensor] = []
 
         for step in range(effective_k):
-            logits_full = decoder(z, context, x_static)
+            logits_full = decoder(z, context, x_static, current_velocity)
             logits_step = logits_full[:, :, :1]
             target_step = y[:, :, step : step + 1]
 
@@ -243,6 +244,24 @@ def parse_args() -> argparse.Namespace:
         help="Context branch latent channels in decoder (defaults to latent-channel)",
     )
     parser.add_argument("--static-stem-channels", type=int, default=8)
+    parser.add_argument(
+        "--velocity-mlp-dim",
+        type=int,
+        default=16,
+        help="Velocity embedding dimension C after MLP",
+    )
+    parser.add_argument(
+        "--encoder-velocity-condition-channels",
+        type=int,
+        default=4,
+        help="Velocity conditioning channel count C1 fused in encoder",
+    )
+    parser.add_argument(
+        "--decoder-velocity-condition-channels",
+        type=int,
+        default=4,
+        help="Velocity conditioning channel count C2 fused in decoder context branch",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/vae_prediction.pt"))
@@ -328,6 +347,9 @@ def build_checkpoint(
             ),
             "decoder_context_latent_channel": decoder_context_latent_channel,
             "static_stem_channels": args.static_stem_channels,
+            "velocity_mlp_dim": args.velocity_mlp_dim,
+            "encoder_velocity_condition_channels": args.encoder_velocity_condition_channels,
+            "decoder_velocity_condition_channels": args.decoder_velocity_condition_channels,
             "downsample_strides": downsample_strides,
             "upsample_strides": upsample_strides,
             "upsample_channels": upsample_channels,
@@ -395,7 +417,7 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    sample_x_encoder_dynamic, sample_x_decoder_dynamic, sample_x_static, sample_y = train_dataset[0]
+    sample_x_encoder_dynamic, sample_x_decoder_dynamic, sample_x_static, _sample_current_velocity, sample_y = train_dataset[0]
     _, enc_t, h, w = sample_x_encoder_dynamic.shape
     _, dec_ctx_t, _, _ = sample_x_decoder_dynamic.shape
     input_shape = (1, enc_t, h, w)
@@ -423,6 +445,9 @@ def main() -> None:
         decoder_downsample_channels=args.decoder_downsample_channels,
         decoder_context_latent_channel=decoder_context_latent_channel,
         static_stem_channels=args.static_stem_channels,
+        velocity_mlp_dim=args.velocity_mlp_dim,
+        encoder_velocity_condition_channels=args.encoder_velocity_condition_channels,
+        decoder_velocity_condition_channels=args.decoder_velocity_condition_channels,
         decoder_context_frames=dec_ctx_t,
         downsample_strides=downsample_strides,
         decoder_context_downsample_strides=downsample_strides,

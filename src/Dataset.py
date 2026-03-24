@@ -25,7 +25,7 @@ class OccupancyWindowDataset(Dataset):
 
     def __init__(
         self,
-        sequences: Sequence[tuple[torch.Tensor, torch.Tensor]],
+        sequences: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         history_len: int = 16,
         future_len: int = 8,
         decoder_context_len: int = 8,
@@ -49,13 +49,17 @@ class OccupancyWindowDataset(Dataset):
         self.sequences = list(sequences)
         self.samples: list[tuple[int, int]] = []
 
-        for seq_idx, (seq, static_map) in enumerate(self.sequences):
+        for seq_idx, (seq, static_map, velocity_seq) in enumerate(self.sequences):
             if seq.ndim != 3:
                 raise ValueError("Each sequence must have shape (T, H, W)")
             if static_map.ndim != 2:
                 raise ValueError("Each static map must have shape (H, W)")
             if static_map.shape != seq.shape[-2:]:
                 raise ValueError("Static map shape must match sequence spatial shape")
+            if velocity_seq.ndim != 2 or velocity_seq.shape[1] != 2:
+                raise ValueError("Each velocity sequence must have shape (T, 2)")
+            if velocity_seq.shape[0] != seq.shape[0]:
+                raise ValueError("Velocity sequence length must match dynamic sequence length")
             t = seq.shape[0]
             if t < self.window_size:
                 continue
@@ -65,21 +69,23 @@ class OccupancyWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         seq_idx, start = self.samples[index]
-        seq, static_map = self.sequences[seq_idx]
+        seq, static_map, velocity_seq = self.sequences[seq_idx]
 
         past = seq[start : start + self.history_len]
         future = seq[start + self.history_len : start + self.window_size]
+        # Anchor velocity corresponds to first prediction timestep.
+        current_velocity = velocity_seq[start + self.history_len]
 
         x_encoder_dynamic = torch.cat([past, future], dim=0).unsqueeze(0)
         x_decoder_dynamic = past[-self.decoder_context_len :].unsqueeze(0)
         x_static = static_map.unsqueeze(0)
         y = future.unsqueeze(0)
-        return x_encoder_dynamic, x_decoder_dynamic, x_static, y
+        return x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y
 
 
-def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor]]:
+def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     payload = torch.load(pt_path, map_location="cpu")
 
     def _to_2d(frame: object) -> torch.Tensor:
@@ -90,35 +96,43 @@ def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor]
             raise ValueError(f"Occupancy frame must be 2D, got shape {tuple(tensor.shape)}")
         return (tensor > 0).float()
 
-    def _from_rollout_obj(obj: RollOutData) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    def _from_rollout_obj(obj: RollOutData) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         if not hasattr(obj, "agents"):
             raise ValueError("RollOutData.agents is required")
 
-        out: list[tuple[torch.Tensor, torch.Tensor]] = []
+        out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for agent_idx in sorted(obj.agents.keys()):
             agent_data = obj.agents[agent_idx]
             anchor_grids: list[torch.Tensor] = []
             anchor_static_maps: list[torch.Tensor] = []
+            anchor_velocities: list[torch.Tensor] = []
             for anchor_time in sorted(agent_data.anchors.keys()):
                 anchor_data = agent_data.anchors[anchor_time]
                 if not anchor_data.frames:
                     continue
                 if not hasattr(anchor_data, "static_map"):
                     raise ValueError("AnchorRollOutData.static_map is required")
+                if not hasattr(anchor_data, "current_velocity"):
+                    raise ValueError("AnchorRollOutData.current_velocity is required")
                 frame_stack = torch.stack([_to_2d(frame) for frame in anchor_data.frames], dim=0)
                 anchor_grids.append(frame_stack.amax(dim=0))
                 anchor_static_maps.append(_to_2d(anchor_data.static_map))
+                vel = torch.as_tensor(anchor_data.current_velocity, dtype=torch.float32).view(-1)
+                if vel.numel() != 2:
+                    raise ValueError("Anchor current_velocity must contain exactly 2 values")
+                anchor_velocities.append(vel)
 
             if not anchor_grids:
                 continue
 
             dynamic_seq = torch.stack(anchor_grids, dim=0)
             static_map = torch.stack(anchor_static_maps, dim=0).amax(dim=0)
-            out.append((dynamic_seq, static_map))
+            velocity_seq = torch.stack(anchor_velocities, dim=0)
+            out.append((dynamic_seq, static_map, velocity_seq))
 
         return out
 
-    sequences: list[tuple[torch.Tensor, torch.Tensor]] = []
+    sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     if isinstance(payload, RollOutData):
         sequences.extend(_from_rollout_obj(payload))
     elif isinstance(payload, list):
@@ -134,10 +148,13 @@ def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor]
 
 
 def _split_origins(
-    sequences: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    sequences: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     val_ratio: float,
     rng: random.Random,
-) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], list[tuple[torch.Tensor, torch.Tensor]]]:
+) -> tuple[
+    list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+]:
     if not 0.0 <= val_ratio < 1.0:
         raise ValueError("val_ratio must be in [0.0, 1.0)")
 
@@ -169,8 +186,8 @@ def build_datasets(
 ) -> tuple[OccupancyWindowDataset, OccupancyWindowDataset, DatasetStats]:
     rng = random.Random(seed)
 
-    all_train_sequences: list[tuple[torch.Tensor, torch.Tensor]] = []
-    all_val_sequences: list[tuple[torch.Tensor, torch.Tensor]] = []
+    all_train_sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    all_val_sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
     pt_files = sorted(data_dir.glob("*.pt"))
     if not pt_files:

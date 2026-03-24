@@ -41,12 +41,15 @@ def _coerce_channel_list(raw: object) -> list[int]:
     return [int(c) for c in raw]
 
 
-def load_scene_origins(pt_path: Path) -> tuple[list[list[torch.Tensor]], list[list[torch.Tensor]]]:
+def load_scene_origins(
+    pt_path: Path,
+) -> tuple[list[list[torch.Tensor]], list[list[torch.Tensor]], list[list[torch.Tensor]]]:
     """Load dynamic time-series and static maps grouped by scene and origin.
 
     Returns:
         scene_dynamic_sequences: list[scene] of list[origin] tensors `(T, H, W)`
         scene_static_maps: list[scene] of list[origin] tensors `(H, W)`
+        scene_velocity_sequences: list[scene] of list[origin] tensors `(T, 2)`
     """
     payload = torch.load(pt_path, map_location="cpu")
 
@@ -60,10 +63,12 @@ def load_scene_origins(pt_path: Path) -> tuple[list[list[torch.Tensor]], list[li
 
     scene_dynamic_sequences: list[list[torch.Tensor]] = []
     scene_static_maps: list[list[torch.Tensor]] = []
+    scene_velocity_sequences: list[list[torch.Tensor]] = []
 
-    def _collect_from_rollout_obj(obj: RollOutData) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    def _collect_from_rollout_obj(obj: RollOutData) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         dynamic_sequences: list[torch.Tensor] = []
         static_maps: list[torch.Tensor] = []
+        velocity_sequences: list[torch.Tensor] = []
         if hasattr(obj, "dynamic_grids") and hasattr(obj, "static_maps"):
             if len(obj.dynamic_grids) != len(obj.static_maps):
                 raise ValueError("dynamic_grids and static_maps must have same length")
@@ -73,7 +78,8 @@ def load_scene_origins(pt_path: Path) -> tuple[list[list[torch.Tensor]], list[li
                     continue
                 dynamic_sequences.append(torch.stack(dyn_frames, dim=0))
                 static_maps.append(_to_2d(static_map))
-            return dynamic_sequences, static_maps
+                velocity_sequences.append(torch.zeros((len(dyn_frames), 2), dtype=torch.float32))
+            return dynamic_sequences, static_maps, velocity_sequences
 
         if hasattr(obj, "occupancy_grids"):
             for origin_series in obj.occupancy_grids:
@@ -83,15 +89,44 @@ def load_scene_origins(pt_path: Path) -> tuple[list[list[torch.Tensor]], list[li
                 full_seq = torch.stack(frames, dim=0)
                 dynamic_sequences.append(full_seq)
                 static_maps.append(torch.zeros_like(full_seq[0]))
-            return dynamic_sequences, static_maps
+                velocity_sequences.append(torch.zeros((full_seq.shape[0], 2), dtype=torch.float32))
+            return dynamic_sequences, static_maps, velocity_sequences
+
+        if hasattr(obj, "agents"):
+            for agent_idx in sorted(obj.agents.keys()):
+                agent_data = obj.agents[agent_idx]
+                anchor_grids: list[torch.Tensor] = []
+                anchor_static: list[torch.Tensor] = []
+                anchor_vel: list[torch.Tensor] = []
+                for anchor_time in sorted(agent_data.anchors.keys()):
+                    anchor_data = agent_data.anchors[anchor_time]
+                    if not anchor_data.frames:
+                        continue
+                    frame_stack = torch.stack([_to_2d(frame) for frame in anchor_data.frames], dim=0)
+                    anchor_grids.append(frame_stack.amax(dim=0))
+                    anchor_static.append(_to_2d(anchor_data.static_map))
+                    vel = torch.as_tensor(anchor_data.current_velocity, dtype=torch.float32).view(-1)
+                    if vel.numel() != 2:
+                        raise ValueError("Anchor current_velocity must contain exactly 2 values")
+                    anchor_vel.append(vel)
+
+                if not anchor_grids:
+                    continue
+
+                dynamic_sequences.append(torch.stack(anchor_grids, dim=0))
+                static_maps.append(torch.stack(anchor_static, dim=0).amax(dim=0))
+                velocity_sequences.append(torch.stack(anchor_vel, dim=0))
+
+            return dynamic_sequences, static_maps, velocity_sequences
 
         raise ValueError("Unsupported RollOutData schema")
 
     if isinstance(payload, RollOutData):
-        dyn, sta = _collect_from_rollout_obj(payload)
+        dyn, sta, vel = _collect_from_rollout_obj(payload)
         if dyn:
             scene_dynamic_sequences.append(dyn)
             scene_static_maps.append(sta)
+            scene_velocity_sequences.append(vel)
     elif isinstance(payload, dict):
         if "dynamic_grids" in payload and "static_maps" in payload:
             pseudo = RollOutData(
@@ -99,30 +134,34 @@ def load_scene_origins(pt_path: Path) -> tuple[list[list[torch.Tensor]], list[li
                 dynamic_grids=payload["dynamic_grids"],
                 dt=float(payload.get("dt", 0.0)),
             )
-            dyn, sta = _collect_from_rollout_obj(pseudo)
+            dyn, sta, vel = _collect_from_rollout_obj(pseudo)
             if dyn:
                 scene_dynamic_sequences.append(dyn)
                 scene_static_maps.append(sta)
+                scene_velocity_sequences.append(vel)
         elif "occupancy_grids" in payload:
             pseudo = RollOutData(static_maps=[], dynamic_grids=[], dt=float(payload.get("dt", 0.0)))
             setattr(pseudo, "occupancy_grids", payload["occupancy_grids"])
-            dyn, sta = _collect_from_rollout_obj(pseudo)
+            dyn, sta, vel = _collect_from_rollout_obj(pseudo)
             if dyn:
                 scene_dynamic_sequences.append(dyn)
                 scene_static_maps.append(sta)
+                scene_velocity_sequences.append(vel)
         else:
             raise ValueError(f"Unsupported payload format in {pt_path}")
     elif isinstance(payload, list):
         if all(isinstance(x, RollOutData) for x in payload):
             for item in payload:
-                dyn, sta = _collect_from_rollout_obj(item)
+                dyn, sta, vel = _collect_from_rollout_obj(item)
                 if dyn:
                     scene_dynamic_sequences.append(dyn)
                     scene_static_maps.append(sta)
+                    scene_velocity_sequences.append(vel)
         else:
             # Treat list-of-origins payload as a single scene with many origins.
             dynamic_sequences: list[torch.Tensor] = []
             static_maps: list[torch.Tensor] = []
+            velocity_sequences: list[torch.Tensor] = []
             for origin_series in payload:
                 frames = [_to_2d(frame) for frame in origin_series]
                 if not frames:
@@ -130,13 +169,15 @@ def load_scene_origins(pt_path: Path) -> tuple[list[list[torch.Tensor]], list[li
                 full_seq = torch.stack(frames, dim=0)
                 dynamic_sequences.append(full_seq)
                 static_maps.append(torch.zeros_like(full_seq[0]))
+                velocity_sequences.append(torch.zeros((full_seq.shape[0], 2), dtype=torch.float32))
             if dynamic_sequences:
                 scene_dynamic_sequences.append(dynamic_sequences)
                 scene_static_maps.append(static_maps)
+                scene_velocity_sequences.append(velocity_sequences)
     else:
         raise ValueError(f"Unsupported payload format in {pt_path}")
 
-    return scene_dynamic_sequences, scene_static_maps
+    return scene_dynamic_sequences, scene_static_maps, scene_velocity_sequences
 
 
 def build_models(
@@ -189,6 +230,9 @@ def build_models(
         model_cfg.get("decoder_context_latent_channel", latent_channel)
     )
     static_stem_channels = int(model_cfg["static_stem_channels"])
+    velocity_mlp_dim = int(model_cfg.get("velocity_mlp_dim", 16))
+    encoder_velocity_condition_channels = int(model_cfg.get("encoder_velocity_condition_channels", 0))
+    decoder_velocity_condition_channels = int(model_cfg.get("decoder_velocity_condition_channels", 0))
 
     input_shape = tuple(model_cfg["input_shape"])
     output_shape = tuple(model_cfg["output_shape"])
@@ -206,6 +250,9 @@ def build_models(
         decoder_downsample_channels=decoder_downsample_channels,
         decoder_context_latent_channel=decoder_context_latent_channel,
         static_stem_channels=static_stem_channels,
+        velocity_mlp_dim=velocity_mlp_dim,
+        encoder_velocity_condition_channels=encoder_velocity_condition_channels,
+        decoder_velocity_condition_channels=decoder_velocity_condition_channels,
         downsample_strides=model_downsample_strides,
         upsample_strides=model_upsample_strides,
         upsample_channels=model_upsample_channels,
@@ -230,6 +277,7 @@ def build_models(
 def autoregressive_predict(
     dynamic_sequence: torch.Tensor,
     static_map: torch.Tensor,
+    velocity_sequence: torch.Tensor,
     decoder: VAEPredictionDecoder,
     history_len: int,
     decoder_context_len: int,
@@ -261,7 +309,8 @@ def autoregressive_predict(
                 for _ in range(horizon):
                     x_decoder_dynamic = context[-decoder_context_len:].unsqueeze(0).unsqueeze(0).to(device)
                     x_static = static_map.unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
-                    logits = decoder(z, x_decoder_dynamic, x_static)
+                    current_velocity = velocity_sequence[anchor_t].unsqueeze(0).to(device)
+                    logits = decoder(z, x_decoder_dynamic, x_static, current_velocity)
                     prob = torch.sigmoid(logits)[0, 0, 0].detach().cpu()
                     pred_frames.append(prob)
 
@@ -296,7 +345,7 @@ def main() -> None:
 
     device = torch.device(args.device)
 
-    scene_sequences, scene_static_maps = load_scene_origins(args.data_file)
+    scene_sequences, scene_static_maps, scene_velocity_sequences = load_scene_origins(args.data_file)
     if not scene_sequences:
         raise ValueError(f"No scene sequences found in {args.data_file}")
 
@@ -331,9 +380,11 @@ def main() -> None:
             )
             seq = scene_sequences[scene_idx][origin_idx]
             static_map = scene_static_maps[scene_idx][origin_idx]
+            velocity_seq = scene_velocity_sequences[scene_idx][origin_idx]
             cache[key] = autoregressive_predict(
                 dynamic_sequence=seq,
                 static_map=static_map,
+                velocity_sequence=velocity_seq,
                 decoder=decoder,
                 history_len=history_len,
                 decoder_context_len=decoder_context_len,
