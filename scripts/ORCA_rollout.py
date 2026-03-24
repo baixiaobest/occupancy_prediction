@@ -697,7 +697,7 @@ def main() -> None:
 
     # premade templates are provided by `src.templates.default_templates()`
     rollout_setting = RollOutSetting(
-        templates=test_templates(), #default_templates(),
+        templates=default_templates(),
         mirror=False,
         rotate=False,
         name="default",
