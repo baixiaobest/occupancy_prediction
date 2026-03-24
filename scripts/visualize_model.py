@@ -47,7 +47,13 @@ def load_scene_origins(
         scene_static_maps: list[scene] of list[origin] tensors `(T, H, W)`
         scene_velocity_sequences: list[scene] of list[origin] tensors `(T, 2)`
     """
-    payload = torch.load(pt_path, map_location="cpu")
+    try:
+        payload = torch.load(pt_path, map_location="cpu")
+    except AttributeError as exc:
+        raise ValueError(
+            f"Failed to load {pt_path}: legacy rollout format is no longer supported. "
+            "Regenerate rollout .pt files using the current scripts/ORCA_rollout.py format."
+        ) from exc
 
     def _to_2d(frame: object) -> torch.Tensor:
         tensor = torch.as_tensor(frame, dtype=torch.float32)

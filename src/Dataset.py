@@ -93,7 +93,14 @@ class OccupancyWindowDataset(Dataset):
 
 
 def _load_agent_sequences_from_file(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    payload = torch.load(pt_path, map_location="cpu")
+    try:
+        payload = torch.load(pt_path, map_location="cpu")
+    except AttributeError as exc:
+        # Legacy pickle payloads reference removed classes (e.g., AnchorRollOutData).
+        raise ValueError(
+            f"Failed to load {pt_path}: legacy rollout format is no longer supported. "
+            "Regenerate rollout .pt files using the current scripts/ORCA_rollout.py format."
+        ) from exc
 
     def _to_2d(frame: object) -> torch.Tensor:
         tensor = torch.as_tensor(frame, dtype=torch.float32)
