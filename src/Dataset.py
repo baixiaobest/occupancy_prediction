@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from src.rollout_data import RollOutData
+from src.rollout_data import RollOutData, SceneRollOutData
 
 
 @dataclass
@@ -102,53 +103,123 @@ def _load_agent_sequences_from_file(pt_path: Path) -> list[tuple[torch.Tensor, t
             raise ValueError(f"Occupancy frame must be 2D, got shape {tuple(tensor.shape)}")
         return (tensor > 0).float()
 
-    def _from_rollout_obj(obj: RollOutData) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        if not hasattr(obj, "agents"):
-            raise ValueError("RollOutData.agents is required")
+    def _slice_centered_patch(
+        grid: torch.Tensor,
+        center_xy: torch.Tensor,
+        origin_xy: tuple[float, float],
+        resolution_xy: tuple[float, float],
+        patch_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        patch_h, patch_w = patch_shape
+        res_x, res_y = float(resolution_xy[0]), float(resolution_xy[1])
+        center_x = float(center_xy[0].item())
+        center_y = float(center_xy[1].item())
+        half_w = 0.5 * patch_w * res_x
+        half_h = 0.5 * patch_h * res_y
 
+        start_x = int(np.floor((center_x - half_w - origin_xy[0]) / res_x))
+        start_y = int(np.floor((center_y - half_h - origin_xy[1]) / res_y))
+
+        out = torch.zeros((patch_h, patch_w), dtype=torch.float32)
+        src_x0 = max(0, start_x)
+        src_y0 = max(0, start_y)
+        src_x1 = min(grid.shape[1], start_x + patch_w)
+        src_y1 = min(grid.shape[0], start_y + patch_h)
+        if src_x1 <= src_x0 or src_y1 <= src_y0:
+            return out
+
+        dst_x0 = src_x0 - start_x
+        dst_y0 = src_y0 - start_y
+        dst_x1 = dst_x0 + (src_x1 - src_x0)
+        dst_y1 = dst_y0 + (src_y1 - src_y0)
+        out[dst_y0:dst_y1, dst_x0:dst_x1] = grid[src_y0:src_y1, src_x0:src_x1]
+        return (out > 0).float()
+
+    def _from_scene_obj(scene: SceneRollOutData) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if scene.scene_static_map is None:
+            raise ValueError("RollOutData.scene_static_map is required")
+        if scene.scene_map_origin is None:
+            raise ValueError("RollOutData.scene_map_origin is required")
+        if scene.local_map_shape is None:
+            raise ValueError("RollOutData.local_map_shape is required")
+        if not scene.scene_dynamic_maps:
+            raise ValueError("RollOutData.scene_dynamic_maps is required")
         out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        for agent_idx in sorted(obj.agents.keys()):
-            agent_data = obj.agents[agent_idx]
+        scene_static = _to_2d(scene.scene_static_map)
+        scene_origin = (
+            float(scene.scene_map_origin[0]),
+            float(scene.scene_map_origin[1]),
+        )
+        resolution_xy = (
+            float(scene.occupancy_resolution[0]),
+            float(scene.occupancy_resolution[1]),
+        )
+        patch_shape = (int(scene.local_map_shape[0]), int(scene.local_map_shape[1]))
+
+        for agent_idx in sorted(scene.agents.keys()):
+            agent_data = scene.agents[agent_idx]
+            dynamic_map_obj = scene.scene_dynamic_maps.get(agent_idx)
+            if dynamic_map_obj is None:
+                continue
+
+            anchor_times = agent_data.anchor_times
+            anchor_centers = agent_data.anchor_centers
+            velocity_series = agent_data.current_velocities
+            if not anchor_times:
+                continue
+            if anchor_centers is None or velocity_series is None:
+                raise ValueError("Agent metadata requires anchor_centers and current_velocities")
+
+            centers_tensor = torch.as_tensor(anchor_centers, dtype=torch.float32)
+            velocity_tensor = torch.as_tensor(velocity_series, dtype=torch.float32)
+            dynamic_map = torch.as_tensor(dynamic_map_obj, dtype=torch.float32)
+            if centers_tensor.shape != (len(anchor_times), 2):
+                raise ValueError("anchor_centers must have shape (num_anchors, 2)")
+            if velocity_tensor.shape != (len(anchor_times), 2):
+                raise ValueError("current_velocities must have shape (num_anchors, 2)")
+            if dynamic_map.ndim != 2:
+                raise ValueError("scene_dynamic_maps[agent] must be a 2D map")
+
             anchor_grids: list[torch.Tensor] = []
             anchor_static_maps: list[torch.Tensor] = []
             anchor_velocities: list[torch.Tensor] = []
-            for anchor_time in sorted(agent_data.anchors.keys()):
-                anchor_data = agent_data.anchors[anchor_time]
-                if not anchor_data.frames:
-                    continue
-                if not hasattr(anchor_data, "static_map"):
-                    raise ValueError("AnchorRollOutData.static_map is required")
-                if not hasattr(anchor_data, "current_velocity"):
-                    raise ValueError("AnchorRollOutData.current_velocity is required")
-                frame_stack = torch.stack([_to_2d(frame) for frame in anchor_data.frames], dim=0)
-                anchor_grids.append(frame_stack.amax(dim=0))
-                anchor_static_maps.append(_to_2d(anchor_data.static_map))
-                vel = torch.as_tensor(anchor_data.current_velocity, dtype=torch.float32).view(-1)
-                if vel.numel() != 2:
-                    raise ValueError("Anchor current_velocity must contain exactly 2 values")
-                anchor_velocities.append(vel)
+            for anchor_idx in range(len(anchor_times)):
+                center_xy = centers_tensor[anchor_idx]
+                dynamic_local = _slice_centered_patch(
+                    grid=dynamic_map,
+                    center_xy=center_xy,
+                    origin_xy=scene_origin,
+                    resolution_xy=resolution_xy,
+                    patch_shape=patch_shape,
+                )
+                static_local = _slice_centered_patch(
+                    grid=scene_static,
+                    center_xy=center_xy,
+                    origin_xy=scene_origin,
+                    resolution_xy=resolution_xy,
+                    patch_shape=patch_shape,
+                )
+
+                anchor_grids.append(dynamic_local)
+                anchor_static_maps.append(static_local)
+                anchor_velocities.append(velocity_tensor[anchor_idx])
 
             if not anchor_grids:
                 continue
 
             dynamic_seq = torch.stack(anchor_grids, dim=0)
             static_seq = torch.stack(anchor_static_maps, dim=0)
-            velocity_seq = torch.stack(anchor_velocities, dim=0)
+            velocity_seq = torch.stack(anchor_velocities, dim=0).to(dtype=torch.float32)
             out.append((dynamic_seq, static_seq, velocity_seq))
 
         return out
 
     sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     if isinstance(payload, RollOutData):
-        sequences.extend(_from_rollout_obj(payload))
-    elif isinstance(payload, list):
-        if all(isinstance(x, RollOutData) for x in payload):
-            for item in payload:
-                sequences.extend(_from_rollout_obj(item))
-        else:
-            raise ValueError("List payload must contain RollOutData objects")
+        for scene in payload.scenes:
+            sequences.extend(_from_scene_obj(scene))
     else:
-        raise ValueError(f"Unsupported payload format in {pt_path}")
+        raise ValueError(f"Unsupported payload format in {pt_path}: expected RollOutData")
 
     return sequences
 

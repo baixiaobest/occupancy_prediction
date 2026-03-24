@@ -18,20 +18,16 @@ from src.VAE_prediction import (
     VAEPredictionDecoder,
     build_prediction_vae_models,
 )
-from src.rollout_data import RollOutData
+from src.rollout_data import RollOutData, SceneRollOutData
 
 def _coerce_stride_list(raw: object) -> list[tuple[int, int]]:
     if raw is None:
         raise ValueError("stride config is missing")
     stride_list: list[tuple[int, int]] = []
     for s in raw:
-        if len(s) == 2:
-            stride_list.append((int(s[0]), int(s[1])))
-        elif len(s) == 3:
-            # Backward compatibility for old checkpoints storing (t, h, w).
-            stride_list.append((int(s[1]), int(s[2])))
-        else:
-            raise ValueError("stride entries must have length 2 or 3")
+        if len(s) != 2:
+            raise ValueError("stride entries must have length 2")
+        stride_list.append((int(s[0]), int(s[1])))
     return stride_list
 
 
@@ -65,125 +61,101 @@ def load_scene_origins(
     scene_static_maps: list[list[torch.Tensor]] = []
     scene_velocity_sequences: list[list[torch.Tensor]] = []
 
-    def _collect_from_rollout_obj(obj: RollOutData) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    def _slice_centered_patch(
+        grid: torch.Tensor,
+        center_xy: torch.Tensor,
+        origin_xy: tuple[float, float],
+        resolution_xy: tuple[float, float],
+        patch_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        patch_h, patch_w = patch_shape
+        res_x, res_y = float(resolution_xy[0]), float(resolution_xy[1])
+        center_x = float(center_xy[0].item())
+        center_y = float(center_xy[1].item())
+        half_w = 0.5 * patch_w * res_x
+        half_h = 0.5 * patch_h * res_y
+        start_x = int(np.floor((center_x - half_w - origin_xy[0]) / res_x))
+        start_y = int(np.floor((center_y - half_h - origin_xy[1]) / res_y))
+
+        out = torch.zeros((patch_h, patch_w), dtype=torch.float32)
+        src_x0 = max(0, start_x)
+        src_y0 = max(0, start_y)
+        src_x1 = min(grid.shape[1], start_x + patch_w)
+        src_y1 = min(grid.shape[0], start_y + patch_h)
+        if src_x1 <= src_x0 or src_y1 <= src_y0:
+            return out
+
+        dst_x0 = src_x0 - start_x
+        dst_y0 = src_y0 - start_y
+        dst_x1 = dst_x0 + (src_x1 - src_x0)
+        dst_y1 = dst_y0 + (src_y1 - src_y0)
+        out[dst_y0:dst_y1, dst_x0:dst_x1] = grid[src_y0:src_y1, src_x0:src_x1]
+        return (out > 0).float()
+
+    def _collect_from_scene_obj(scene: SceneRollOutData) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        if scene.scene_static_map is None or scene.scene_map_origin is None or scene.local_map_shape is None:
+            raise ValueError("Compact RollOutData fields are required")
+        if not scene.scene_dynamic_maps:
+            raise ValueError("RollOutData.scene_dynamic_maps is required")
+
         dynamic_sequences: list[torch.Tensor] = []
         static_maps: list[torch.Tensor] = []
         velocity_sequences: list[torch.Tensor] = []
-        if hasattr(obj, "dynamic_grids") and hasattr(obj, "static_maps"):
-            if len(obj.dynamic_grids) != len(obj.static_maps):
-                raise ValueError("dynamic_grids and static_maps must have same length")
-            for dyn_series, static_map in zip(obj.dynamic_grids, obj.static_maps):
-                dyn_frames = [_to_2d(frame) for frame in dyn_series]
-                if not dyn_frames:
-                    continue
-                dynamic_sequences.append(torch.stack(dyn_frames, dim=0))
-                static_2d = _to_2d(static_map)
-                static_maps.append(static_2d.unsqueeze(0).repeat(len(dyn_frames), 1, 1))
-                velocity_sequences.append(torch.zeros((len(dyn_frames), 2), dtype=torch.float32))
-            return dynamic_sequences, static_maps, velocity_sequences
 
-        if hasattr(obj, "occupancy_grids"):
-            for origin_series in obj.occupancy_grids:
-                frames = [_to_2d(frame) for frame in origin_series]
-                if not frames:
-                    continue
-                full_seq = torch.stack(frames, dim=0)
-                dynamic_sequences.append(full_seq)
-                static_maps.append(torch.zeros_like(full_seq))
-                velocity_sequences.append(torch.zeros((full_seq.shape[0], 2), dtype=torch.float32))
-            return dynamic_sequences, static_maps, velocity_sequences
+        scene_static = _to_2d(scene.scene_static_map)
+        scene_origin = (float(scene.scene_map_origin[0]), float(scene.scene_map_origin[1]))
+        resolution_xy = (float(scene.occupancy_resolution[0]), float(scene.occupancy_resolution[1]))
+        patch_shape = (int(scene.local_map_shape[0]), int(scene.local_map_shape[1]))
 
-        if hasattr(obj, "agents"):
-            zero_offset_idx = 0
-            if hasattr(obj, "frame_offsets"):
-                offsets = [int(v) for v in getattr(obj, "frame_offsets")]
-                if 0 in offsets:
-                    zero_offset_idx = offsets.index(0)
-            for agent_idx in sorted(obj.agents.keys()):
-                agent_data = obj.agents[agent_idx]
-                anchor_grids: list[torch.Tensor] = []
-                anchor_static: list[torch.Tensor] = []
-                anchor_vel: list[torch.Tensor] = []
-                for anchor_time in sorted(agent_data.anchors.keys()):
-                    anchor_data = agent_data.anchors[anchor_time]
-                    if not anchor_data.frames:
-                        continue
-                    frame_list = [_to_2d(frame) for frame in anchor_data.frames]
-                    current_idx = min(max(zero_offset_idx, 0), len(frame_list) - 1)
-                    # Use the current-timestep frame so temporal overlays remain causal.
-                    anchor_grids.append(frame_list[current_idx])
-                    anchor_static.append(_to_2d(anchor_data.static_map))
-                    vel = torch.as_tensor(anchor_data.current_velocity, dtype=torch.float32).view(-1)
-                    if vel.numel() != 2:
-                        raise ValueError("Anchor current_velocity must contain exactly 2 values")
-                    anchor_vel.append(vel)
+        for agent_idx in sorted(scene.agents.keys()):
+            agent_data = scene.agents[agent_idx]
+            dynamic_map_obj = scene.scene_dynamic_maps.get(agent_idx)
+            if dynamic_map_obj is None:
+                continue
 
-                if not anchor_grids:
-                    continue
+            if agent_data.anchor_centers is None or agent_data.current_velocities is None:
+                raise ValueError("Agent metadata requires anchor_centers and current_velocities")
 
-                dynamic_sequences.append(torch.stack(anchor_grids, dim=0))
-                static_maps.append(torch.stack(anchor_static, dim=0))
-                velocity_sequences.append(torch.stack(anchor_vel, dim=0))
+            centers = torch.as_tensor(agent_data.anchor_centers, dtype=torch.float32)
+            velocities = torch.as_tensor(agent_data.current_velocities, dtype=torch.float32)
+            dynamic_map = torch.as_tensor(dynamic_map_obj, dtype=torch.float32)
 
-            return dynamic_sequences, static_maps, velocity_sequences
+            if centers.ndim != 2 or centers.shape[1] != 2:
+                raise ValueError("anchor_centers must have shape (A, 2)")
+            if velocities.shape != centers.shape:
+                raise ValueError("current_velocities must match anchor_centers shape")
+            if dynamic_map.ndim != 2:
+                raise ValueError("scene_dynamic_maps[agent] must be 2D")
 
-        raise ValueError("Unsupported RollOutData schema")
+            dyn_local: list[torch.Tensor] = []
+            sta_local: list[torch.Tensor] = []
+            for anchor_idx in range(centers.shape[0]):
+                center_xy = centers[anchor_idx]
+                dyn_local.append(
+                    _slice_centered_patch(dynamic_map, center_xy, scene_origin, resolution_xy, patch_shape)
+                )
+                sta_local.append(
+                    _slice_centered_patch(scene_static, center_xy, scene_origin, resolution_xy, patch_shape)
+                )
+
+            if not dyn_local:
+                continue
+
+            dynamic_sequences.append(torch.stack(dyn_local, dim=0))
+            static_maps.append(torch.stack(sta_local, dim=0))
+            velocity_sequences.append(velocities)
+
+        return dynamic_sequences, static_maps, velocity_sequences
 
     if isinstance(payload, RollOutData):
-        dyn, sta, vel = _collect_from_rollout_obj(payload)
-        if dyn:
-            scene_dynamic_sequences.append(dyn)
-            scene_static_maps.append(sta)
-            scene_velocity_sequences.append(vel)
-    elif isinstance(payload, dict):
-        if "dynamic_grids" in payload and "static_maps" in payload:
-            pseudo = RollOutData(
-                static_maps=payload["static_maps"],
-                dynamic_grids=payload["dynamic_grids"],
-                dt=float(payload.get("dt", 0.0)),
-            )
-            dyn, sta, vel = _collect_from_rollout_obj(pseudo)
+        for scene in payload.scenes:
+            dyn, sta, vel = _collect_from_scene_obj(scene)
             if dyn:
                 scene_dynamic_sequences.append(dyn)
                 scene_static_maps.append(sta)
                 scene_velocity_sequences.append(vel)
-        elif "occupancy_grids" in payload:
-            pseudo = RollOutData(static_maps=[], dynamic_grids=[], dt=float(payload.get("dt", 0.0)))
-            setattr(pseudo, "occupancy_grids", payload["occupancy_grids"])
-            dyn, sta, vel = _collect_from_rollout_obj(pseudo)
-            if dyn:
-                scene_dynamic_sequences.append(dyn)
-                scene_static_maps.append(sta)
-                scene_velocity_sequences.append(vel)
-        else:
-            raise ValueError(f"Unsupported payload format in {pt_path}")
-    elif isinstance(payload, list):
-        if all(isinstance(x, RollOutData) for x in payload):
-            for item in payload:
-                dyn, sta, vel = _collect_from_rollout_obj(item)
-                if dyn:
-                    scene_dynamic_sequences.append(dyn)
-                    scene_static_maps.append(sta)
-                    scene_velocity_sequences.append(vel)
-        else:
-            # Treat list-of-origins payload as a single scene with many origins.
-            dynamic_sequences: list[torch.Tensor] = []
-            static_maps: list[torch.Tensor] = []
-            velocity_sequences: list[torch.Tensor] = []
-            for origin_series in payload:
-                frames = [_to_2d(frame) for frame in origin_series]
-                if not frames:
-                    continue
-                full_seq = torch.stack(frames, dim=0)
-                dynamic_sequences.append(full_seq)
-                static_maps.append(torch.zeros_like(full_seq))
-                velocity_sequences.append(torch.zeros((full_seq.shape[0], 2), dtype=torch.float32))
-            if dynamic_sequences:
-                scene_dynamic_sequences.append(dynamic_sequences)
-                scene_static_maps.append(static_maps)
-                scene_velocity_sequences.append(velocity_sequences)
     else:
-        raise ValueError(f"Unsupported payload format in {pt_path}")
+        raise ValueError(f"Unsupported payload format in {pt_path}: expected RollOutData")
 
     return scene_dynamic_sequences, scene_static_maps, scene_velocity_sequences
 
@@ -220,20 +192,14 @@ def build_models(
     model_downsample_strides = _coerce_stride_list(model_cfg["downsample_strides"])
     channels_cfg = model_cfg.get("channels")
     if channels_cfg is None:
-        # Backward compatibility: reconstruct old channel schedule from base_channels.
-        base_channels = int(model_cfg["base_channels"])
-        channels = [base_channels, base_channels * 2] + [base_channels * 4] * (len(model_downsample_strides) - 1)
-    else:
-        channels = [int(c) for c in channels_cfg]
+        raise ValueError("Checkpoint model_config is missing required key: channels")
+    channels = [int(c) for c in channels_cfg]
 
     decoder_base_channels = int(model_cfg.get("decoder_base_channels", channels[0]))
     decoder_downsample_channels_cfg = model_cfg.get("decoder_downsample_channels")
     if decoder_downsample_channels_cfg is None:
-        decoder_downsample_channels = [decoder_base_channels, decoder_base_channels * 2] + [
-            decoder_base_channels * 4
-        ] * (len(model_downsample_strides) - 1)
-    else:
-        decoder_downsample_channels = [int(c) for c in decoder_downsample_channels_cfg]
+        raise ValueError("Checkpoint model_config is missing required key: decoder_downsample_channels")
+    decoder_downsample_channels = [int(c) for c in decoder_downsample_channels_cfg]
     decoder_context_latent_channel = int(
         model_cfg.get("decoder_context_latent_channel", latent_channel)
     )

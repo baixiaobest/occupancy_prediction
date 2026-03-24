@@ -7,40 +7,24 @@ import torch
 
 
 @dataclass
-class AnchorRollOutData:
-    """One anchor snapshot for a centered agent.
-
-    Fields:
-    - anchor_time: simulation timestep index used as anchor.
-    - static_map: static occupancy map (H, W) centered at this anchor.
-    - current_velocity: ego velocity [vx, vy] at anchor_time.
-    - frames: occupancy frames over temporal offsets around the anchor.
-      Each frame has shape (H, W).
-    """
-
-    anchor_time: int
-    static_map: torch.Tensor
-    current_velocity: torch.Tensor
-    frames: List[torch.Tensor]
-
-
-@dataclass
 class AgentRollOutData:
-    """All anchor snapshots for one centered agent.
-
-    - anchors: map from anchor timestep -> anchor payload.
-    """
+    """Compact per-agent metadata for one scene rollout."""
 
     agent_index: int
-    anchors: Dict[int, AnchorRollOutData] = field(default_factory=dict)
+    anchor_times: List[int] = field(default_factory=list)
+    anchor_centers: torch.Tensor | None = None
+    current_velocities: torch.Tensor | None = None
 
 
 @dataclass
-class RollOutData:
+class SceneRollOutData:
     """Stored rollout payload for one scene.
 
-    Explicit hierarchy:
-    scene -> agents[agent_index] -> anchors[anchor_time] -> frames[offset_idx]
+    Compact hierarchy:
+    - scene_static_map: one static map for the full scene canvas.
+    - scene_dynamic_maps[agent_index]: one dynamic map (H, W) per centered agent.
+    - agents[agent_index] contains anchor_times + anchor_centers + current_velocities.
+    - local_map_shape gives the map size (H, W) that should be sliced per anchor.
     """
 
     dt: float
@@ -48,3 +32,14 @@ class RollOutData:
     occupancy_origin: Tuple[float, float]
     frame_offsets: List[int]
     agents: Dict[int, AgentRollOutData] = field(default_factory=dict)
+    scene_static_map: torch.Tensor | None = None
+    scene_dynamic_maps: Dict[int, torch.Tensor] = field(default_factory=dict)
+    scene_map_origin: Tuple[float, float] | None = None
+    local_map_shape: Tuple[int, int] | None = None
+
+
+@dataclass
+class RollOutData:
+    """Top-level rollout payload containing multiple scenes."""
+
+    scenes: List[SceneRollOutData] = field(default_factory=list)
