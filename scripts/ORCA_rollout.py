@@ -341,6 +341,8 @@ def animate_rollout(
     occupancy_grids: List[List[np.ndarray]],
     static_maps: List[List[np.ndarray]],
     dynamic_grids: List[List[np.ndarray]],
+    dynamic_past_grids: List[List[np.ndarray]] | None,
+    dynamic_future_grids: List[List[np.ndarray]] | None,
     occupancy_origins: List[np.ndarray],
     occupancy_resolution: Tuple[float, float],
     anchor_steps: List[int],
@@ -558,6 +560,68 @@ def animate_rollout(
     for ax_static in flat_static_axes[num_occ_maps:]:
         ax_static.axis("off")
 
+    has_future_overlay = (
+        dynamic_past_grids is not None
+        and dynamic_future_grids is not None
+        and len(dynamic_past_grids) == num_occ_maps
+        and len(dynamic_future_grids) == num_occ_maps
+    )
+    overlay_images = []
+    overlay_time_texts = []
+    if has_future_overlay:
+        fig_overlay, axes_overlay = plt.subplots(
+            occ_rows,
+            occ_cols,
+            figsize=(4.0 * occ_cols, 4.0 * occ_rows),
+            squeeze=False,
+        )
+        overlay_title = "Dynamic Past/Future Overlay (R=past, G=future)"
+        if title_prefix:
+            overlay_title = f"{title_prefix} - {overlay_title}"
+        fig_overlay.suptitle(overlay_title)
+
+        flat_overlay_axes = axes_overlay.flatten()
+        for occ_idx in range(num_occ_maps):
+            ax_overlay = flat_overlay_axes[occ_idx]
+            first_past = dynamic_past_grids[occ_idx][0]
+            first_future = dynamic_future_grids[occ_idx][0]
+            cells_y, cells_x = first_past.shape
+            origin = occupancy_origins[occ_idx]
+            extent = (
+                float(origin[0]),
+                float(origin[0] + cells_x * res_x),
+                float(origin[1]),
+                float(origin[1] + cells_y * res_y),
+            )
+            first_overlay = np.stack(
+                [
+                    first_past,
+                    first_future,
+                    np.zeros_like(first_past),
+                ],
+                axis=-1,
+            )
+            im_overlay = ax_overlay.imshow(
+                np.clip(first_overlay, 0.0, 1.0),
+                origin="lower",
+                vmin=0,
+                vmax=1,
+                extent=extent,
+                interpolation="nearest",
+            )
+            ax_overlay.set_title(f"Past/Future #{occ_idx}")
+            ax_overlay.set_xlabel("X")
+            ax_overlay.set_ylabel("Y")
+            ax_overlay.set_aspect("equal", adjustable="box")
+            time_text = ax_overlay.text(0.02, 0.98, "", transform=ax_overlay.transAxes, va="top")
+            overlay_images.append(im_overlay)
+            overlay_time_texts.append(time_text)
+
+        for ax_overlay in flat_overlay_axes[num_occ_maps:]:
+            ax_overlay.axis("off")
+    else:
+        fig_overlay = None
+
     def update(frame: int):
         sim_step = int(frame)
         # Occupancy grids are sampled only at anchor steps; keep the latest
@@ -587,6 +651,21 @@ def animate_rollout(
                 f"sim t={sim_step * time_step:.2f}s\\nocc@t={anchor_step * time_step:.2f}s"
             )
             artists.extend([im_static, time_text_static])
+        if has_future_overlay:
+            for occ_idx, (im_overlay, time_text_overlay) in enumerate(zip(overlay_images, overlay_time_texts)):
+                overlay_rgb = np.stack(
+                    [
+                        dynamic_past_grids[occ_idx][anchor_idx],
+                        dynamic_future_grids[occ_idx][anchor_idx],
+                        np.zeros_like(dynamic_past_grids[occ_idx][anchor_idx]),
+                    ],
+                    axis=-1,
+                )
+                im_overlay.set_data(np.clip(overlay_rgb, 0.0, 1.0))
+                time_text_overlay.set_text(
+                    f"sim t={sim_step * time_step:.2f}s\\nocc@t={anchor_step * time_step:.2f}s"
+                )
+                artists.extend([im_overlay, time_text_overlay])
         return tuple(artists)
 
     anim_traj = FuncAnimation(
@@ -617,11 +696,21 @@ def animate_rollout(
         interval=time_step * 1000,
         blit=False,
     )
+    if fig_overlay is not None:
+        anim_overlay = FuncAnimation(
+            fig_overlay,
+            update,
+            frames=num_steps,
+            interval=time_step * 1000,
+            blit=False,
+        )
+    else:
+        anim_overlay = None
 
     plt.tight_layout()
     plt.show()
 
-    _ = (anim_traj, anim_occ, anim_dyn, anim_static)
+    _ = (anim_traj, anim_occ, anim_dyn, anim_static, anim_overlay)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -839,6 +928,39 @@ def _prepare_animation_grids(
         for occ_idx in range(len(dynamic_grids_np))
     ]
     return static_maps_np, dynamic_grids_np, occupancy_grids_np
+
+
+def _prepare_past_future_dynamic_grids(
+    dynamic_windows: List[List[List[torch.Tensor]]],
+    frame_offsets: List[int],
+) -> Tuple[List[List[np.ndarray]], List[List[np.ndarray]]]:
+    past_grids: List[List[np.ndarray]] = []
+    future_grids: List[List[np.ndarray]] = []
+
+    for agent_windows in dynamic_windows:
+        agent_past: List[np.ndarray] = []
+        agent_future: List[np.ndarray] = []
+        for anchor_frames in agent_windows:
+            if not anchor_frames:
+                continue
+            if len(anchor_frames) != len(frame_offsets):
+                raise ValueError("anchor frame count must match frame_offsets length")
+
+            frame_tensors = [torch.as_tensor(frame, dtype=torch.float32) for frame in anchor_frames]
+            zero_grid = torch.zeros_like(frame_tensors[0])
+            past_frames = [frame_tensors[idx] for idx, dt in enumerate(frame_offsets) if dt < 0]
+            future_frames = [frame_tensors[idx] for idx, dt in enumerate(frame_offsets) if dt >= 0]
+
+            past_stack = torch.stack(past_frames, dim=0).amax(dim=0) if past_frames else zero_grid
+            future_stack = torch.stack(future_frames, dim=0).amax(dim=0) if future_frames else zero_grid
+
+            agent_past.append(past_stack.detach().cpu().numpy())
+            agent_future.append(future_stack.detach().cpu().numpy())
+
+        past_grids.append(agent_past)
+        future_grids.append(agent_future)
+
+    return past_grids, future_grids
 
 
 def _print_scene_occupancy_summary(
@@ -1106,6 +1228,10 @@ def main() -> None:
                     static_maps,
                     dynamic_grids,
                 )
+                dynamic_past_grids_np, dynamic_future_grids_np = _prepare_past_future_dynamic_grids(
+                    dynamic_windows,
+                    frame_offsets,
+                )
 
                 animate_rollout(
                     traj=traj,
@@ -1115,6 +1241,8 @@ def main() -> None:
                     occupancy_grids=occupancy_grids_np,
                     static_maps=static_maps_np,
                     dynamic_grids=dynamic_grids_np,
+                    dynamic_past_grids=dynamic_past_grids_np,
+                    dynamic_future_grids=dynamic_future_grids_np,
                     occupancy_origins=occupancy_origin,
                     occupancy_resolution=occupancy_resolution,
                     anchor_steps=anchor_steps,

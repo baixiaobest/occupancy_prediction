@@ -48,7 +48,7 @@ def load_scene_origins(
 
     Returns:
         scene_dynamic_sequences: list[scene] of list[origin] tensors `(T, H, W)`
-        scene_static_maps: list[scene] of list[origin] tensors `(H, W)`
+        scene_static_maps: list[scene] of list[origin] tensors `(T, H, W)`
         scene_velocity_sequences: list[scene] of list[origin] tensors `(T, 2)`
     """
     payload = torch.load(pt_path, map_location="cpu")
@@ -77,7 +77,8 @@ def load_scene_origins(
                 if not dyn_frames:
                     continue
                 dynamic_sequences.append(torch.stack(dyn_frames, dim=0))
-                static_maps.append(_to_2d(static_map))
+                static_2d = _to_2d(static_map)
+                static_maps.append(static_2d.unsqueeze(0).repeat(len(dyn_frames), 1, 1))
                 velocity_sequences.append(torch.zeros((len(dyn_frames), 2), dtype=torch.float32))
             return dynamic_sequences, static_maps, velocity_sequences
 
@@ -88,11 +89,16 @@ def load_scene_origins(
                     continue
                 full_seq = torch.stack(frames, dim=0)
                 dynamic_sequences.append(full_seq)
-                static_maps.append(torch.zeros_like(full_seq[0]))
+                static_maps.append(torch.zeros_like(full_seq))
                 velocity_sequences.append(torch.zeros((full_seq.shape[0], 2), dtype=torch.float32))
             return dynamic_sequences, static_maps, velocity_sequences
 
         if hasattr(obj, "agents"):
+            zero_offset_idx = 0
+            if hasattr(obj, "frame_offsets"):
+                offsets = [int(v) for v in getattr(obj, "frame_offsets")]
+                if 0 in offsets:
+                    zero_offset_idx = offsets.index(0)
             for agent_idx in sorted(obj.agents.keys()):
                 agent_data = obj.agents[agent_idx]
                 anchor_grids: list[torch.Tensor] = []
@@ -102,8 +108,10 @@ def load_scene_origins(
                     anchor_data = agent_data.anchors[anchor_time]
                     if not anchor_data.frames:
                         continue
-                    frame_stack = torch.stack([_to_2d(frame) for frame in anchor_data.frames], dim=0)
-                    anchor_grids.append(frame_stack.amax(dim=0))
+                    frame_list = [_to_2d(frame) for frame in anchor_data.frames]
+                    current_idx = min(max(zero_offset_idx, 0), len(frame_list) - 1)
+                    # Use the current-timestep frame so temporal overlays remain causal.
+                    anchor_grids.append(frame_list[current_idx])
                     anchor_static.append(_to_2d(anchor_data.static_map))
                     vel = torch.as_tensor(anchor_data.current_velocity, dtype=torch.float32).view(-1)
                     if vel.numel() != 2:
@@ -114,7 +122,7 @@ def load_scene_origins(
                     continue
 
                 dynamic_sequences.append(torch.stack(anchor_grids, dim=0))
-                static_maps.append(torch.stack(anchor_static, dim=0).amax(dim=0))
+                static_maps.append(torch.stack(anchor_static, dim=0))
                 velocity_sequences.append(torch.stack(anchor_vel, dim=0))
 
             return dynamic_sequences, static_maps, velocity_sequences
@@ -168,7 +176,7 @@ def load_scene_origins(
                     continue
                 full_seq = torch.stack(frames, dim=0)
                 dynamic_sequences.append(full_seq)
-                static_maps.append(torch.zeros_like(full_seq[0]))
+                static_maps.append(torch.zeros_like(full_seq))
                 velocity_sequences.append(torch.zeros((full_seq.shape[0], 2), dtype=torch.float32))
             if dynamic_sequences:
                 scene_dynamic_sequences.append(dynamic_sequences)
@@ -276,7 +284,7 @@ def build_models(
 
 def autoregressive_predict(
     dynamic_sequence: torch.Tensor,
-    static_map: torch.Tensor,
+    static_sequence: torch.Tensor,
     velocity_sequence: torch.Tensor,
     decoder: VAEPredictionDecoder,
     history_len: int,
@@ -295,6 +303,10 @@ def autoregressive_predict(
     the number of selected modalities.
     """
     t_total, h, w = dynamic_sequence.shape
+    if static_sequence.ndim != 3:
+        raise ValueError("static_sequence must have shape (T, H, W)")
+    if static_sequence.shape != dynamic_sequence.shape:
+        raise ValueError("static_sequence shape must match dynamic_sequence shape")
     if t_total <= history_len:
         return torch.zeros((num_modalities, 0, horizon, h, w), dtype=torch.float32)
 
@@ -308,7 +320,7 @@ def autoregressive_predict(
                 pred_frames: list[torch.Tensor] = []
                 for _ in range(horizon):
                     x_decoder_dynamic = context[-decoder_context_len:].unsqueeze(0).unsqueeze(0).to(device)
-                    x_static = static_map.unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
+                    x_static = static_sequence[anchor_t].unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
                     current_velocity = velocity_sequence[anchor_t].unsqueeze(0).to(device)
                     logits = decoder(z, x_decoder_dynamic, x_static, current_velocity)
                     prob = torch.sigmoid(logits)[0, 0, 0].detach().cpu()
@@ -379,11 +391,11 @@ def main() -> None:
                 f"horizon={horizon}, modalities={num_modalities} ..."
             )
             seq = scene_sequences[scene_idx][origin_idx]
-            static_map = scene_static_maps[scene_idx][origin_idx]
+            static_sequence = scene_static_maps[scene_idx][origin_idx]
             velocity_seq = scene_velocity_sequences[scene_idx][origin_idx]
             cache[key] = autoregressive_predict(
                 dynamic_sequence=seq,
-                static_map=static_map,
+                static_sequence=static_sequence,
                 velocity_sequence=velocity_seq,
                 decoder=decoder,
                 history_len=history_len,
