@@ -89,7 +89,8 @@ def run_epoch(
     Args:
         encoder: VAE encoder instance.
         decoder: VAE decoder instance.
-        loader: DataLoader yielding `(x, y)` pairs.
+        loader: DataLoader yielding
+            `(x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y)`.
         optimizer: Optimizer to use for training, or `None` for evaluation.
         device: Device to run tensors on.
         recon_loss_type: Reconstruction loss type: `bce` or `focal`.
@@ -465,7 +466,9 @@ def main() -> None:
     _log_message(
         "Dataset summary: "
         f"files={stats.num_scene_files}, "
-        f"train_origins={stats.num_train_origins}, val_origins={stats.num_val_origins}, "
+        f"train_agent_sequences={stats.num_train_agent_sequences}, "
+        f"val_agent_sequences={stats.num_val_agent_sequences}, "
+        f"train_anchors={stats.num_train_anchors}, val_anchors={stats.num_val_anchors}, "
         f"train_samples={stats.num_train_samples}, val_samples={stats.num_val_samples}",
     )
 

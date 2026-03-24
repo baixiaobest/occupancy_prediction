@@ -14,8 +14,10 @@ from src.rollout_data import RollOutData
 @dataclass
 class DatasetStats:
     num_scene_files: int
-    num_train_origins: int
-    num_val_origins: int
+    num_train_agent_sequences: int
+    num_val_agent_sequences: int
+    num_train_anchors: int
+    num_val_anchors: int
     num_train_samples: int
     num_val_samples: int
 
@@ -49,15 +51,17 @@ class OccupancyWindowDataset(Dataset):
         self.sequences = list(sequences)
         self.samples: list[tuple[int, int]] = []
 
-        for seq_idx, (seq, static_map, velocity_seq) in enumerate(self.sequences):
+        for seq_idx, (seq, static_seq, velocity_seq) in enumerate(self.sequences):
             if seq.ndim != 3:
                 raise ValueError("Each sequence must have shape (T, H, W)")
-            if static_map.ndim != 2:
-                raise ValueError("Each static map must have shape (H, W)")
-            if static_map.shape != seq.shape[-2:]:
-                raise ValueError("Static map shape must match sequence spatial shape")
+            if static_seq.ndim != 3:
+                raise ValueError("Each static sequence must have shape (T, H, W)")
+            if static_seq.shape[-2:] != seq.shape[-2:]:
+                raise ValueError("Static sequence spatial shape must match dynamic sequence")
             if velocity_seq.ndim != 2 or velocity_seq.shape[1] != 2:
                 raise ValueError("Each velocity sequence must have shape (T, 2)")
+            if static_seq.shape[0] != seq.shape[0]:
+                raise ValueError("Static sequence length must match dynamic sequence length")
             if velocity_seq.shape[0] != seq.shape[0]:
                 raise ValueError("Velocity sequence length must match dynamic sequence length")
             t = seq.shape[0]
@@ -71,21 +75,23 @@ class OccupancyWindowDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         seq_idx, start = self.samples[index]
-        seq, static_map, velocity_seq = self.sequences[seq_idx]
+        seq, static_seq, velocity_seq = self.sequences[seq_idx]
 
         past = seq[start : start + self.history_len]
         future = seq[start + self.history_len : start + self.window_size]
         # Anchor velocity corresponds to first prediction timestep.
-        current_velocity = velocity_seq[start + self.history_len]
+        anchor_index = start + self.history_len
+        current_velocity = velocity_seq[anchor_index]
+        current_static = static_seq[anchor_index]
 
         x_encoder_dynamic = torch.cat([past, future], dim=0).unsqueeze(0)
         x_decoder_dynamic = past[-self.decoder_context_len :].unsqueeze(0)
-        x_static = static_map.unsqueeze(0)
+        x_static = current_static.unsqueeze(0)
         y = future.unsqueeze(0)
         return x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y
 
 
-def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+def _load_agent_sequences_from_file(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     payload = torch.load(pt_path, map_location="cpu")
 
     def _to_2d(frame: object) -> torch.Tensor:
@@ -126,9 +132,9 @@ def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor,
                 continue
 
             dynamic_seq = torch.stack(anchor_grids, dim=0)
-            static_map = torch.stack(anchor_static_maps, dim=0).amax(dim=0)
+            static_seq = torch.stack(anchor_static_maps, dim=0)
             velocity_seq = torch.stack(anchor_velocities, dim=0)
-            out.append((dynamic_seq, static_map, velocity_seq))
+            out.append((dynamic_seq, static_seq, velocity_seq))
 
         return out
 
@@ -147,7 +153,7 @@ def _load_scene_origins(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor,
     return sequences
 
 
-def _split_origins(
+def _split_agent_sequences(
     sequences: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     val_ratio: float,
     rng: random.Random,
@@ -194,10 +200,13 @@ def build_datasets(
         raise FileNotFoundError(f"No .pt files found in {data_dir}")
 
     for pt_file in pt_files:
-        scene_sequences = _load_scene_origins(pt_file)
-        train_seq, val_seq = _split_origins(scene_sequences, val_ratio, rng)
+        scene_sequences = _load_agent_sequences_from_file(pt_file)
+        train_seq, val_seq = _split_agent_sequences(scene_sequences, val_ratio, rng)
         all_train_sequences.extend(train_seq)
         all_val_sequences.extend(val_seq)
+
+    num_train_anchors = int(sum(seq.shape[0] for seq, _, _ in all_train_sequences))
+    num_val_anchors = int(sum(seq.shape[0] for seq, _, _ in all_val_sequences))
 
     train_dataset = OccupancyWindowDataset(
         all_train_sequences,
@@ -216,8 +225,10 @@ def build_datasets(
 
     stats = DatasetStats(
         num_scene_files=len(pt_files),
-        num_train_origins=len(all_train_sequences),
-        num_val_origins=len(all_val_sequences),
+        num_train_agent_sequences=len(all_train_sequences),
+        num_val_agent_sequences=len(all_val_sequences),
+        num_train_anchors=num_train_anchors,
+        num_val_anchors=num_val_anchors,
         num_train_samples=len(train_dataset),
         num_val_samples=len(val_dataset),
     )
