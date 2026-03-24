@@ -9,7 +9,7 @@ class RollOutSetting:
     """Settings for generating rollouts from one or more scene templates.
 
     Fields:
-        templates: List of scene-template objects that implement `generate(num_levels)`.
+        templates: List of scene-template objects.
         mirror: If True, data will be mirrored (not implemented yet).
         rotate: If True, data will be rotated (not implemented yet).
         name: Optional human-readable name for this rollout setting.

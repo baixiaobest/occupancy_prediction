@@ -642,12 +642,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory to save rollout .pt files (defaults to ../data)",
     )
-    parser.add_argument(
-        "--num-levels",
-        type=int,
-        default=5,
-        help="Number of levels to generate per template (default: 5)",
-    )
+
     parser.add_argument(
         "--disable-data-aug",
         action="store_true",
@@ -904,8 +899,6 @@ def main() -> None:
     PREF_VELOCITY_NOISE_STD = 0.02
     PREF_VELOCITY_NOISE_INTERVAL = 3
     PREF_VELOCITY_NOISE_SEED = 0
-    NUM_LEVELS_PER_TEMPLATE = int(args.num_levels)
-
     # Occupancy settings
     OCC_RESOLUTION = 0.1
     OCC_AGENT_RADIUS = 0.2
@@ -931,10 +924,10 @@ def main() -> None:
             "rot180": [],
             "rot270": [],
         }
-        scenes = tpl.generate(num_levels=NUM_LEVELS_PER_TEMPLATE)
+        scenes = tpl.generate()
         print(
             f"generated {len(scenes)} scenes from {tpl.__class__.__name__} "
-            f"(name={template_name})"
+            f"(name={template_name}, num_levels={int(tpl.num_levels)})"
         )
 
         for local_idx, scene in enumerate(scenes):

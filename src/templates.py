@@ -12,7 +12,7 @@ from src.scene_template import (
 
 
 def default_templates() -> List[SceneTemplate]:
-    """Return a list of premade scene-template instances used for rollouts.
+    """Return premade scene templates used for rollouts.
 
     These mirror the templates previously embedded in the rollout script.
     """
@@ -24,6 +24,7 @@ def default_templates() -> List[SceneTemplate]:
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
         num_region_pairs=2,
+        num_levels=15,
     )
     l_template = LShapeCorridorTemplate(
         width_range=(3.0, 10.0),
@@ -35,6 +36,7 @@ def default_templates() -> List[SceneTemplate]:
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
         num_region_pairs=2,
+        num_levels=10,
     )
     t_template = TShapeCorridorTemplate(
         width_range=(3.0, 10.0),
@@ -47,6 +49,7 @@ def default_templates() -> List[SceneTemplate]:
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
         num_enabled_start_regions=3,
+        num_levels=5,
     )
     cross_template = CrossShapeCorridorTemplate(
         width_range=(3.0, 10.0),
@@ -59,6 +62,7 @@ def default_templates() -> List[SceneTemplate]:
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
         num_enabled_start_regions=4,
+        num_levels=5,
     )
 
     return [straight_template, l_template, t_template, cross_template]
@@ -76,6 +80,7 @@ def test_templates():
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
         num_enabled_start_regions=1,
+        num_levels=1,
     )
 
     return [t_template]

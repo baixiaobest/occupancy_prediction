@@ -12,13 +12,18 @@ from src.scene import ObstacleSpec, PathSpec, RegionPairSpec, RegionSpec, Scene
 class SceneTemplate(ABC):
     """Base class for scene templates that generate a list of scenes."""
 
+    def __init__(self, num_levels: int = 5) -> None:
+        self.num_levels = int(num_levels)
+        if self.num_levels <= 0:
+            raise ValueError("num_levels must be >= 1")
+
     @abstractmethod
     def get_name(self) -> str:
         """Return a stable template name for logging and file naming."""
 
     @abstractmethod
-    def generate(self, num_levels: int) -> List[Scene]:
-        """Generate a list of scenes for the requested number of levels."""
+    def generate(self) -> List[Scene]:
+        """Generate a list of scenes using template-specific `self.num_levels`."""
 
     @staticmethod
     def _linear_levels(value_range: Tuple[float, float], num_levels: int) -> List[float]:
@@ -167,6 +172,7 @@ class StraightCorridorTemplate(SceneTemplate):
         self,
         width_range: Tuple[float, float],
         length_range: Tuple[float, float],
+        num_levels: int = 5,
         spawn_density_range: Tuple[float, float] = (1.0, 1.0),
         spawn_velocity_range: Tuple[float, float] = (1.5, 1.5),
         num_region_pairs: int = 1,
@@ -194,6 +200,8 @@ class StraightCorridorTemplate(SceneTemplate):
         if ego_center_noise_std < 0.0:
             raise ValueError("ego_center_noise_std must be >= 0")
 
+        super().__init__(num_levels=num_levels)
+
         self.width_range = (float(width_range[0]), float(width_range[1]))
         self.length_range = (float(length_range[0]), float(length_range[1]))
         self.spawn_density_range = (
@@ -212,12 +220,13 @@ class StraightCorridorTemplate(SceneTemplate):
         self.ego_center_noise_std = float(ego_center_noise_std)
         self._ego_center_rng = np.random.default_rng(ego_center_noise_seed)
 
-    def generate(self, num_levels: int) -> List[Scene]:
-        """Generate `num_levels` straight-corridor scenes.
+    def generate(self) -> List[Scene]:
+        """Generate straight-corridor scenes using `self.num_levels`.
 
         Level i uses linearly sampled width, length, and spawn density.
         Spawn count per region pair is floor(density * spawn_area).
         """
+        num_levels = self.num_levels
         widths = self._linear_levels(self.width_range, num_levels)
         lengths = self._linear_levels(self.length_range, num_levels)
         densities = self._linear_levels(self.spawn_density_range, num_levels)
@@ -321,6 +330,7 @@ class LShapeCorridorTemplate(SceneTemplate):
         width_range: Tuple[float, float],
         horizontal_length_range: Tuple[float, float],
         vertical_length_range: Tuple[float, float],
+        num_levels: int = 5,
         spawn_density_range: Tuple[float, float] = (1.0, 1.0),
         spawn_velocity_range: Tuple[float, float] = (1.5, 1.5),
         num_region_pairs: int = 1,
@@ -354,6 +364,8 @@ class LShapeCorridorTemplate(SceneTemplate):
         if ego_center_noise_std < 0.0:
             raise ValueError("ego_center_noise_std must be >= 0")
 
+        super().__init__(num_levels=num_levels)
+
         self.width_range = (float(width_range[0]), float(width_range[1]))
         self.horizontal_length_range = (
             float(horizontal_length_range[0]),
@@ -381,12 +393,13 @@ class LShapeCorridorTemplate(SceneTemplate):
         self.ego_center_noise_std = float(ego_center_noise_std)
         self._ego_center_rng = np.random.default_rng(ego_center_noise_seed)
 
-    def generate(self, num_levels: int) -> List[Scene]:
-        """Generate `num_levels` L-shaped corridor scenes.
+    def generate(self) -> List[Scene]:
+        """Generate L-shaped corridor scenes using `self.num_levels`.
 
         Level i uses linearly sampled width, horizontal length, vertical length, and density.
         Startup agent counts are floor(density * spawn_area).
         """
+        num_levels = self.num_levels
         widths = self._linear_levels(self.width_range, num_levels)
         horizontal_lengths = self._linear_levels(self.horizontal_length_range, num_levels)
         vertical_lengths = self._linear_levels(self.vertical_length_range, num_levels)
@@ -576,6 +589,7 @@ class TShapeCorridorTemplate(SceneTemplate):
         width_range: Tuple[float, float],
         horizontal_length_range: Tuple[float, float],
         vertical_length_range: Tuple[float, float],
+        num_levels: int = 5,
         spawn_density_range: Tuple[float, float] = (1.0, 1.0),
         spawn_velocity_range: Tuple[float, float] = (1.5, 1.5),
         num_enabled_start_regions: int = 3,
@@ -609,6 +623,8 @@ class TShapeCorridorTemplate(SceneTemplate):
         if ego_center_noise_std < 0.0:
             raise ValueError("ego_center_noise_std must be >= 0")
 
+        super().__init__(num_levels=num_levels)
+
         self.width_range = (float(width_range[0]), float(width_range[1]))
         self.horizontal_length_range = (
             float(horizontal_length_range[0]),
@@ -636,8 +652,9 @@ class TShapeCorridorTemplate(SceneTemplate):
         self.ego_center_noise_std = float(ego_center_noise_std)
         self._ego_center_rng = np.random.default_rng(ego_center_noise_seed)
 
-    def generate(self, num_levels: int) -> List[Scene]:
-        """Generate `num_levels` T-shaped corridor scenes."""
+    def generate(self) -> List[Scene]:
+        """Generate T-shaped corridor scenes using `self.num_levels`."""
+        num_levels = self.num_levels
         widths = self._linear_levels(self.width_range, num_levels)
         horizontal_lengths = self._linear_levels(self.horizontal_length_range, num_levels)
         vertical_lengths = self._linear_levels(self.vertical_length_range, num_levels)
@@ -935,6 +952,7 @@ class CrossShapeCorridorTemplate(SceneTemplate):
         width_range: Tuple[float, float],
         horizontal_length_range: Tuple[float, float],
         vertical_length_range: Tuple[float, float],
+        num_levels: int = 5,
         spawn_density_range: Tuple[float, float] = (1.0, 1.0),
         spawn_velocity_range: Tuple[float, float] = (1.5, 1.5),
         num_enabled_start_regions: int = 4,
@@ -968,6 +986,8 @@ class CrossShapeCorridorTemplate(SceneTemplate):
         if ego_center_noise_std < 0.0:
             raise ValueError("ego_center_noise_std must be >= 0")
 
+        super().__init__(num_levels=num_levels)
+
         self.width_range = (float(width_range[0]), float(width_range[1]))
         self.horizontal_length_range = (
             float(horizontal_length_range[0]),
@@ -995,8 +1015,9 @@ class CrossShapeCorridorTemplate(SceneTemplate):
         self.ego_center_noise_std = float(ego_center_noise_std)
         self._ego_center_rng = np.random.default_rng(ego_center_noise_seed)
 
-    def generate(self, num_levels: int) -> List[Scene]:
-        """Generate `num_levels` cross-shaped corridor scenes."""
+    def generate(self) -> List[Scene]:
+        """Generate cross-shaped corridor scenes using `self.num_levels`."""
+        num_levels = self.num_levels
         widths = self._linear_levels(self.width_range, num_levels)
         horizontal_lengths = self._linear_levels(self.horizontal_length_range, num_levels)
         vertical_lengths = self._linear_levels(self.vertical_length_range, num_levels)
