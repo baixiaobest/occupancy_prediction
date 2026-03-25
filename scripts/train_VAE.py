@@ -265,6 +265,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--lazy-data-load",
+        action="store_true",
+        help="Enable lazy on-the-fly occupancy window slicing during dataset loading",
+    )
     parser.add_argument("--output", type=Path, default=Path("checkpoints/vae_prediction.pt"))
     parser.add_argument(
         "--save-interval",
@@ -398,6 +403,7 @@ def main() -> None:
         decoder_context_len=args.decoder_context_len,
         window_stride=args.window_stride,
         seed=args.seed,
+        lazy=args.lazy_data_load,
     )
 
     if len(train_dataset) == 0:
