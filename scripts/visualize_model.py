@@ -464,15 +464,14 @@ def main() -> None:
     ax_past, ax_pred, ax_overlay_pred, ax_overlay_gt = axes.flatten()
     plt.subplots_adjust(bottom=0.25)
 
-    zero_img = np.zeros((init_h, init_w), dtype=np.float32)
     zero_rgb = np.zeros((init_h, init_w, 3), dtype=np.float32)
     # Occupancy is cell-discrete; nearest interpolation prevents visual blurring.
-    im_past = ax_past.imshow(zero_img, cmap="Blues", vmin=0.0, vmax=1.0, interpolation="nearest")
+    im_past = ax_past.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
     im_pred = ax_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
     im_overlay_pred = ax_overlay_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
     im_overlay_gt = ax_overlay_gt.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
 
-    ax_past.set_title("Past 16 Stack")
+    ax_past.set_title("Past + Static Stack")
     ax_pred.set_title("Predicted Horizon Stack (Mode1=Red, Mode2=Green)")
     ax_overlay_pred.set_title("Overlay: Past (Blue) + Pred1 (Red) + Pred2 (Green)")
     ax_overlay_gt.set_title("Overlay: Past (Blue) + GT Future (Green)")
@@ -564,6 +563,7 @@ def main() -> None:
             return
 
         seq = scene_sequences[scene_idx][agent_idx][anchor_idx]
+        static_seq = scene_static_maps[scene_idx][agent_idx][anchor_idx]
         t_total, h_img, w_img = seq.shape
 
         preds = get_predictions(scene_idx, agent_idx, anchor_idx, horizon, num_modalities)
@@ -571,6 +571,7 @@ def main() -> None:
         t_anchor = int(history_len)
         past = seq[t_anchor - history_len : t_anchor]  # (history_len, H, W)
         past_stack = (past.max(dim=0).values > 0.0).float()
+        static_map = (static_seq[t_anchor] > 0.0).float()
 
         pred_stack_1 = torch.zeros((h_img, w_img), dtype=torch.float32)
         pred_stack_2 = torch.zeros((h_img, w_img), dtype=torch.float32)
@@ -589,20 +590,27 @@ def main() -> None:
             gt_stack = torch.zeros((h_img, w_img), dtype=torch.float32)
 
         past_np = past_stack.numpy()
+        static_np = static_map.numpy()
         pred1_np = pred_stack_1.numpy()
         pred2_np = pred_stack_2.numpy()
         gt_np = gt_stack.numpy()
+
+        # Show static occupancy as gray background and past occupancy in blue.
+        past_with_static = np.stack(
+            [0.35 * static_np, 0.35 * static_np, np.clip(0.35 * static_np + past_np, 0.0, 1.0)],
+            axis=-1,
+        )
 
         pred_viz = np.stack([pred1_np, pred2_np, np.zeros_like(pred1_np)], axis=-1)
         overlay_pred = np.stack([pred1_np, pred2_np, past_np], axis=-1)
         overlay_gt = np.stack([np.zeros_like(gt_np), gt_np, past_np], axis=-1)
 
-        im_past.set_data(past_np)
+        im_past.set_data(np.clip(past_with_static, 0.0, 1.0))
         im_pred.set_data(np.clip(pred_viz, 0.0, 1.0))
         im_overlay_pred.set_data(np.clip(overlay_pred, 0.0, 1.0))
         im_overlay_gt.set_data(np.clip(overlay_gt, 0.0, 1.0))
 
-        ax_past.set_title(f"Past Stack (anchor={anchor_idx}, hist={history_len})")
+        ax_past.set_title(f"Past+Static Stack (anchor={anchor_idx}, hist={history_len})")
         ax_pred.set_title(f"Pred Stack (h={horizon}, modes={num_modalities})")
 
         anchor_time = scene_anchor_times[scene_idx][agent_idx][anchor_idx]
