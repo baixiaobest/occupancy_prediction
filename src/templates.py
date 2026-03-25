@@ -61,7 +61,7 @@ def default_templates() -> List[SceneTemplate]:
         turn_radius_ratio=1.2,
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
-        num_enabled_start_regions=4,
+        num_enabled_start_regions=2,
         num_levels=10,
     )
 
