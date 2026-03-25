@@ -65,7 +65,7 @@ def default_templates() -> List[SceneTemplate]:
         num_levels=10,
     )
 
-    return [straight_template, l_template, t_template, cross_template]
+    return [cross_template]
 
 
 def test_templates():
