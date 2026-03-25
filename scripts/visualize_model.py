@@ -39,13 +39,24 @@ def _coerce_channel_list(raw: object) -> list[int]:
 
 def load_scene_origins(
     pt_path: Path,
-) -> tuple[list[list[torch.Tensor]], list[list[torch.Tensor]], list[list[torch.Tensor]]]:
+    history_len: int,
+    future_len: int,
+) -> tuple[
+    list[list[torch.Tensor]],
+    list[list[torch.Tensor]],
+    list[list[torch.Tensor]],
+    list[list[list[int]]],
+]:
     """Load dynamic time-series and static maps grouped by scene and origin.
 
     Returns:
-        scene_dynamic_sequences: list[scene] of list[origin] tensors `(T, H, W)`
-        scene_static_maps: list[scene] of list[origin] tensors `(T, H, W)`
-        scene_velocity_sequences: list[scene] of list[origin] tensors `(T, 2)`
+        scene_dynamic_sequences: list[scene] of list[agent] tensors `(A, T, H, W)`
+        scene_static_maps: list[scene] of list[agent] tensors `(A, T, H, W)`
+        scene_velocity_sequences: list[scene] of list[agent] tensors `(A, T, 2)`
+        scene_anchor_times: list[scene] of list[agent] anchor-time lists length `A`
+
+    For one selected agent, the time slider indexes anchor slots (A). Each slot
+    uses a fixed anchor center to slice a local window, so it is not a moving frame.
     """
     try:
         payload = torch.load(pt_path, map_location="cpu")
@@ -66,6 +77,7 @@ def load_scene_origins(
     scene_dynamic_sequences: list[list[torch.Tensor]] = []
     scene_static_maps: list[list[torch.Tensor]] = []
     scene_velocity_sequences: list[list[torch.Tensor]] = []
+    scene_anchor_times: list[list[list[int]]] = []
 
     def _slice_centered_patch(
         grid: torch.Tensor,
@@ -98,7 +110,9 @@ def load_scene_origins(
         out[dst_y0:dst_y1, dst_x0:dst_x1] = grid[src_y0:src_y1, src_x0:src_x1]
         return (out > 0).float()
 
-    def _collect_from_scene_obj(scene: SceneRollOutData) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    def _collect_from_scene_obj(
+        scene: SceneRollOutData,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[list[int]]]:
         if scene.scene_static_map is None or scene.scene_map_origin is None or scene.local_map_shape is None:
             raise ValueError("Compact RollOutData fields are required")
         if scene.scene_dynamic_maps is None:
@@ -107,6 +121,7 @@ def load_scene_origins(
         dynamic_sequences: list[torch.Tensor] = []
         static_maps: list[torch.Tensor] = []
         velocity_sequences: list[torch.Tensor] = []
+        anchor_times_per_agent: list[list[int]] = []
 
         scene_static = _to_2d(scene.scene_static_map)
         scene_origin = (float(scene.scene_map_origin[0]), float(scene.scene_map_origin[1]))
@@ -115,6 +130,9 @@ def load_scene_origins(
         dynamic_maps = torch.as_tensor(scene.scene_dynamic_maps, dtype=torch.float32)
         if dynamic_maps.ndim != 4:
             raise ValueError("scene_dynamic_maps must have shape (num_agents, total_time, H, W)")
+        window_size = int(history_len + future_len)
+        if window_size <= 0:
+            raise ValueError("history_len + future_len must be > 0")
 
         for agent_idx in sorted(scene.agents.keys()):
             agent_data = scene.agents[agent_idx]
@@ -135,50 +153,74 @@ def load_scene_origins(
             if len(anchor_times) != centers.shape[0]:
                 raise ValueError("anchor_times must match anchor_centers length")
 
-            dyn_local: list[torch.Tensor] = []
-            sta_local: list[torch.Tensor] = []
-            vel_local: list[torch.Tensor] = []
             agent_dynamic = dynamic_maps[agent_idx]
             total_time = int(agent_dynamic.shape[0])
 
-            for anchor_idx, anchor_t in enumerate(anchor_times):
-                if anchor_t < 0 or anchor_t >= total_time:
-                    continue
-                center_xy = centers[anchor_idx]
-                dyn_local.append(
-                    _slice_centered_patch(
-                        _to_2d(agent_dynamic[anchor_t]),
-                        center_xy,
-                        scene_origin,
-                        resolution_xy,
-                        patch_shape,
-                    )
-                )
-                sta_local.append(
-                    _slice_centered_patch(scene_static, center_xy, scene_origin, resolution_xy, patch_shape)
-                )
-                vel_local.append(velocities[anchor_idx].to(dtype=torch.float32))
+            agent_dynamic_windows: list[torch.Tensor] = []
+            agent_static_windows: list[torch.Tensor] = []
+            agent_velocity_windows: list[torch.Tensor] = []
+            agent_anchor_times: list[int] = []
 
-            if not dyn_local:
+            for anchor_idx, anchor_t in enumerate(anchor_times):
+                start_t = int(anchor_t - history_len)
+                end_t = int(anchor_t + future_len)
+                if start_t < 0 or end_t > total_time:
+                    continue
+
+                center_xy = centers[anchor_idx]
+
+                dynamic_window: list[torch.Tensor] = []
+                for absolute_t in range(start_t, end_t):
+                    dynamic_window.append(
+                        _slice_centered_patch(
+                            _to_2d(agent_dynamic[absolute_t]),
+                            center_xy,
+                            scene_origin,
+                            resolution_xy,
+                            patch_shape,
+                        )
+                    )
+
+                if len(dynamic_window) != window_size:
+                    continue
+
+                static_local = _slice_centered_patch(
+                    scene_static,
+                    center_xy,
+                    scene_origin,
+                    resolution_xy,
+                    patch_shape,
+                )
+                static_sequence = torch.stack([static_local.clone() for _ in range(window_size)], dim=0)
+                velocity_sequence = velocities[anchor_idx].to(dtype=torch.float32).unsqueeze(0).repeat(window_size, 1)
+
+                agent_dynamic_windows.append(torch.stack(dynamic_window, dim=0))
+                agent_static_windows.append(static_sequence)
+                agent_velocity_windows.append(velocity_sequence)
+                agent_anchor_times.append(int(anchor_t))
+
+            if not agent_dynamic_windows:
                 continue
 
-            dynamic_sequences.append(torch.stack(dyn_local, dim=0))
-            static_maps.append(torch.stack(sta_local, dim=0))
-            velocity_sequences.append(torch.stack(vel_local, dim=0))
+            dynamic_sequences.append(torch.stack(agent_dynamic_windows, dim=0))
+            static_maps.append(torch.stack(agent_static_windows, dim=0))
+            velocity_sequences.append(torch.stack(agent_velocity_windows, dim=0))
+            anchor_times_per_agent.append(agent_anchor_times)
 
-        return dynamic_sequences, static_maps, velocity_sequences
+        return dynamic_sequences, static_maps, velocity_sequences, anchor_times_per_agent
 
     if isinstance(payload, RollOutData):
         for scene in payload.scenes:
-            dyn, sta, vel = _collect_from_scene_obj(scene)
+            dyn, sta, vel, anchor_times = _collect_from_scene_obj(scene)
             if dyn:
                 scene_dynamic_sequences.append(dyn)
                 scene_static_maps.append(sta)
                 scene_velocity_sequences.append(vel)
+                scene_anchor_times.append(anchor_times)
     else:
         raise ValueError(f"Unsupported payload format in {pt_path}: expected RollOutData")
 
-    return scene_dynamic_sequences, scene_static_maps, scene_velocity_sequences
+    return scene_dynamic_sequences, scene_static_maps, scene_velocity_sequences, scene_anchor_times
 
 
 def build_models(
@@ -330,7 +372,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-file", type=Path, required=True, help="Path to rollout .pt file")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to model checkpoint .pt")
     parser.add_argument("--scene-index", type=int, default=0, help="Initial scene index")
-    parser.add_argument("--origin-index", type=int, default=0, help="Initial origin index within selected scene")
+    parser.add_argument("--agent-index", type=int, default=0, help="Initial agent index within selected scene")
     parser.add_argument("--horizon", type=int, default=4, help="Initial autoregressive horizon")
     parser.add_argument("--max-horizon", type=int, default=16, help="Max horizon in GUI slider")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -344,42 +386,57 @@ def main() -> None:
 
     device = torch.device(args.device)
 
-    scene_sequences, scene_static_maps, scene_velocity_sequences = load_scene_origins(args.data_file)
-    if not scene_sequences:
-        raise ValueError(f"No scene sequences found in {args.data_file}")
-
-    for scene_idx, origins in enumerate(scene_sequences):
-        if not origins:
-            raise ValueError(f"Scene {scene_idx} has no origins")
-        for origin_idx, seq in enumerate(origins):
-            if seq.ndim != 3:
-                raise ValueError(
-                    f"Scene {scene_idx}, origin {origin_idx} has invalid shape {tuple(seq.shape)}; expected (T,H,W)"
-                )
-
-    init_scene = clamp_int(args.scene_index, 0, len(scene_sequences) - 1)
-    init_origin = clamp_int(args.origin_index, 0, len(scene_sequences[init_scene]) - 1)
-    init_seq = scene_sequences[init_scene][init_origin]
-    _, init_h, init_w = init_seq.shape
-
     decoder, history_len, decoder_context_len, latent_shape, latent_channels = build_models(
         checkpoint_path=args.checkpoint,
         device=device,
     )
 
-    # Cache by (scene_index, origin_index, horizon, num_modalities) to avoid recompute when only t changes.
-    cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
+    (
+        scene_sequences,
+        scene_static_maps,
+        scene_velocity_sequences,
+        scene_anchor_times,
+    ) = load_scene_origins(
+        args.data_file,
+        history_len=history_len,
+        future_len=max(1, int(args.max_horizon)),
+    )
+    if not scene_sequences:
+        raise ValueError(f"No scene sequences found in {args.data_file}")
 
-    def get_predictions(scene_idx: int, origin_idx: int, horizon: int, num_modalities: int) -> torch.Tensor:
-        key = (scene_idx, origin_idx, horizon, num_modalities)
+    for scene_idx, agents in enumerate(scene_sequences):
+        if not agents:
+            raise ValueError(f"Scene {scene_idx} has no agents")
+        for agent_idx, seq in enumerate(agents):
+            if seq.ndim != 4:
+                raise ValueError(
+                    f"Scene {scene_idx}, agent {agent_idx} has invalid shape {tuple(seq.shape)}; expected (A,T,H,W)"
+                )
+
+    init_scene = clamp_int(args.scene_index, 0, len(scene_sequences) - 1)
+    init_agent = clamp_int(args.agent_index, 0, len(scene_sequences[init_scene]) - 1)
+    init_seq = scene_sequences[init_scene][init_agent][0]
+    _, init_h, init_w = init_seq.shape
+
+    # Cache by (scene_index, agent_index, anchor_index, horizon, num_modalities).
+    cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
+
+    def get_predictions(
+        scene_idx: int,
+        agent_idx: int,
+        anchor_idx: int,
+        horizon: int,
+        num_modalities: int,
+    ) -> torch.Tensor:
+        key = (scene_idx, agent_idx, anchor_idx, horizon, num_modalities)
         if key not in cache:
             print(
-                f"Running inference for scene={scene_idx}, origin={origin_idx}, "
+                f"Running inference for scene={scene_idx}, agent={agent_idx}, anchor={anchor_idx}, "
                 f"horizon={horizon}, modalities={num_modalities} ..."
             )
-            seq = scene_sequences[scene_idx][origin_idx]
-            static_sequence = scene_static_maps[scene_idx][origin_idx]
-            velocity_seq = scene_velocity_sequences[scene_idx][origin_idx]
+            seq = scene_sequences[scene_idx][agent_idx][anchor_idx]
+            static_sequence = scene_static_maps[scene_idx][agent_idx][anchor_idx]
+            velocity_seq = scene_velocity_sequences[scene_idx][agent_idx][anchor_idx]
             cache[key] = autoregressive_predict(
                 dynamic_sequence=seq,
                 static_sequence=static_sequence,
@@ -395,7 +452,7 @@ def main() -> None:
                 binary_feedback=args.binary_feedback,
                 threshold=args.threshold,
             )
-            t_total = seq.shape[0]
+            t_total = int(seq.shape[0])
             print(
                 "Done. Total inferences: "
                 f"{(max(t_total - history_len, 0)) * horizon * num_modalities}"
@@ -441,17 +498,17 @@ def main() -> None:
     ax_scene.set_title("Scene", fontsize=9)
     scene_state = {"index": init_scene}
 
-    origin_slider = Slider(
+    agent_slider = Slider(
         ax_origin,
-        "Origin",
+        "Agent ID",
         0,
         max(0, len(scene_sequences[init_scene]) - 1),
-        valinit=init_origin,
+        valinit=init_agent,
         valstep=1,
     )
 
-    max_t_global = max(seq.shape[0] - 1 for origins in scene_sequences for seq in origins)
-    t_slider = Slider(ax_t, "t", history_len, max_t_global, valinit=history_len, valstep=1)
+    init_anchor_max = max(0, int(scene_sequences[init_scene][init_agent].shape[0]) - 1)
+    t_slider = Slider(ax_t, "Anchor", 0, init_anchor_max, valinit=0, valstep=1)
 
     h_slider = Slider(
         ax_h,
@@ -480,47 +537,52 @@ def main() -> None:
 
     def refresh(_: float | None = None) -> None:
         scene_idx = int(scene_state["index"])
-        origin_max = max(0, len(scene_sequences[scene_idx]) - 1)
-        if origin_slider.valmax != origin_max:
-            origin_slider.valmax = origin_max
-            origin_slider.ax.set_xlim(origin_slider.valmin, origin_max)
+        agent_max = max(0, len(scene_sequences[scene_idx]) - 1)
+        if agent_slider.valmax != agent_max:
+            agent_slider.valmax = agent_max
+            agent_slider.ax.set_xlim(agent_slider.valmin, agent_max)
 
-        origin_req = int(origin_slider.val)
-        origin_idx = clamp_int(origin_req, 0, origin_max)
-        if origin_idx != origin_req:
-            origin_slider.set_val(origin_idx)
+        agent_req = int(agent_slider.val)
+        agent_idx = clamp_int(agent_req, 0, agent_max)
+        if agent_idx != agent_req:
+            agent_slider.set_val(agent_idx)
             return
 
         horizon = int(h_slider.val)
         num_modalities = int(mode_state["count"])
 
-        seq = scene_sequences[scene_idx][origin_idx]
-        t_total, h_img, w_img = seq.shape
-        t_min = history_len
-        t_max = max(t_min, t_total - 1)
-        t_req = int(t_slider.val)
-        t = clamp_int(t_req, t_min, t_max)
+        agent_anchor_count = int(scene_sequences[scene_idx][agent_idx].shape[0])
+        anchor_max = max(0, agent_anchor_count - 1)
+        if t_slider.valmax != anchor_max:
+            t_slider.valmax = anchor_max
+            t_slider.ax.set_xlim(t_slider.valmin, anchor_max)
 
-        if t != t_req:
-            t_slider.set_val(t)
+        anchor_req = int(t_slider.val)
+        anchor_idx = clamp_int(anchor_req, 0, anchor_max)
+        if anchor_idx != anchor_req:
+            t_slider.set_val(anchor_idx)
             return
 
-        preds = get_predictions(scene_idx, origin_idx, horizon, num_modalities)
+        seq = scene_sequences[scene_idx][agent_idx][anchor_idx]
+        t_total, h_img, w_img = seq.shape
 
-        past = seq[t - history_len : t]  # (history_len, H, W)
+        preds = get_predictions(scene_idx, agent_idx, anchor_idx, horizon, num_modalities)
+
+        t_anchor = int(history_len)
+        past = seq[t_anchor - history_len : t_anchor]  # (history_len, H, W)
         past_stack = (past.max(dim=0).values > 0.0).float()
 
         pred_stack_1 = torch.zeros((h_img, w_img), dtype=torch.float32)
         pred_stack_2 = torch.zeros((h_img, w_img), dtype=torch.float32)
         if preds.shape[1] > 0:
-            pred_index = t - history_len
+            pred_index = 0
             pred_seq_1 = preds[0, pred_index]  # (horizon, H, W)
             pred_stack_1 = pred_seq_1.max(dim=0).values
             if num_modalities > 1 and preds.shape[0] > 1:
                 pred_seq_2 = preds[1, pred_index]
                 pred_stack_2 = pred_seq_2.max(dim=0).values
 
-        gt_future = seq[t : min(t + horizon, t_total)]
+        gt_future = seq[t_anchor : min(t_anchor + horizon, t_total)]
         if gt_future.shape[0] > 0:
             gt_stack = (gt_future.max(dim=0).values > 0.0).float()
         else:
@@ -540,12 +602,15 @@ def main() -> None:
         im_overlay_pred.set_data(np.clip(overlay_pred, 0.0, 1.0))
         im_overlay_gt.set_data(np.clip(overlay_gt, 0.0, 1.0))
 
-        ax_past.set_title(f"Past Stack (t-{history_len}..t-1), t={t}")
+        ax_past.set_title(f"Past Stack (anchor={anchor_idx}, hist={history_len})")
         ax_pred.set_title(f"Pred Stack (h={horizon}, modes={num_modalities})")
+
+        anchor_time = scene_anchor_times[scene_idx][agent_idx][anchor_idx]
 
         total_infer = max(t_total - history_len, 0) * horizon * num_modalities
         info_text.set_text(
-            f"scene={scene_idx} | origin={origin_idx} | T={t_total} | t={t} | horizon={horizon} | "
+            f"scene={scene_idx} | agent={agent_idx} | anchor_idx={anchor_idx} | anchor_t={anchor_time} | "
+            f"window_T={t_total} | horizon={horizon} | "
             f"modes={num_modalities} | total inferences={total_infer}"
         )
 
@@ -553,7 +618,7 @@ def main() -> None:
 
     mode_radio.on_clicked(_on_mode_select)
     scene_radio.on_clicked(_on_scene_select)
-    origin_slider.on_changed(refresh)
+    agent_slider.on_changed(refresh)
     t_slider.on_changed(refresh)
     h_slider.on_changed(refresh)
 
