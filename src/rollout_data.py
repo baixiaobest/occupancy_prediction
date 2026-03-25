@@ -20,11 +20,14 @@ class AgentRollOutData:
 class SceneRollOutData:
     """Stored rollout payload for one scene.
 
-    Compact hierarchy:
-    - scene_static_map: one static map for the full scene canvas.
-    - scene_dynamic_maps[agent_index]: one dynamic map (H, W) per centered agent.
-    - agents[agent_index] contains anchor_times + anchor_centers + current_velocities.
-    - local_map_shape gives the map size (H, W) that should be sliced per anchor.
+        Compact hierarchy:
+        - scene_static_map: one static map for the full scene canvas.
+        - scene_dynamic_maps: global dynamic occupancy with shape
+            (num_agents, total_time, H, W).
+            `scene_dynamic_maps[i, t]` is the global occupancy map at absolute
+            timestep `t` with centered agent `i` removed.
+        - agents[agent_index] contains anchor_times + anchor_centers + current_velocities.
+        - local_map_shape gives the local crop size (H, W) used by dataset loading.
     """
 
     dt: float
@@ -33,7 +36,7 @@ class SceneRollOutData:
     frame_offsets: List[int]
     agents: Dict[int, AgentRollOutData] = field(default_factory=dict)
     scene_static_map: torch.Tensor | None = None
-    scene_dynamic_maps: Dict[int, torch.Tensor] = field(default_factory=dict)
+    scene_dynamic_maps: torch.Tensor | None = None
     scene_map_origin: Tuple[float, float] | None = None
     local_map_shape: Tuple[int, int] | None = None
 

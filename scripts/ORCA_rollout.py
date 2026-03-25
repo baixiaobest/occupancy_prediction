@@ -21,6 +21,136 @@ from src.templates import default_templates, test_templates
 
 # RollOutSetting is defined in src.rollout_setting
 
+
+def _compute_scene_canvas(
+    traj: np.ndarray,
+    obstacles: List[ObstacleSpec],
+    resolution: float,
+    occupancy_length: float,
+    occupancy_width: float,
+) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[int, int], np.ndarray]:
+    """Compute global scene canvas origin/size/grid shape/center.
+
+    The canvas is expanded by half of the local crop size so any anchor-centered
+    local crop can be safely sliced from the stored global maps.
+    """
+    obs_min_x = np.inf
+    obs_max_x = -np.inf
+    obs_min_y = np.inf
+    obs_max_y = -np.inf
+    for obstacle in obstacles:
+        if not obstacle.vertices:
+            continue
+        verts = np.asarray(obstacle.vertices, dtype=np.float32)
+        obs_min_x = min(obs_min_x, float(np.min(verts[:, 0])))
+        obs_max_x = max(obs_max_x, float(np.max(verts[:, 0])))
+        obs_min_y = min(obs_min_y, float(np.min(verts[:, 1])))
+        obs_max_y = max(obs_max_y, float(np.max(verts[:, 1])))
+
+    traj_min_x = float(np.min(traj[:, :, 0]))
+    traj_max_x = float(np.max(traj[:, :, 0]))
+    traj_min_y = float(np.min(traj[:, :, 1]))
+    traj_max_y = float(np.max(traj[:, :, 1]))
+
+    if np.isfinite(obs_min_x):
+        min_x_base = min(traj_min_x, obs_min_x)
+        max_x_base = max(traj_max_x, obs_max_x)
+        min_y_base = min(traj_min_y, obs_min_y)
+        max_y_base = max(traj_max_y, obs_max_y)
+    else:
+        min_x_base = traj_min_x
+        max_x_base = traj_max_x
+        min_y_base = traj_min_y
+        max_y_base = traj_max_y
+
+    half_local_w_m = 0.5 * float(occupancy_length)
+    half_local_h_m = 0.5 * float(occupancy_width)
+    scene_min_x = min_x_base - half_local_w_m
+    scene_max_x = max_x_base + half_local_w_m
+    scene_min_y = min_y_base - half_local_h_m
+    scene_max_y = max_y_base + half_local_h_m
+
+    scene_cells_x = max(1, int(np.ceil((scene_max_x - scene_min_x) / float(resolution))))
+    scene_cells_y = max(1, int(np.ceil((scene_max_y - scene_min_y) / float(resolution))))
+    scene_size = (float(scene_cells_x * resolution), float(scene_cells_y * resolution))
+    scene_origin = (float(scene_min_x), float(scene_min_y))
+    scene_center = np.array(
+        [scene_origin[0] + 0.5 * scene_size[0], scene_origin[1] + 0.5 * scene_size[1]],
+        dtype=np.float32,
+    )
+    return scene_origin, scene_size, (scene_cells_y, scene_cells_x), scene_center
+
+
+def _build_scene_static_map(
+    obstacles: List[ObstacleSpec],
+    resolution: float,
+    agent_radius: float,
+    scene_size: Tuple[float, float],
+    scene_center: np.ndarray,
+) -> torch.Tensor:
+    """Rasterize one static occupancy map for the full scene canvas."""
+    static_occ = Occupancy2d(
+        resolution=(resolution, resolution),
+        size=scene_size,
+        trajectory=None,
+        static_obstacles=obstacles,
+        agent_radius=agent_radius,
+    )
+    return static_occ.generate(center_offset=scene_center)[0].to(dtype=torch.float32)
+
+
+def _build_agent_dynamic_map(
+    traj: np.ndarray,
+    center_agent_idx: int,
+    resolution: float,
+    agent_radius: float,
+    scene_size: Tuple[float, float],
+    scene_center: np.ndarray,
+    canvas_shape: Tuple[int, int],
+) -> torch.Tensor:
+    """Rasterize global dynamic occupancy over all timesteps for one centered agent.
+
+    The centered agent is excluded and all other agents are rasterized.
+    """
+    num_steps = int(traj.shape[0])
+    num_agents = int(traj.shape[1])
+    other_agent_indices = [idx for idx in range(num_agents) if idx != center_agent_idx]
+
+    if not other_agent_indices:
+        return torch.zeros((num_steps, canvas_shape[0], canvas_shape[1]), dtype=torch.float32)
+
+    other_traj = traj[:, other_agent_indices].astype(np.float32)
+    dynamic_occ = Occupancy2d(
+        resolution=(resolution, resolution),
+        size=scene_size,
+        trajectory=other_traj,
+        static_obstacles=None,
+        agent_radius=agent_radius,
+    )
+    generated_frames = dynamic_occ.generate(center_offset=scene_center)
+    return torch.stack([grid.to(dtype=torch.float32) for grid in generated_frames], dim=0)
+
+
+def _collect_anchor_metadata(
+    traj: np.ndarray,
+    velocities: np.ndarray,
+    center_agent_idx: int,
+    anchor_steps: List[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Collect anchor center positions and anchor velocities for one agent."""
+    velocity_series = torch.zeros((len(anchor_steps), 2), dtype=torch.float32)
+    center_series = torch.zeros((len(anchor_steps), 2), dtype=torch.float32)
+
+    for anchor_idx, anchor_t in enumerate(anchor_steps):
+        center_series[anchor_idx] = torch.as_tensor(
+            traj[anchor_t, center_agent_idx], dtype=torch.float32
+        )
+        velocity_series[anchor_idx] = torch.as_tensor(
+            velocities[anchor_t, center_agent_idx], dtype=torch.float32
+        )
+
+    return center_series, velocity_series
+
 def build_agent_centric_occupancy_sequences(
     traj: np.ndarray,
     velocities: np.ndarray,
@@ -34,30 +164,23 @@ def build_agent_centric_occupancy_sequences(
     future_frames: int,
     center_agent_indices: List[int] | None = None,
 ) -> Tuple[
-    List[List[List[torch.Tensor]]],
-    List[List[torch.Tensor]],
     List[torch.Tensor],
-    List[np.ndarray],
+    torch.Tensor,
+    List[torch.Tensor],
+    Tuple[float, float],
     Tuple[float, float],
     List[int],
     List[int],
     List[torch.Tensor],
+    Tuple[int, int],
 ]:
-    """Build agent-centric occupancy windows for each centered agent.
-
-    For each agent and anchor timestep, this function creates:
-    - one static map centered at the agent position at the anchor,
-    - a list of occupancy frames over temporal offsets [t-past, t+future],
-      where only other agents are rasterized as dynamic occupancy,
-    - the centered agent velocity at the anchor timestep.
+    """Build scene-global occupancy maps and per-agent anchor metadata.
 
     Output structure:
-    - dynamic_windows[agent][anchor][offset] -> dynamic occupancy frame.
-    - static_maps[agent][anchor] -> static map at the same anchor center.
-    - current_velocities[agent][anchor] -> ego velocity at that anchor.
-
-    Rasterization is delegated to `Occupancy2d` with per-anchor center offsets,
-    so inputs remain in world coordinates.
+    - dynamic_maps[agent] -> (T, H, W) global dynamic occupancy over full time.
+    - scene_static_map -> (H, W) global static map for the whole scene.
+    - current_velocities[agent][anchor] and anchor_centers[agent][anchor] keep
+      sampled anchor metadata for training.
     """
     if occupancy_length <= 0 or occupancy_width <= 0:
         raise ValueError("occupancy_length and occupancy_width must be positive")
@@ -86,11 +209,27 @@ def build_agent_centric_occupancy_sequences(
     if cells_x <= 0 or cells_y <= 0:
         raise ValueError("occupancy size/resolution yields non-positive grid dimensions")
 
-    static_maps: List[List[torch.Tensor]] = []
-    dynamic_windows: List[List[List[torch.Tensor]]] = []
+    scene_origin, scene_size, scene_canvas_shape, scene_center = _compute_scene_canvas(
+        traj=traj,
+        obstacles=obstacles,
+        resolution=resolution,
+        occupancy_length=occupancy_length,
+        occupancy_width=occupancy_width,
+    )
+    local_h = int(cells_y)
+    local_w = int(cells_x)
+
+    scene_static_map = _build_scene_static_map(
+        obstacles=obstacles,
+        resolution=resolution,
+        agent_radius=agent_radius,
+        scene_size=scene_size,
+        scene_center=scene_center,
+    )
+
+    dynamic_maps: List[torch.Tensor] = []
     current_velocities: List[torch.Tensor] = []
     anchor_centers: List[torch.Tensor] = []
-    origins: List[np.ndarray] = []
     frame_offsets = list(range(-past_frames, future_frames + 1))
 
     if center_agent_indices is None:
@@ -101,194 +240,163 @@ def build_agent_centric_occupancy_sequences(
     for center_agent_idx in center_agent_indices:
         if center_agent_idx < 0 or center_agent_idx >= num_agents:
             raise ValueError("center_agent_indices contains out-of-range index")
-        sequence_windows: List[List[torch.Tensor]] = []
-        static_series: List[torch.Tensor] = []
-        velocity_series = torch.zeros((len(anchor_steps), 2), dtype=torch.float32)
-        center_series = torch.zeros((len(anchor_steps), 2), dtype=torch.float32)
-        other_agent_indices = [idx for idx in range(num_agents) if idx != center_agent_idx]
+        agent_dynamic = _build_agent_dynamic_map(
+            traj=traj,
+            center_agent_idx=center_agent_idx,
+            resolution=resolution,
+            agent_radius=agent_radius,
+            scene_size=scene_size,
+            scene_center=scene_center,
+            canvas_shape=scene_canvas_shape,
+        )
+        center_series, velocity_series = _collect_anchor_metadata(
+            traj=traj,
+            velocities=velocities,
+            center_agent_idx=center_agent_idx,
+            anchor_steps=anchor_steps,
+        )
 
-        for anchor_idx, anchor_t in enumerate(anchor_steps):
-            ego_pos = traj[anchor_t, center_agent_idx].astype(np.float32)
-
-            # Build a static-only occupancy map at this anchor center.
-            static_occ = Occupancy2d(
-                resolution=(resolution, resolution),
-                size=(float(size_xy[0]), float(size_xy[1])),
-                trajectory=None,
-                static_obstacles=obstacles,
-                agent_radius=agent_radius,
-            )
-            static_grid = static_occ.generate(center_offset=ego_pos)[0].to(dtype=torch.float32)
-
-            window_start = anchor_t - past_frames
-            window_end = anchor_t + future_frames + 1
-            if other_agent_indices:
-                other_traj = traj[window_start:window_end, other_agent_indices].astype(np.float32)
-            else:
-                other_traj = None
-
-            dynamic_occ = Occupancy2d(
-                resolution=(resolution, resolution),
-                size=(float(size_xy[0]), float(size_xy[1])),
-                trajectory=other_traj,
-                static_obstacles=None,
-                agent_radius=agent_radius,
-            )
-            generated_frames = dynamic_occ.generate(center_offset=ego_pos)
-            if other_traj is None:
-                # Occupancy2d returns one static-only frame when trajectory is None.
-                # Repeat it so each anchor still has a full temporal window.
-                base_grid = generated_frames[0].to(dtype=torch.float32)
-                anchor_frames = [base_grid.clone() for _ in frame_offsets]
-            else:
-                anchor_frames = [grid.to(dtype=torch.float32) for grid in generated_frames]
-
-            sequence_windows.append(anchor_frames)
-            static_series.append(static_grid)
-            center_series[anchor_idx] = torch.as_tensor(ego_pos, dtype=torch.float32)
-            velocity_series[anchor_idx] = torch.as_tensor(
-                velocities[anchor_t, center_agent_idx], dtype=torch.float32
-            )
-
-        dynamic_windows.append(sequence_windows)
-        static_maps.append(static_series)
+        dynamic_maps.append(agent_dynamic)
         current_velocities.append(velocity_series)
         anchor_centers.append(center_series)
-        origins.append(np.array([-0.5 * size_xy[0], -0.5 * size_xy[1]], dtype=np.float32))
 
     return (
-        dynamic_windows,
-        static_maps,
+        dynamic_maps,
+        scene_static_map,
         current_velocities,
-        origins,
+        scene_origin,
         (resolution, resolution),
         anchor_steps,
         frame_offsets,
         anchor_centers,
+        (local_h, local_w),
     )
 
 
-def collapse_windows_to_grids(
-    dynamic_windows: List[List[List[torch.Tensor]]],
-) -> List[List[torch.Tensor]]:
-    """Collapse per-anchor windows to one frame via OR over temporal offsets.
+def _slice_centered_patch(
+    grid: torch.Tensor,
+    center_xy: torch.Tensor,
+    origin_xy: Tuple[float, float],
+    resolution_xy: Tuple[float, float],
+    patch_shape: Tuple[int, int],
+) -> torch.Tensor:
+    patch_h, patch_w = int(patch_shape[0]), int(patch_shape[1])
+    res_x, res_y = float(resolution_xy[0]), float(resolution_xy[1])
+    center_x = float(center_xy[0].item())
+    center_y = float(center_xy[1].item())
+    half_w = 0.5 * patch_w * res_x
+    half_h = 0.5 * patch_h * res_y
 
-    This is used by animation/debug paths that expect one grid per anchor.
-    """
-    collapsed: List[List[torch.Tensor]] = []
-    for agent_windows in dynamic_windows:
-        agent_seq: List[torch.Tensor] = []
-        for anchor_frames in agent_windows:
-            if not anchor_frames:
-                continue
-            stacked = torch.stack([torch.as_tensor(frame) for frame in anchor_frames], dim=0)
-            agent_seq.append(stacked.amax(dim=0))
-        collapsed.append(agent_seq)
-    return collapsed
+    start_x = int(np.floor((center_x - half_w - origin_xy[0]) / res_x))
+    start_y = int(np.floor((center_y - half_h - origin_xy[1]) / res_y))
+
+    out = torch.zeros((patch_h, patch_w), dtype=torch.float32)
+    src_x0 = max(0, start_x)
+    src_y0 = max(0, start_y)
+    src_x1 = min(grid.shape[1], start_x + patch_w)
+    src_y1 = min(grid.shape[0], start_y + patch_h)
+    if src_x1 <= src_x0 or src_y1 <= src_y0:
+        return out
+
+    dst_x0 = src_x0 - start_x
+    dst_y0 = src_y0 - start_y
+    dst_x1 = dst_x0 + (src_x1 - src_x0)
+    dst_y1 = dst_y0 + (src_y1 - src_y0)
+    out[dst_y0:dst_y1, dst_x0:dst_x1] = torch.as_tensor(
+        grid[src_y0:src_y1, src_x0:src_x1],
+        dtype=torch.float32,
+    )
+    return out
 
 
-def collapse_static_series(
-    static_series_per_agent: List[List[torch.Tensor]],
-) -> List[torch.Tensor]:
-    """Collapse per-anchor static maps into one map per agent for display compatibility."""
-    collapsed: List[torch.Tensor] = []
-    for static_series in static_series_per_agent:
-        if not static_series:
-            continue
-        stacked = torch.stack([torch.as_tensor(frame) for frame in static_series], dim=0)
-        collapsed.append(stacked.amax(dim=0))
-    return collapsed
+def build_anchor_local_windows(
+    *,
+    scene_static_map: torch.Tensor,
+    dynamic_maps: List[torch.Tensor],
+    anchor_centers: List[torch.Tensor],
+    anchor_steps: List[int],
+    frame_offsets: List[int],
+    scene_origin: Tuple[float, float],
+    occupancy_resolution: Tuple[float, float],
+    local_map_shape: Tuple[int, int],
+    total_steps: int,
+) -> Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]]]:
+    """Reconstruct per-anchor local static/dynamic windows from global maps."""
+    static_maps: List[List[torch.Tensor]] = []
+    dynamic_windows: List[List[List[torch.Tensor]]] = []
+
+    for agent_idx, centers in enumerate(anchor_centers):
+        centers_tensor = torch.as_tensor(centers, dtype=torch.float32)
+        agent_static_series: List[torch.Tensor] = []
+        agent_dynamic_windows: List[List[torch.Tensor]] = []
+        agent_dynamic = torch.as_tensor(dynamic_maps[agent_idx], dtype=torch.float32)
+
+        for local_idx, anchor_t in enumerate(anchor_steps):
+            center_xy = centers_tensor[local_idx]
+            static_local = _slice_centered_patch(
+                scene_static_map,
+                center_xy,
+                scene_origin,
+                occupancy_resolution,
+                local_map_shape,
+            )
+            agent_static_series.append(static_local)
+
+            anchor_frames: List[torch.Tensor] = []
+            for dt_offset in frame_offsets:
+                absolute_t = int(anchor_t + dt_offset)
+                if absolute_t < 0 or absolute_t >= int(total_steps):
+                    anchor_frames.append(torch.zeros(local_map_shape, dtype=torch.float32))
+                    continue
+                dynamic_local = _slice_centered_patch(
+                    agent_dynamic[absolute_t],
+                    center_xy,
+                    scene_origin,
+                    occupancy_resolution,
+                    local_map_shape,
+                )
+                anchor_frames.append(dynamic_local)
+
+            agent_dynamic_windows.append(anchor_frames)
+
+        static_maps.append(agent_static_series)
+        dynamic_windows.append(agent_dynamic_windows)
+
+    return static_maps, dynamic_windows
 
 
 def data_augmentation(
-    static_maps: List[List[torch.Tensor]],
-    dynamic_windows: List[List[List[torch.Tensor]]],
+    scene_static_map: torch.Tensor,
+    dynamic_maps: List[torch.Tensor],
     current_velocities: List[torch.Tensor],
 ) -> Tuple[
-    Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]],
-    Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]],
-    Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]],
-    Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]],
-    Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]],
+    Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]],
+    Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]],
+    Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]],
+    Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]],
+    Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]],
 ]:
-    """Return static+dynamic variants: original, mirror, rot90, rot180, rot270.
+    """Global-map rollout path currently keeps only the original variant.
 
-    Rotations are clockwise around the grid center.
+    Mirror/rotation variants are returned as empty placeholders to preserve
+    existing save-loop structure.
     """
-
-    if len(static_maps) != len(dynamic_windows):
-        raise ValueError("static_maps and dynamic_windows must have the same length")
-    if len(current_velocities) != len(dynamic_windows):
-        raise ValueError("current_velocities and dynamic_windows must have the same length")
-
-    def _tensor_to_windows(seq_tensor: torch.Tensor) -> List[List[torch.Tensor]]:
-        return [
-            [frame.clone() for frame in anchor_tensor]
-            for anchor_tensor in seq_tensor
-        ]
-
-    original_static: List[List[torch.Tensor]] = []
-    original_dynamic: List[List[List[torch.Tensor]]] = []
-    original_velocity: List[torch.Tensor] = []
-    mirrored_static: List[List[torch.Tensor]] = []
-    mirrored_dynamic: List[List[List[torch.Tensor]]] = []
-    mirrored_velocity: List[torch.Tensor] = []
-    rot90_static: List[List[torch.Tensor]] = []
-    rot90_dynamic: List[List[List[torch.Tensor]]] = []
-    rot90_velocity: List[torch.Tensor] = []
-    rot180_static: List[List[torch.Tensor]] = []
-    rot180_dynamic: List[List[List[torch.Tensor]]] = []
-    rot180_velocity: List[torch.Tensor] = []
-    rot270_static: List[List[torch.Tensor]] = []
-    rot270_dynamic: List[List[List[torch.Tensor]]] = []
-    rot270_velocity: List[torch.Tensor] = []
-
-    for static_series, sequence_windows, velocity_series in zip(static_maps, dynamic_windows, current_velocities):
-        if not sequence_windows:
-            continue
-
-        # Stack once so transforms are applied consistently to all timesteps.
-        static_tensor = torch.stack([torch.as_tensor(frame) for frame in static_series], dim=0)
-        seq_tensor = torch.stack(
-            [
-                torch.stack([torch.as_tensor(frame) for frame in anchor_frames], dim=0)
-                for anchor_frames in sequence_windows
-            ],
-            dim=0,
-        )
-
-        original_static.append([frame.clone() for frame in static_tensor])
-        original_dynamic.append(_tensor_to_windows(seq_tensor))
-        original_velocity.append(torch.as_tensor(velocity_series, dtype=torch.float32).clone())
-
-        mirrored_static.append([frame.clone() for frame in torch.flip(static_tensor, dims=(-1,))])
-        mirrored_dynamic.append(_tensor_to_windows(torch.flip(seq_tensor, dims=(-1,))))
-        mirrored_vel = torch.as_tensor(velocity_series, dtype=torch.float32).clone()
-        mirrored_vel[:, 0] *= -1.0
-        mirrored_velocity.append(mirrored_vel)
-
-        rot90_static.append([frame.clone() for frame in torch.rot90(static_tensor, k=-1, dims=(-2, -1))])
-        rot90_dynamic.append(_tensor_to_windows(torch.rot90(seq_tensor, k=-1, dims=(-2, -1))))
-        rot90_vel = torch.as_tensor(velocity_series, dtype=torch.float32).clone()
-        rot90_vel = torch.stack([rot90_vel[:, 1], -rot90_vel[:, 0]], dim=1)
-        rot90_velocity.append(rot90_vel)
-
-        rot180_static.append([frame.clone() for frame in torch.rot90(static_tensor, k=2, dims=(-2, -1))])
-        rot180_dynamic.append(_tensor_to_windows(torch.rot90(seq_tensor, k=2, dims=(-2, -1))))
-        rot180_velocity.append(-torch.as_tensor(velocity_series, dtype=torch.float32).clone())
-
-        rot270_static.append([frame.clone() for frame in torch.rot90(static_tensor, k=-3, dims=(-2, -1))])
-        rot270_dynamic.append(_tensor_to_windows(torch.rot90(seq_tensor, k=-3, dims=(-2, -1))))
-        rot270_vel = torch.as_tensor(velocity_series, dtype=torch.float32).clone()
-        rot270_vel = torch.stack([-rot270_vel[:, 1], rot270_vel[:, 0]], dim=1)
-        rot270_velocity.append(rot270_vel)
-
+    _ = (scene_static_map, dynamic_maps, current_velocities)
+    empty_variant: Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]] = (
+        torch.empty(0, dtype=torch.float32),
+        [],
+        [],
+    )
     return (
-        (original_static, original_dynamic, original_velocity),
-        (mirrored_static, mirrored_dynamic, mirrored_velocity),
-        (rot90_static, rot90_dynamic, rot90_velocity),
-        (rot180_static, rot180_dynamic, rot180_velocity),
-        (rot270_static, rot270_dynamic, rot270_velocity),
+        (
+            torch.as_tensor(scene_static_map, dtype=torch.float32).clone(),
+            [torch.as_tensor(v, dtype=torch.float32).clone() for v in dynamic_maps],
+            [torch.as_tensor(v, dtype=torch.float32).clone() for v in current_velocities],
+        ),
+        empty_variant,
+        empty_variant,
+        empty_variant,
+        empty_variant,
     )
 
 
@@ -298,70 +406,38 @@ def build_scene_rollout_data(
     occupancy_origin: Tuple[float, float],
     frame_offsets: List[int],
     anchor_steps: List[int],
-    static_maps: List[List[torch.Tensor]],
-    dynamic_windows: List[List[List[torch.Tensor]]],
+    total_steps: int,
+    scene_static_map: torch.Tensor,
+    dynamic_maps: List[torch.Tensor],
     current_velocities: List[torch.Tensor],
     anchor_centers: List[torch.Tensor],
+    scene_map_origin: Tuple[float, float],
+    local_map_shape: Tuple[int, int],
 ) -> SceneRollOutData:
-    if not (len(static_maps) == len(dynamic_windows) == len(current_velocities) == len(anchor_centers)):
-        raise ValueError("static_maps, dynamic_windows, current_velocities, anchor_centers must have same length")
-    if not static_maps or not static_maps[0]:
-        raise ValueError("static_maps must not be empty")
+    if not (len(dynamic_maps) == len(current_velocities) == len(anchor_centers)):
+        raise ValueError("dynamic_maps, current_velocities, anchor_centers must have same length")
 
-    local_shape = tuple(int(v) for v in torch.as_tensor(static_maps[0][0]).shape)
-    if len(local_shape) != 2:
-        raise ValueError("Each static map must be 2D")
-    local_h, local_w = local_shape
-    res_x = float(occupancy_resolution[0])
-    res_y = float(occupancy_resolution[1])
+    static_2d = torch.as_tensor(scene_static_map, dtype=torch.float32)
+    if static_2d.ndim != 2:
+        raise ValueError("scene_static_map must be 2D")
 
-    all_centers = torch.cat([torch.as_tensor(c, dtype=torch.float32) for c in anchor_centers], dim=0)
-    if all_centers.numel() == 0:
-        raise ValueError("anchor_centers must not be empty")
+    if not dynamic_maps:
+        raise ValueError("dynamic_maps must not be empty")
+    scene_dynamic_maps = torch.stack(
+        [torch.as_tensor(m, dtype=torch.float32) for m in dynamic_maps],
+        dim=0,
+    )
+    if scene_dynamic_maps.ndim != 4:
+        raise ValueError("dynamic_maps must stack into shape (num_agents, total_time, H, W)")
 
-    half_w = 0.5 * local_w * res_x
-    half_h = 0.5 * local_h * res_y
-    min_x = float(torch.min(all_centers[:, 0]).item() - half_w)
-    max_x = float(torch.max(all_centers[:, 0]).item() + half_w)
-    min_y = float(torch.min(all_centers[:, 1]).item() - half_h)
-    max_y = float(torch.max(all_centers[:, 1]).item() + half_h)
+    if int(scene_dynamic_maps.shape[1]) != int(total_steps):
+        raise ValueError("dynamic_maps time dimension must match total_steps")
 
-    canvas_w = max(1, int(np.ceil((max_x - min_x) / res_x)))
-    canvas_h = max(1, int(np.ceil((max_y - min_y) / res_y)))
-    scene_origin = (float(min_x), float(min_y))
-
-    def _window_start(center_xy: torch.Tensor) -> Tuple[int, int]:
-        cx = float(center_xy[0].item())
-        cy = float(center_xy[1].item())
-        start_x = int(np.floor((cx - half_w - scene_origin[0]) / res_x))
-        start_y = int(np.floor((cy - half_h - scene_origin[1]) / res_y))
-        return start_x, start_y
-
-    def _stamp_patch(canvas: torch.Tensor, patch: torch.Tensor, start_x: int, start_y: int) -> None:
-        patch_h, patch_w = patch.shape
-        src_x0 = max(0, -start_x)
-        src_y0 = max(0, -start_y)
-        dst_x0 = max(0, start_x)
-        dst_y0 = max(0, start_y)
-        copy_w = min(patch_w - src_x0, canvas.shape[1] - dst_x0)
-        copy_h = min(patch_h - src_y0, canvas.shape[0] - dst_y0)
-        if copy_w <= 0 or copy_h <= 0:
-            return
-        src = patch[src_y0 : src_y0 + copy_h, src_x0 : src_x0 + copy_w]
-        canvas_slice = canvas[dst_y0 : dst_y0 + copy_h, dst_x0 : dst_x0 + copy_w]
-        canvas_slice.copy_(torch.maximum(canvas_slice, src))
-
-    scene_static_map = torch.zeros((canvas_h, canvas_w), dtype=torch.float32)
-    scene_dynamic_maps: Dict[int, torch.Tensor] = {}
     agents: Dict[int, AgentRollOutData] = {}
 
-    for agent_idx, (static_series, agent_windows, velocity_series, center_series) in enumerate(
-        zip(static_maps, dynamic_windows, current_velocities, anchor_centers)
+    for agent_idx, (velocity_series, center_series) in enumerate(
+        zip(current_velocities, anchor_centers)
     ):
-        if len(static_series) != len(anchor_steps):
-            raise ValueError("static series length must match anchor_steps")
-        if len(agent_windows) != len(anchor_steps):
-            raise ValueError("agent_windows length must match anchor_steps")
         if velocity_series.shape[0] != len(anchor_steps):
             raise ValueError("velocity series length must match anchor_steps")
 
@@ -369,22 +445,6 @@ def build_scene_rollout_data(
         if centers_tensor.shape != (len(anchor_steps), 2):
             raise ValueError("center series must have shape (num_anchors, 2)")
 
-        per_agent_dynamic = torch.zeros((canvas_h, canvas_w), dtype=torch.float32)
-        for local_idx, _anchor_t in enumerate(anchor_steps):
-            static_patch = torch.as_tensor(static_series[local_idx], dtype=torch.float32)
-            if not agent_windows[local_idx]:
-                dynamic_patch = torch.zeros_like(static_patch)
-            else:
-                dynamic_patch = torch.stack(
-                    [torch.as_tensor(frame, dtype=torch.float32) for frame in agent_windows[local_idx]],
-                    dim=0,
-                ).amax(dim=0)
-
-            sx, sy = _window_start(centers_tensor[local_idx])
-            _stamp_patch(scene_static_map, static_patch, sx, sy)
-            _stamp_patch(per_agent_dynamic, dynamic_patch, sx, sy)
-
-        scene_dynamic_maps[agent_idx] = per_agent_dynamic
         agents[agent_idx] = AgentRollOutData(
             agent_index=agent_idx,
             anchor_times=[int(t) for t in anchor_steps],
@@ -398,10 +458,10 @@ def build_scene_rollout_data(
         occupancy_origin=(float(occupancy_origin[0]), float(occupancy_origin[1])),
         frame_offsets=[int(v) for v in frame_offsets],
         agents=agents,
-        scene_static_map=scene_static_map,
+        scene_static_map=static_2d,
         scene_dynamic_maps=scene_dynamic_maps,
-        scene_map_origin=scene_origin,
-        local_map_shape=(local_h, local_w),
+        scene_map_origin=(float(scene_map_origin[0]), float(scene_map_origin[1])),
+        local_map_shape=(int(local_map_shape[0]), int(local_map_shape[1])),
     )
 
 
@@ -498,7 +558,7 @@ def animate_rollout(
 
     occ_cols = int(np.ceil(np.sqrt(num_occ_maps)))
     occ_rows = int(np.ceil(num_occ_maps / occ_cols))
-    fig_occ, axes_occ = plt.subplots(
+    fig_occ, axes_occ = plt.subplots( \
         occ_rows,
         occ_cols * 2,
         figsize=(7.6 * occ_cols, 4.0 * occ_rows),
@@ -692,11 +752,11 @@ def _resolve_data_dir(data_dir_arg: str | None) -> str:
 
 
 def _compute_variant_sets(
-    static_maps: List[List[torch.Tensor]],
-    dynamic_windows: List[List[List[torch.Tensor]]],
+    scene_static_map: torch.Tensor,
+    dynamic_maps: List[torch.Tensor],
     current_velocities: List[torch.Tensor],
     data_aug_enabled: bool,
-) -> Dict[str, Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]]]:
+) -> Dict[str, Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]]:
     if data_aug_enabled:
         (
             original,
@@ -704,7 +764,7 @@ def _compute_variant_sets(
             rot90,
             rot180,
             rot270,
-        ) = data_augmentation(static_maps, dynamic_windows, current_velocities)
+        ) = data_augmentation(scene_static_map, dynamic_maps, current_velocities)
         return {
             "orig": original,
             "mirror": mirrored,
@@ -713,13 +773,17 @@ def _compute_variant_sets(
             "rot270": rot270,
         }
 
-    empty_variant: Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]] = (
-        [],
+    empty_variant: Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]] = (
+        torch.empty(0, dtype=torch.float32),
         [],
         [],
     )
     return {
-        "orig": (static_maps, dynamic_windows, current_velocities),
+        "orig": (
+            torch.as_tensor(scene_static_map, dtype=torch.float32).clone(),
+            [torch.as_tensor(v, dtype=torch.float32).clone() for v in dynamic_maps],
+            [torch.as_tensor(v, dtype=torch.float32).clone() for v in current_velocities],
+        ),
         "mirror": empty_variant,
         "rot90": empty_variant,
         "rot180": empty_variant,
@@ -733,20 +797,26 @@ def _build_rollout_data_from_variant(
     occupancy_origin: Tuple[float, float],
     frame_offsets: List[int],
     anchor_steps: List[int],
-    variant: Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]],
+    total_steps: int,
+    variant: Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]],
     anchor_centers: List[torch.Tensor],
+    scene_map_origin: Tuple[float, float],
+    local_map_shape: Tuple[int, int],
 ) -> SceneRollOutData:
-    static_maps, dynamic_windows, current_velocities = variant
+    scene_static_map, dynamic_maps, current_velocities = variant
     return build_scene_rollout_data(
         dt=dt,
         occupancy_resolution=occupancy_resolution,
         occupancy_origin=occupancy_origin,
         frame_offsets=frame_offsets,
         anchor_steps=anchor_steps,
-        static_maps=static_maps,
-        dynamic_windows=dynamic_windows,
+        total_steps=total_steps,
+        scene_static_map=scene_static_map,
+        dynamic_maps=dynamic_maps,
         current_velocities=current_velocities,
         anchor_centers=anchor_centers,
+        scene_map_origin=scene_map_origin,
+        local_map_shape=local_map_shape,
     )
 
 
@@ -759,14 +829,17 @@ def _variant_names(data_aug_enabled: bool) -> List[str]:
 
 def _append_scene_rollouts_to_template(
     template_rollouts: Dict[str, List[SceneRollOutData]],
-    variants: Dict[str, Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]]],
+    variants: Dict[str, Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]],
     *,
     dt: float,
     occupancy_resolution: Tuple[float, float],
     occupancy_origin: Tuple[float, float],
     frame_offsets: List[int],
     anchor_steps: List[int],
+    total_steps: int,
     anchor_centers: List[torch.Tensor],
+    scene_map_origin: Tuple[float, float],
+    local_map_shape: Tuple[int, int],
     data_aug_enabled: bool,
 ) -> None:
     for name in _variant_names(data_aug_enabled):
@@ -776,8 +849,11 @@ def _append_scene_rollouts_to_template(
             occupancy_origin=occupancy_origin,
             frame_offsets=frame_offsets,
             anchor_steps=anchor_steps,
+            total_steps=total_steps,
             variant=variants[name],
             anchor_centers=anchor_centers,
+            scene_map_origin=scene_map_origin,
+            local_map_shape=local_map_shape,
         )
         template_rollouts[name].append(rollout)
 
@@ -802,13 +878,16 @@ def _save_scene_rollouts(
     data_dir: str,
     template_name: str,
     scene_index: int,
-    variants: Dict[str, Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]]],
+    variants: Dict[str, Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]],
     dt: float,
     occupancy_resolution: Tuple[float, float],
     occupancy_origin: Tuple[float, float],
     frame_offsets: List[int],
     anchor_steps: List[int],
+    total_steps: int,
     anchor_centers: List[torch.Tensor],
+    scene_map_origin: Tuple[float, float],
+    local_map_shape: Tuple[int, int],
     data_aug_enabled: bool,
 ) -> None:
     for name in _variant_names(data_aug_enabled):
@@ -818,8 +897,11 @@ def _save_scene_rollouts(
             occupancy_origin=occupancy_origin,
             frame_offsets=frame_offsets,
             anchor_steps=anchor_steps,
+            total_steps=total_steps,
             variant=variants[name],
             anchor_centers=anchor_centers,
+            scene_map_origin=scene_map_origin,
+            local_map_shape=local_map_shape,
         )
         payload = RollOutData(scenes=[scene_payload])
         file_name = f"rollout_{template_name}_scene{scene_index:05d}_{name}.pt"
@@ -873,9 +955,10 @@ def _prepare_past_future_dynamic_grids(
 def _print_scene_occupancy_summary(
     scene_index: int,
     traj: np.ndarray,
-    static_maps_display: List[torch.Tensor],
-    dynamic_grids: List[List[torch.Tensor]],
-    variants: Dict[str, Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]], List[torch.Tensor]]],
+    scene_static_map: torch.Tensor,
+    dynamic_maps: List[torch.Tensor],
+    variants: Dict[str, Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]],
+    anchor_steps: List[int],
 ) -> None:
     for i, pos in enumerate(traj[-1]):
         print(
@@ -885,15 +968,15 @@ def _print_scene_occupancy_summary(
 
     dynamic_original = variants["orig"][1]
     velocity_original = variants["orig"][2]
+    dynamic_shape = tuple(dynamic_maps[0].shape) if dynamic_maps else ()
     print(
         f"scene[{scene_index}] occupancy generated: "
         f"orig={len(variants['orig'][1])}, mirror={len(variants['mirror'][1])}, "
         f"rot90={len(variants['rot90'][1])}, rot180={len(variants['rot180'][1])}, "
         f"rot270={len(variants['rot270'][1])} maps; "
-        f"{len(dynamic_grids[0])} anchors each (sampled), "
-        f"{len(dynamic_original[0][0])} frames per anchor window, "
-        f"static shape {static_maps_display[0].shape}, "
-        f"dynamic grid shape {dynamic_grids[0][0].shape}, "
+        f"{len(anchor_steps)} anchors each (sampled), "
+        f"global static shape {tuple(scene_static_map.shape)}, "
+        f"global dynamic shape {dynamic_shape}, "
         f"velocity shape {velocity_original[0].shape}"
     )
 
@@ -912,6 +995,12 @@ def main() -> None:
 
     ANIMATE = bool(args.animate)
     DATA_AUG_ENABLED = not bool(args.disable_data_aug)
+    if DATA_AUG_ENABLED:
+        print(
+            "Global-map rollout format currently saves only the original variant; "
+            "data augmentation variants are disabled."
+        )
+        DATA_AUG_ENABLED = False
 
     # ORCASim configuration constants
     TIME_STEP = 0.1
@@ -997,14 +1086,15 @@ def main() -> None:
                 continue
 
             (
-                dynamic_windows,
-                static_maps,
+                dynamic_maps,
+                scene_static_map,
                 current_velocities,
-                occupancy_origin,
+                scene_map_origin,
                 occupancy_resolution,
                 anchor_steps,
                 frame_offsets,
                 anchor_centers,
+                local_map_shape,
             ) = build_agent_centric_occupancy_sequences(
                 traj=traj,
                 velocities=vel_traj,
@@ -1018,11 +1108,9 @@ def main() -> None:
                 future_frames=int(args.occ_future_frames),
             )
 
-            dynamic_grids = collapse_windows_to_grids(dynamic_windows)
-            static_maps_display = collapse_static_series(static_maps)
             variants = _compute_variant_sets(
-                static_maps,
-                dynamic_windows,
+                scene_static_map,
+                dynamic_maps,
                 current_velocities,
                 DATA_AUG_ENABLED,
             )
@@ -1036,10 +1124,13 @@ def main() -> None:
                         variants=variants,
                         dt=TIME_STEP,
                         occupancy_resolution=occupancy_resolution,
-                        occupancy_origin=(float(occupancy_origin[0][0]), float(occupancy_origin[0][1])),
+                        occupancy_origin=(float(scene_map_origin[0]), float(scene_map_origin[1])),
                         frame_offsets=frame_offsets,
                         anchor_steps=anchor_steps,
+                        total_steps=int(traj.shape[0]),
                         anchor_centers=anchor_centers,
+                        scene_map_origin=scene_map_origin,
+                        local_map_shape=local_map_shape,
                         data_aug_enabled=DATA_AUG_ENABLED,
                     )
                 else:
@@ -1048,10 +1139,13 @@ def main() -> None:
                         variants=variants,
                         dt=TIME_STEP,
                         occupancy_resolution=occupancy_resolution,
-                        occupancy_origin=(float(occupancy_origin[0][0]), float(occupancy_origin[0][1])),
+                        occupancy_origin=(float(scene_map_origin[0]), float(scene_map_origin[1])),
                         frame_offsets=frame_offsets,
                         anchor_steps=anchor_steps,
+                        total_steps=int(traj.shape[0]),
                         anchor_centers=anchor_centers,
+                        scene_map_origin=scene_map_origin,
+                        local_map_shape=local_map_shape,
                         data_aug_enabled=DATA_AUG_ENABLED,
                     )
                     if DATA_AUG_ENABLED:
@@ -1072,11 +1166,33 @@ def main() -> None:
             
             title_prefix = f"{tpl.__class__.__name__} {local_idx + 1}/{len(scenes)}"
             if ANIMATE:
+                static_maps, dynamic_windows = build_anchor_local_windows(
+                    scene_static_map=scene_static_map,
+                    dynamic_maps=dynamic_maps,
+                    anchor_centers=anchor_centers,
+                    anchor_steps=anchor_steps,
+                    frame_offsets=frame_offsets,
+                    scene_origin=scene_map_origin,
+                    occupancy_resolution=occupancy_resolution,
+                    local_map_shape=local_map_shape,
+                    total_steps=int(traj.shape[0]),
+                )
                 static_maps_np = _prepare_animation_grids(static_maps)
                 dynamic_past_grids_np, dynamic_future_grids_np = _prepare_past_future_dynamic_grids(
                     dynamic_windows,
                     frame_offsets,
                 )
+
+                local_origins = [
+                    np.array(
+                        [
+                            -0.5 * float(local_map_shape[1]) * float(occupancy_resolution[0]),
+                            -0.5 * float(local_map_shape[0]) * float(occupancy_resolution[1]),
+                        ],
+                        dtype=np.float32,
+                    )
+                    for _ in range(len(static_maps_np))
+                ]
 
                 animate_rollout(
                     traj=traj,
@@ -1086,7 +1202,7 @@ def main() -> None:
                     static_maps=static_maps_np,
                     dynamic_past_grids=dynamic_past_grids_np,
                     dynamic_future_grids=dynamic_future_grids_np,
-                    occupancy_origins=occupancy_origin,
+                    occupancy_origins=local_origins,
                     occupancy_resolution=occupancy_resolution,
                     anchor_steps=anchor_steps,
                     time_step=TIME_STEP,
@@ -1096,9 +1212,10 @@ def main() -> None:
                 _print_scene_occupancy_summary(
                     scene_index=scene_index,
                     traj=traj,
-                    static_maps_display=static_maps_display,
-                    dynamic_grids=dynamic_grids,
+                    scene_static_map=scene_static_map,
+                    dynamic_maps=dynamic_maps,
                     variants=variants,
+                    anchor_steps=anchor_steps,
                 )
 
             global_scene_index += 1

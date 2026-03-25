@@ -101,7 +101,7 @@ def load_scene_origins(
     def _collect_from_scene_obj(scene: SceneRollOutData) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         if scene.scene_static_map is None or scene.scene_map_origin is None or scene.local_map_shape is None:
             raise ValueError("Compact RollOutData fields are required")
-        if not scene.scene_dynamic_maps:
+        if scene.scene_dynamic_maps is None:
             raise ValueError("RollOutData.scene_dynamic_maps is required")
 
         dynamic_sequences: list[torch.Tensor] = []
@@ -112,11 +112,13 @@ def load_scene_origins(
         scene_origin = (float(scene.scene_map_origin[0]), float(scene.scene_map_origin[1]))
         resolution_xy = (float(scene.occupancy_resolution[0]), float(scene.occupancy_resolution[1]))
         patch_shape = (int(scene.local_map_shape[0]), int(scene.local_map_shape[1]))
+        dynamic_maps = torch.as_tensor(scene.scene_dynamic_maps, dtype=torch.float32)
+        if dynamic_maps.ndim != 4:
+            raise ValueError("scene_dynamic_maps must have shape (num_agents, total_time, H, W)")
 
         for agent_idx in sorted(scene.agents.keys()):
             agent_data = scene.agents[agent_idx]
-            dynamic_map_obj = scene.scene_dynamic_maps.get(agent_idx)
-            if dynamic_map_obj is None:
+            if agent_idx < 0 or agent_idx >= dynamic_maps.shape[0]:
                 continue
 
             if agent_data.anchor_centers is None or agent_data.current_velocities is None:
@@ -124,32 +126,45 @@ def load_scene_origins(
 
             centers = torch.as_tensor(agent_data.anchor_centers, dtype=torch.float32)
             velocities = torch.as_tensor(agent_data.current_velocities, dtype=torch.float32)
-            dynamic_map = torch.as_tensor(dynamic_map_obj, dtype=torch.float32)
+            anchor_times = [int(t) for t in agent_data.anchor_times]
 
             if centers.ndim != 2 or centers.shape[1] != 2:
                 raise ValueError("anchor_centers must have shape (A, 2)")
             if velocities.shape != centers.shape:
                 raise ValueError("current_velocities must match anchor_centers shape")
-            if dynamic_map.ndim != 2:
-                raise ValueError("scene_dynamic_maps[agent] must be 2D")
+            if len(anchor_times) != centers.shape[0]:
+                raise ValueError("anchor_times must match anchor_centers length")
 
             dyn_local: list[torch.Tensor] = []
             sta_local: list[torch.Tensor] = []
-            for anchor_idx in range(centers.shape[0]):
+            vel_local: list[torch.Tensor] = []
+            agent_dynamic = dynamic_maps[agent_idx]
+            total_time = int(agent_dynamic.shape[0])
+
+            for anchor_idx, anchor_t in enumerate(anchor_times):
+                if anchor_t < 0 or anchor_t >= total_time:
+                    continue
                 center_xy = centers[anchor_idx]
                 dyn_local.append(
-                    _slice_centered_patch(dynamic_map, center_xy, scene_origin, resolution_xy, patch_shape)
+                    _slice_centered_patch(
+                        _to_2d(agent_dynamic[anchor_t]),
+                        center_xy,
+                        scene_origin,
+                        resolution_xy,
+                        patch_shape,
+                    )
                 )
                 sta_local.append(
                     _slice_centered_patch(scene_static, center_xy, scene_origin, resolution_xy, patch_shape)
                 )
+                vel_local.append(velocities[anchor_idx].to(dtype=torch.float32))
 
             if not dyn_local:
                 continue
 
             dynamic_sequences.append(torch.stack(dyn_local, dim=0))
             static_maps.append(torch.stack(sta_local, dim=0))
-            velocity_sequences.append(velocities)
+            velocity_sequences.append(torch.stack(vel_local, dim=0))
 
         return dynamic_sequences, static_maps, velocity_sequences
 
@@ -394,10 +409,11 @@ def main() -> None:
 
     zero_img = np.zeros((init_h, init_w), dtype=np.float32)
     zero_rgb = np.zeros((init_h, init_w, 3), dtype=np.float32)
-    im_past = ax_past.imshow(zero_img, cmap="Blues", vmin=0.0, vmax=1.0)
-    im_pred = ax_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0)
-    im_overlay_pred = ax_overlay_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0)
-    im_overlay_gt = ax_overlay_gt.imshow(zero_rgb, vmin=0.0, vmax=1.0)
+    # Occupancy is cell-discrete; nearest interpolation prevents visual blurring.
+    im_past = ax_past.imshow(zero_img, cmap="Blues", vmin=0.0, vmax=1.0, interpolation="nearest")
+    im_pred = ax_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
+    im_overlay_pred = ax_overlay_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
+    im_overlay_gt = ax_overlay_gt.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
 
     ax_past.set_title("Past 16 Stack")
     ax_pred.set_title("Predicted Horizon Stack (Mode1=Red, Mode2=Green)")
@@ -492,7 +508,7 @@ def main() -> None:
         preds = get_predictions(scene_idx, origin_idx, horizon, num_modalities)
 
         past = seq[t - history_len : t]  # (history_len, H, W)
-        past_stack = past.max(dim=0).values
+        past_stack = (past.max(dim=0).values > 0.0).float()
 
         pred_stack_1 = torch.zeros((h_img, w_img), dtype=torch.float32)
         pred_stack_2 = torch.zeros((h_img, w_img), dtype=torch.float32)
@@ -506,7 +522,7 @@ def main() -> None:
 
         gt_future = seq[t : min(t + horizon, t_total)]
         if gt_future.shape[0] > 0:
-            gt_stack = gt_future.max(dim=0).values
+            gt_stack = (gt_future.max(dim=0).values > 0.0).float()
         else:
             gt_stack = torch.zeros((h_img, w_img), dtype=torch.float32)
 

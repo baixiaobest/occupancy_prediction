@@ -24,7 +24,7 @@ class DatasetStats:
 
 
 class OccupancyWindowDataset(Dataset):
-    """Sliding-window dataset over dynamic occupancy sequences."""
+    """Anchor-window dataset over precomputed local occupancy windows."""
 
     def __init__(
         self,
@@ -49,41 +49,29 @@ class OccupancyWindowDataset(Dataset):
         self.future_len = int(future_len)
         self.decoder_context_len = int(decoder_context_len)
         self.window_size = self.history_len + self.future_len
-        self.sequences = list(sequences)
-        self.samples: list[tuple[int, int]] = []
+        self.samples = list(sequences)
 
-        for seq_idx, (seq, static_seq, velocity_seq) in enumerate(self.sequences):
+        for seq, static_map, velocity in self.samples:
             if seq.ndim != 3:
-                raise ValueError("Each sequence must have shape (T, H, W)")
-            if static_seq.ndim != 3:
-                raise ValueError("Each static sequence must have shape (T, H, W)")
-            if static_seq.shape[-2:] != seq.shape[-2:]:
-                raise ValueError("Static sequence spatial shape must match dynamic sequence")
-            if velocity_seq.ndim != 2 or velocity_seq.shape[1] != 2:
-                raise ValueError("Each velocity sequence must have shape (T, 2)")
-            if static_seq.shape[0] != seq.shape[0]:
-                raise ValueError("Static sequence length must match dynamic sequence length")
-            if velocity_seq.shape[0] != seq.shape[0]:
-                raise ValueError("Velocity sequence length must match dynamic sequence length")
-            t = seq.shape[0]
-            if t < self.window_size:
-                continue
-            for start in range(0, t - self.window_size + 1, stride):
-                self.samples.append((seq_idx, start))
+                raise ValueError("Each sequence must have shape (history+future, H, W)")
+            if seq.shape[0] != self.window_size:
+                raise ValueError("Each sequence must have exactly history_len + future_len frames")
+            if static_map.ndim != 2:
+                raise ValueError("Each static map must have shape (H, W)")
+            if static_map.shape != seq.shape[-2:]:
+                raise ValueError("Static map spatial shape must match sequence shape")
+            vel = torch.as_tensor(velocity, dtype=torch.float32)
+            if vel.shape != (2,):
+                raise ValueError("Each velocity must have shape (2,)")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        seq_idx, start = self.samples[index]
-        seq, static_seq, velocity_seq = self.sequences[seq_idx]
+        seq, current_static, current_velocity = self.samples[index]
 
-        past = seq[start : start + self.history_len]
-        future = seq[start + self.history_len : start + self.window_size]
-        # Anchor velocity corresponds to first prediction timestep.
-        anchor_index = start + self.history_len
-        current_velocity = velocity_seq[anchor_index]
-        current_static = static_seq[anchor_index]
+        past = seq[: self.history_len]
+        future = seq[self.history_len : self.window_size]
 
         x_encoder_dynamic = torch.cat([past, future], dim=0).unsqueeze(0)
         x_decoder_dynamic = past[-self.decoder_context_len :].unsqueeze(0)
@@ -92,7 +80,12 @@ class OccupancyWindowDataset(Dataset):
         return x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y
 
 
-def _load_agent_sequences_from_file(pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+def _load_agent_sequences_from_file(
+    pt_path: Path,
+    history_len: int,
+    future_len: int,
+    anchor_stride: int,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     try:
         payload = torch.load(pt_path, map_location="cpu")
     except AttributeError as exc:
@@ -149,7 +142,7 @@ def _load_agent_sequences_from_file(pt_path: Path) -> list[tuple[torch.Tensor, t
             raise ValueError("RollOutData.scene_map_origin is required")
         if scene.local_map_shape is None:
             raise ValueError("RollOutData.local_map_shape is required")
-        if not scene.scene_dynamic_maps:
+        if scene.scene_dynamic_maps is None:
             raise ValueError("RollOutData.scene_dynamic_maps is required")
         out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         scene_static = _to_2d(scene.scene_static_map)
@@ -162,11 +155,15 @@ def _load_agent_sequences_from_file(pt_path: Path) -> list[tuple[torch.Tensor, t
             float(scene.occupancy_resolution[1]),
         )
         patch_shape = (int(scene.local_map_shape[0]), int(scene.local_map_shape[1]))
+        dynamic_maps = torch.as_tensor(scene.scene_dynamic_maps, dtype=torch.float32)
+        if dynamic_maps.ndim != 4:
+            raise ValueError("scene_dynamic_maps must have shape (num_agents, total_time, H, W)")
+
+        window_size = int(history_len + future_len)
 
         for agent_idx in sorted(scene.agents.keys()):
             agent_data = scene.agents[agent_idx]
-            dynamic_map_obj = scene.scene_dynamic_maps.get(agent_idx)
-            if dynamic_map_obj is None:
+            if agent_idx < 0 or agent_idx >= dynamic_maps.shape[0]:
                 continue
 
             anchor_times = agent_data.anchor_times
@@ -179,26 +176,22 @@ def _load_agent_sequences_from_file(pt_path: Path) -> list[tuple[torch.Tensor, t
 
             centers_tensor = torch.as_tensor(anchor_centers, dtype=torch.float32)
             velocity_tensor = torch.as_tensor(velocity_series, dtype=torch.float32)
-            dynamic_map = torch.as_tensor(dynamic_map_obj, dtype=torch.float32)
             if centers_tensor.shape != (len(anchor_times), 2):
                 raise ValueError("anchor_centers must have shape (num_anchors, 2)")
             if velocity_tensor.shape != (len(anchor_times), 2):
                 raise ValueError("current_velocities must have shape (num_anchors, 2)")
-            if dynamic_map.ndim != 2:
-                raise ValueError("scene_dynamic_maps[agent] must be a 2D map")
+            agent_dynamic = dynamic_maps[agent_idx]
+            total_time = int(agent_dynamic.shape[0])
 
-            anchor_grids: list[torch.Tensor] = []
-            anchor_static_maps: list[torch.Tensor] = []
-            anchor_velocities: list[torch.Tensor] = []
-            for anchor_idx in range(len(anchor_times)):
-                center_xy = centers_tensor[anchor_idx]
-                dynamic_local = _slice_centered_patch(
-                    grid=dynamic_map,
-                    center_xy=center_xy,
-                    origin_xy=scene_origin,
-                    resolution_xy=resolution_xy,
-                    patch_shape=patch_shape,
-                )
+            anchor_indices = list(range(0, len(anchor_times), max(1, int(anchor_stride))))
+            for anchor_meta_idx in anchor_indices:
+                anchor_t = int(anchor_times[anchor_meta_idx])
+                start_t = anchor_t - int(history_len)
+                end_t = anchor_t + int(future_len)
+                if start_t < 0 or end_t > total_time:
+                    continue
+
+                center_xy = centers_tensor[anchor_meta_idx]
                 static_local = _slice_centered_patch(
                     grid=scene_static,
                     center_xy=center_xy,
@@ -207,17 +200,28 @@ def _load_agent_sequences_from_file(pt_path: Path) -> list[tuple[torch.Tensor, t
                     patch_shape=patch_shape,
                 )
 
-                anchor_grids.append(dynamic_local)
-                anchor_static_maps.append(static_local)
-                anchor_velocities.append(velocity_tensor[anchor_idx])
+                dynamic_window: list[torch.Tensor] = []
+                for absolute_t in range(start_t, end_t):
+                    dynamic_global_t = _to_2d(agent_dynamic[absolute_t])
+                    dynamic_local_t = _slice_centered_patch(
+                        grid=dynamic_global_t,
+                        center_xy=center_xy,
+                        origin_xy=scene_origin,
+                        resolution_xy=resolution_xy,
+                        patch_shape=patch_shape,
+                    )
+                    dynamic_window.append(dynamic_local_t)
 
-            if not anchor_grids:
-                continue
+                if len(dynamic_window) != window_size:
+                    continue
 
-            dynamic_seq = torch.stack(anchor_grids, dim=0)
-            static_seq = torch.stack(anchor_static_maps, dim=0)
-            velocity_seq = torch.stack(anchor_velocities, dim=0).to(dtype=torch.float32)
-            out.append((dynamic_seq, static_seq, velocity_seq))
+                out.append(
+                    (
+                        torch.stack(dynamic_window, dim=0),
+                        static_local,
+                        velocity_tensor[anchor_meta_idx].to(dtype=torch.float32),
+                    )
+                )
 
         return out
 
@@ -278,13 +282,18 @@ def build_datasets(
         raise FileNotFoundError(f"No .pt files found in {data_dir}")
 
     for pt_file in pt_files:
-        scene_sequences = _load_agent_sequences_from_file(pt_file)
+        scene_sequences = _load_agent_sequences_from_file(
+            pt_file,
+            history_len=history_len,
+            future_len=future_len,
+            anchor_stride=window_stride,
+        )
         train_seq, val_seq = _split_agent_sequences(scene_sequences, val_ratio, rng)
         all_train_sequences.extend(train_seq)
         all_val_sequences.extend(val_seq)
 
-    num_train_anchors = int(sum(seq.shape[0] for seq, _, _ in all_train_sequences))
-    num_val_anchors = int(sum(seq.shape[0] for seq, _, _ in all_val_sequences))
+    num_train_anchors = int(len(all_train_sequences))
+    num_val_anchors = int(len(all_val_sequences))
 
     train_dataset = OccupancyWindowDataset(
         all_train_sequences,
