@@ -28,7 +28,7 @@ from src.VAE_prediction import (
     build_prediction_vae_models,
 )
 from src.Dataset import build_datasets
-from src.loss import kl_divergence, weighted_bernoulli_recon_loss, weighted_focal_recon_loss
+from src.loss import kl_divergence, kl_target_loss, weighted_bernoulli_recon_loss, weighted_focal_recon_loss
 
 
 def get_rollout_length(
@@ -77,11 +77,12 @@ def run_epoch(
     occupied_weight: float,
     focal_gamma: float,
     kl_weight: float,
+    target_kl: float,
     rollout_len: int,
     teacher_forcing_prob: float,
     num_latent_samples: int,
     latent_selection_max_steps: int,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
     """Run one epoch (training or evaluation) over `loader`.
 
     If `optimizer` is provided the model parameters are updated (training
@@ -98,14 +99,15 @@ def run_epoch(
         recon_loss_type: Reconstruction loss type: `bce` or `focal`.
         occupied_weight: Absolute occupied-cell weight for both BCE and focal losses.
         focal_gamma: Focal exponent used to focus on hard examples.
-        kl_weight: Weight to scale the KL term when computing total loss.
+        kl_weight: Weight to scale the KL objective when computing total loss.
+        target_kl: Target KL value used in quadratic penalty `(KL - target_kl)^2`.
         rollout_len: Number of autoregressive steps used for reconstruction loss.
         teacher_forcing_prob: Probability of feeding GT at each rollout step.
         num_latent_samples: Number of latent samples (`z`) to evaluate per sample.
         latent_selection_max_steps: Max rollout steps used to choose best `z`.
 
     Returns:
-        A tuple `(avg_loss, avg_recon, avg_kl)` averaged over batches.
+        A tuple `(avg_loss, avg_recon, avg_kl, avg_kl_objective)` averaged over batches.
     """
     is_train = optimizer is not None
     encoder.train(is_train)
@@ -114,6 +116,7 @@ def run_epoch(
     total_loss = 0.0
     total_recon = 0.0
     total_kl = 0.0
+    total_kl_objective = 0.0
     total_batches = 0
 
     for x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y in loader:
@@ -226,7 +229,8 @@ def run_epoch(
 
         recon = rollout_step_recons.mean()
         kl = kl_divergence(mu, sigma)
-        loss = recon + kl_weight * kl
+        kl_objective = kl_target_loss(kl, target_kl=target_kl)
+        loss = recon + kl_weight * kl_objective
 
         if is_train:
             loss.backward()
@@ -235,15 +239,17 @@ def run_epoch(
         total_loss += float(loss.item())
         total_recon += float(recon.item())
         total_kl += float(kl.item())
+        total_kl_objective += float(kl_objective.item())
         total_batches += 1
 
     if total_batches == 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     return (
         total_loss / total_batches,
         total_recon / total_batches,
         total_kl / total_batches,
+        total_kl_objective / total_batches,
     )
 
 
@@ -291,6 +297,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (0 disables focal modulation)")
     parser.add_argument("--kl-weight", type=float, default=1e-3)
+    parser.add_argument("--target-kl", type=float, default=1.0, help="Target KL value used in quadratic KL objective")
     parser.add_argument("--latent-channel", type=int, default=128)
     parser.add_argument(
         "--channels",
@@ -413,6 +420,7 @@ def build_checkpoint(
             "latent_selection_max_steps": args.latent_selection_max_steps,
             "teacher_forcing_start_p": args.teacher_forcing_start_p,
             "teacher_forcing_end_p": args.teacher_forcing_end_p,
+            "target_kl": args.target_kl,
             "curriculum_epochs": curriculum_epochs,
             "latent_channel": args.latent_channel,
             "channels": list(args.channels),
@@ -590,7 +598,7 @@ def main() -> None:
                 ramp_epochs=curriculum_epochs,
             )
 
-            train_loss, train_recon, train_kl = run_epoch(
+            train_loss, train_recon, train_kl, train_kl_objective = run_epoch(
                 encoder,
                 decoder,
                 train_loader,
@@ -600,6 +608,7 @@ def main() -> None:
                 occupied_weight=args.occupied_weight,
                 focal_gamma=args.focal_gamma,
                 kl_weight=args.kl_weight,
+                target_kl=args.target_kl,
                 rollout_len=current_rollout_k,
                 teacher_forcing_prob=current_teacher_forcing_p,
                 num_latent_samples=args.num_latent_samples,
@@ -607,7 +616,7 @@ def main() -> None:
             )
 
             with torch.no_grad():
-                val_loss, val_recon, val_kl = run_epoch(
+                val_loss, val_recon, val_kl, val_kl_objective = run_epoch(
                     encoder,
                     decoder,
                     val_loader,
@@ -617,8 +626,9 @@ def main() -> None:
                     occupied_weight=args.occupied_weight,
                     focal_gamma=args.focal_gamma,
                     kl_weight=args.kl_weight,
+                    target_kl=args.target_kl,
                     rollout_len=current_rollout_k,
-                    teacher_forcing_prob=0.0,
+                    teacher_forcing_prob=current_teacher_forcing_p,
                     num_latent_samples=args.num_latent_samples,
                     latent_selection_max_steps=args.latent_selection_max_steps,
                 )
@@ -633,8 +643,8 @@ def main() -> None:
                 f"Epoch {epoch:03d} | "
                 f"K={current_rollout_k}, tf_p={current_teacher_forcing_p:.3f}, "
                 f"n_z={args.num_latent_samples}, m={args.latent_selection_max_steps} | "
-                f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, kl={train_kl:.6f} | "
-                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f} | "
+                f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, kl={train_kl:.6f}, kl_obj={train_kl_objective:.6f} | "
+                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f}, kl_obj={val_kl_objective:.6f} | "
                 f"epoch_time={_format_hhmmss(epoch_duration)}, eta={_format_hhmmss(eta_seconds)}",
                 wandb_run=wandb_run,
             )
@@ -677,9 +687,12 @@ def main() -> None:
                         "train/loss": train_loss,
                         "train/recon": train_recon,
                         "train/kl": train_kl,
+                        "train/kl_objective": train_kl_objective,
                         "val/loss": val_loss,
                         "val/recon": val_recon,
                         "val/kl": val_kl,
+                        "val/kl_objective": val_kl_objective,
+                        "kl/target": args.target_kl,
                         "curriculum/rollout_k": current_rollout_k,
                         "curriculum/teacher_forcing_p": current_teacher_forcing_p,
                         "best/val_loss": min(best_val_loss, val_loss),

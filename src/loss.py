@@ -12,6 +12,15 @@ def kl_divergence(mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     return kl
 
 
+def kl_target_loss(
+    kl_value: torch.Tensor,
+    target_kl: float,
+) -> torch.Tensor:
+    """Quadratic KL target penalty: (KL - target_kl)^2."""
+    target = torch.as_tensor(float(target_kl), device=kl_value.device, dtype=kl_value.dtype)
+    return (kl_value - target).pow(2)
+
+
 def weighted_bernoulli_recon_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
