@@ -473,7 +473,7 @@ def main() -> None:
 
     ax_past.set_title("Past + Static Stack")
     ax_pred.set_title("Predicted Horizon Stack (Mode1=Red, Mode2=Green)")
-    ax_overlay_pred.set_title("Overlay: Past (Blue) + Pred1 (Red) + Pred2 (Green)")
+    ax_overlay_pred.set_title("Overlay: Static (Gray) + Past (Blue) + Pred1 (Red) + Pred2 (Green)")
     ax_overlay_gt.set_title("Overlay: Past (Blue) + GT Future (Green)")
 
     for ax in [ax_past, ax_pred, ax_overlay_pred, ax_overlay_gt]:
@@ -602,7 +602,14 @@ def main() -> None:
         )
 
         pred_viz = np.stack([pred1_np, pred2_np, np.zeros_like(pred1_np)], axis=-1)
-        overlay_pred = np.stack([pred1_np, pred2_np, past_np], axis=-1)
+        overlay_pred = np.stack(
+            [
+                np.clip(0.35 * static_np + pred1_np, 0.0, 1.0),
+                np.clip(0.35 * static_np + pred2_np, 0.0, 1.0),
+                np.clip(0.35 * static_np + past_np, 0.0, 1.0),
+            ],
+            axis=-1,
+        )
         overlay_gt = np.stack([np.zeros_like(gt_np), gt_np, past_np], axis=-1)
 
         im_past.set_data(np.clip(past_with_static, 0.0, 1.0))
