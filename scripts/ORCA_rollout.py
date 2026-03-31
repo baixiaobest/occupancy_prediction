@@ -1039,7 +1039,7 @@ def main() -> None:
 
     # ORCASim configuration constants
     TIME_STEP = 0.1
-    NUM_STEPS = 150
+    NUM_STEPS = 200
     NEIGHBOR_DIST = 1.0
     MAX_NEIGHBORS = 5
     TIME_HORIZON = 3.0
