@@ -79,6 +79,8 @@ def run_epoch(
     kl_weight: float,
     rollout_len: int,
     teacher_forcing_prob: float,
+    num_latent_samples: int,
+    latent_selection_max_steps: int,
 ) -> tuple[float, float, float]:
     """Run one epoch (training or evaluation) over `loader`.
 
@@ -99,6 +101,8 @@ def run_epoch(
         kl_weight: Weight to scale the KL term when computing total loss.
         rollout_len: Number of autoregressive steps used for reconstruction loss.
         teacher_forcing_prob: Probability of feeding GT at each rollout step.
+        num_latent_samples: Number of latent samples (`z`) to evaluate per sample.
+        latent_selection_max_steps: Max rollout steps used to choose best `z`.
 
     Returns:
         A tuple `(avg_loss, avg_recon, avg_kl)` averaged over batches.
@@ -123,46 +127,104 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
 
         mu, sigma = encoder(x_encoder_dynamic, x_static, current_velocity)
-        z = encoder.sample(mu, sigma)
 
         horizon = int(y.shape[2])
         effective_k = max(1, min(int(rollout_len), horizon))
-        context = x_decoder_dynamic.clone()
-        step_recons: list[torch.Tensor] = []
+        selection_steps = max(1, min(effective_k, int(latent_selection_max_steps)))
+        batch_size = y.shape[0]
 
-        for step in range(effective_k):
-            logits_full = decoder(z, context, x_static, current_velocity)
+        def _rollout_step(
+            z_step: torch.Tensor,
+            context_step: torch.Tensor,
+            step: int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            logits_full = decoder(z_step, context_step, x_static, current_velocity)
             logits_step = logits_full[:, :, :1]
             target_step = y[:, :, step : step + 1]
 
             if recon_loss_type == "focal":
-                step_recon = weighted_focal_recon_loss(
+                step_recon_cells = weighted_focal_recon_loss(
                     logits_step,
                     target_step,
                     occupied_weight=occupied_weight,
                     focal_gamma=focal_gamma,
+                    reduction="none",
                 )
             elif recon_loss_type == "bce":
-                step_recon = weighted_bernoulli_recon_loss(
+                step_recon_cells = weighted_bernoulli_recon_loss(
                     logits_step,
                     target_step,
                     occupied_weight=occupied_weight,
+                    reduction="none",
                 )
             else:
                 raise ValueError(f"Unsupported recon_loss_type: {recon_loss_type}")
-            step_recons.append(step_recon)
+
+            step_recon = step_recon_cells.reshape(batch_size, -1).mean(dim=1)
 
             pred_step = torch.sigmoid(logits_step.detach())
             if is_train and teacher_forcing_prob < 1.0:
-                batch_size = target_step.shape[0]
-                use_gt = (torch.rand((batch_size, 1, 1, 1, 1), device=device) < teacher_forcing_prob).to(target_step.dtype)
+                use_gt = (
+                    torch.rand((batch_size, 1, 1, 1, 1), device=device) < teacher_forcing_prob
+                ).to(target_step.dtype)
                 feedback_step = use_gt * target_step + (1.0 - use_gt) * pred_step
             else:
                 feedback_step = target_step if teacher_forcing_prob >= 1.0 else pred_step
 
-            context = torch.cat([context[:, :, 1:], feedback_step], dim=2)
+            next_context = torch.cat([context_step[:, :, 1:], feedback_step], dim=2)
+            return step_recon, next_context
 
-        recon = torch.stack(step_recons).mean()
+        selection_step_recons = torch.empty(
+            (num_latent_samples, batch_size, selection_steps),
+            device=device,
+            dtype=y.dtype,
+        )
+        z_candidates = torch.empty(
+            (num_latent_samples,) + tuple(mu.shape),
+            device=device,
+            dtype=mu.dtype,
+        )
+        context_candidates = torch.empty(
+            (num_latent_samples,) + tuple(x_decoder_dynamic.shape),
+            device=device,
+            dtype=x_decoder_dynamic.dtype,
+        )
+
+        for z_idx in range(num_latent_samples):
+            z = encoder.sample(mu, sigma)
+            z_candidates[z_idx] = z
+            context = x_decoder_dynamic.clone()
+
+            for step in range(selection_steps):
+                step_recon, context = _rollout_step(z, context, step)
+                selection_step_recons[z_idx, :, step] = step_recon
+
+            context_candidates[z_idx] = context
+
+        z_selection_losses = selection_step_recons.mean(dim=2)
+        best_z_indices = z_selection_losses.argmin(dim=0)
+        batch_indices = torch.arange(batch_size, device=device)
+
+        selected_step_recons = selection_step_recons[best_z_indices, batch_indices, :]
+
+        if effective_k > selection_steps:
+            rollout_step_recons = torch.empty(
+                (batch_size, effective_k),
+                device=device,
+                dtype=y.dtype,
+            )
+            rollout_step_recons[:, :selection_steps] = selected_step_recons
+
+            best_z = z_candidates[best_z_indices, batch_indices, ...]
+            context = context_candidates[best_z_indices, batch_indices, ...]
+
+            for step in range(selection_steps, effective_k):
+                step_recon, context = _rollout_step(best_z, context, step)
+                rollout_step_recons[:, step] = step_recon
+        else:
+            rollout_step_recons = selected_step_recons
+
+        recon = rollout_step_recons.mean()
         kl = kl_divergence(mu, sigma)
         loss = recon + kl_weight * kl
 
@@ -198,6 +260,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-context-len", type=int, default=8, help="Number of past/current frames used to condition decoder")
     parser.add_argument("--rollout-start-k", type=int, default=1, help="Initial autoregressive rollout length")
     parser.add_argument("--rollout-target-k", type=int, default=8, help="Target autoregressive rollout length")
+    parser.add_argument("--num-latent-samples", type=int, default=2, help="Number of sampled z per sample for best-of-N training")
+    parser.add_argument(
+        "--latent-selection-max-steps",
+        type=int,
+        default=8,
+        help="Max rollout steps used to pick best z (m); full rollout still uses selected z",
+    )
     parser.add_argument("--teacher-forcing-start-p", type=float, default=1.0, help="Initial teacher forcing probability")
     parser.add_argument("--teacher-forcing-end-p", type=float, default=0.2, help="Final teacher forcing probability")
     parser.add_argument("--curriculum-epochs", type=int, default=0, help="Epochs to ramp curriculum (0 uses total epochs)")
@@ -340,6 +409,8 @@ def build_checkpoint(
             "decoder_context_len": args.decoder_context_len,
             "rollout_start_k": args.rollout_start_k,
             "rollout_target_k": args.rollout_target_k,
+            "num_latent_samples": args.num_latent_samples,
+            "latent_selection_max_steps": args.latent_selection_max_steps,
             "teacher_forcing_start_p": args.teacher_forcing_start_p,
             "teacher_forcing_end_p": args.teacher_forcing_end_p,
             "curriculum_epochs": curriculum_epochs,
@@ -387,6 +458,10 @@ def main() -> None:
         raise ValueError("save_interval must be > 0")
     if args.rollout_start_k <= 0 or args.rollout_target_k <= 0:
         raise ValueError("rollout_start_k and rollout_target_k must be > 0")
+    if args.num_latent_samples <= 0:
+        raise ValueError("num_latent_samples must be > 0")
+    if args.latent_selection_max_steps <= 0:
+        raise ValueError("latent_selection_max_steps must be > 0")
     if not (0.0 <= args.teacher_forcing_start_p <= 1.0 and 0.0 <= args.teacher_forcing_end_p <= 1.0):
         raise ValueError("teacher forcing probabilities must be in [0, 1]")
 
@@ -527,6 +602,8 @@ def main() -> None:
                 kl_weight=args.kl_weight,
                 rollout_len=current_rollout_k,
                 teacher_forcing_prob=current_teacher_forcing_p,
+                num_latent_samples=args.num_latent_samples,
+                latent_selection_max_steps=args.latent_selection_max_steps,
             )
 
             with torch.no_grad():
@@ -542,6 +619,8 @@ def main() -> None:
                     kl_weight=args.kl_weight,
                     rollout_len=current_rollout_k,
                     teacher_forcing_prob=0.0,
+                    num_latent_samples=args.num_latent_samples,
+                    latent_selection_max_steps=args.latent_selection_max_steps,
                 )
 
             epoch_duration = time.perf_counter() - epoch_start
@@ -552,7 +631,8 @@ def main() -> None:
 
             _log_message(
                 f"Epoch {epoch:03d} | "
-                f"K={current_rollout_k}, tf_p={current_teacher_forcing_p:.3f} | "
+                f"K={current_rollout_k}, tf_p={current_teacher_forcing_p:.3f}, "
+                f"n_z={args.num_latent_samples}, m={args.latent_selection_max_steps} | "
                 f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, kl={train_kl:.6f} | "
                 f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f} | "
                 f"epoch_time={_format_hhmmss(epoch_duration)}, eta={_format_hhmmss(eta_seconds)}",
