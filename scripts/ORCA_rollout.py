@@ -16,7 +16,7 @@ from src.ORCASim import ORCASim
 from src.occupancy2d import Occupancy2d
 from src.rollout_data import AgentRollOutData, RollOutData, SceneRollOutData
 from src.rollout_setting import RollOutSetting
-from src.templates import default_templates, test_templates
+from src.templates import default_templates, test_templates, cross_templates
 
 
 # RollOutSetting is defined in src.rollout_setting
@@ -467,6 +467,7 @@ def build_scene_rollout_data(
 
 def animate_rollout(
     traj: np.ndarray,
+    velocities: np.ndarray,
     goals: np.ndarray,
     obstacles: List[ObstacleSpec],
     paths: List[PathSpec],
@@ -487,6 +488,9 @@ def animate_rollout(
     patches_mod = importlib.import_module("matplotlib.patches")
     FuncAnimation = animation_mod.FuncAnimation
     Polygon = patches_mod.Polygon
+
+    if traj.shape != velocities.shape:
+        raise ValueError("traj and velocities must have the same shape")
 
     num_steps, _, _ = traj.shape
     occ_steps = len(anchor_steps)
@@ -547,6 +551,18 @@ def animate_rollout(
         )
 
     scat = ax_traj.scatter(traj[anchor_steps[0], :, 0], traj[anchor_steps[0], :, 1], s=60, c="tab:blue")
+    vel_quiver = ax_traj.quiver(
+        traj[anchor_steps[0], :, 0],
+        traj[anchor_steps[0], :, 1],
+        velocities[anchor_steps[0], :, 0],
+        velocities[anchor_steps[0], :, 1],
+        color="tab:green",
+        angles="xy",
+        scale_units="xy",
+        scale=1.0,
+        width=0.004,
+        alpha=0.9,
+    )
     ax_traj.scatter(goals[:, 0], goals[:, 1], s=80, c="tab:red", marker="x")
     traj_time_text = ax_traj.text(0.02, 0.98, "", transform=ax_traj.transAxes, va="top")
 
@@ -650,8 +666,10 @@ def animate_rollout(
         anchor_step = anchor_steps[anchor_idx]
 
         scat.set_offsets(traj[sim_step])
+        vel_quiver.set_offsets(traj[sim_step])
+        vel_quiver.set_UVC(velocities[sim_step, :, 0], velocities[sim_step, :, 1])
         traj_time_text.set_text(f"t={sim_step * time_step:.2f}s")
-        artists = [scat, traj_time_text]
+        artists = [scat, vel_quiver, traj_time_text]
         for occ_idx, (im_static, time_text_static) in enumerate(zip(static_images, static_time_texts)):
             im_static.set_data(static_maps[occ_idx][anchor_idx])
             time_text_static.set_text(
@@ -697,6 +715,13 @@ def animate_rollout(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run an ORCA pedestrian rollout.")
+    parser.add_argument(
+        "--template-set",
+        type=str,
+        choices=["default", "test", "cross"],
+        default="cross",
+        help="Template function to use: default_templates, test_templates, or cross_templates.",
+    )
     parser.add_argument(
         "--animate",
         action="store_true",
@@ -749,6 +774,16 @@ def _resolve_data_dir(data_dir_arg: str | None) -> str:
     if data_dir_arg is None:
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
     return os.path.abspath(os.path.expanduser(data_dir_arg))
+
+
+def _select_templates(template_set: str):
+    if template_set == "default":
+        return default_templates(), "default"
+    if template_set == "test":
+        return test_templates(), "test"
+    if template_set == "cross":
+        return cross_templates(), "cross"
+    raise ValueError(f"Unknown template set: {template_set}")
 
 
 def _compute_variant_sets(
@@ -1005,32 +1040,36 @@ def main() -> None:
     # ORCASim configuration constants
     TIME_STEP = 0.1
     NUM_STEPS = 150
-    NEIGHBOR_DIST = 2.0
+    NEIGHBOR_DIST = 1.0
     MAX_NEIGHBORS = 5
     TIME_HORIZON = 3.0
     TIME_HORIZON_OBST = 5.0
     RADIUS = 0.3
-    MAX_SPEED = 5.0
+    MAX_SPEED = 3.0
     GOAL_TOLERANCE = 0.2
     PATH_GOAL_SWITCH_TOLERANCE = 3.0
     PATH_SEGMENT_REMAINING_SWITCH_RATIO = 0.05
     PREF_VELOCITY_NOISE_STD = 0.02
     PREF_VELOCITY_NOISE_INTERVAL = 3
     PREF_VELOCITY_NOISE_SEED = 0
+    LATERAL_CONTROL_GAIN = 1.0
+    LATERAL_CONTROL_MAX_SPEED = 1.0
     # Occupancy settings
     OCC_RESOLUTION = 0.1
     OCC_AGENT_RADIUS = 0.2
     OCC_LENGTH = 12.8
     OCC_WIDTH = 12.8
 
-    # premade templates are provided by `src.templates.default_templates()`
+    selected_templates, selected_template_set = _select_templates(args.template_set)
+    # premade templates are provided by src.templates
     rollout_setting = RollOutSetting(
-        templates=default_templates(),
-        # templates=test_templates(),
+        templates=selected_templates,
         mirror=False,
         rotate=False,
-        name="default",
+        name=selected_template_set,
     )
+
+    print(f"using template set: {selected_template_set}")
 
     global_scene_index = 0
     for tpl in rollout_setting.templates:
@@ -1066,6 +1105,8 @@ def main() -> None:
                 pref_velocity_noise_std=PREF_VELOCITY_NOISE_STD,
                 pref_velocity_noise_interval=PREF_VELOCITY_NOISE_INTERVAL,
                 pref_velocity_noise_seed=PREF_VELOCITY_NOISE_SEED + scene_index,
+                lateral_control_gain=LATERAL_CONTROL_GAIN,
+                lateral_control_max_speed=LATERAL_CONTROL_MAX_SPEED,
             )
             min_steps_for_occupancy = int(args.occ_past_frames) + int(args.occ_future_frames) + 1
             traj, vel_traj = orca_sim.simulate(
@@ -1196,6 +1237,7 @@ def main() -> None:
 
                 animate_rollout(
                     traj=traj,
+                    velocities=vel_traj,
                     goals=goals,
                     obstacles=scene.obstacles,
                     paths=scene.paths,

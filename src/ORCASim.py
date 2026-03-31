@@ -32,6 +32,8 @@ class ORCASim:
         pref_velocity_noise_std: float = 0.0,
         pref_velocity_noise_interval: int = 1,
         pref_velocity_noise_seed: int | None = 0,
+        lateral_control_gain: float = 1.0,
+        lateral_control_max_speed: float | None = None,
     ) -> None:
         """Initialize ORCA simulator and scene-dependent guidance parameters.
 
@@ -55,6 +57,9 @@ class ORCASim:
             pref_velocity_noise_interval: Number of simulation steps between noise
                 resampling events (must be >= 1).
             pref_velocity_noise_seed: Random seed for preferred-velocity noise.
+            lateral_control_gain: Proportional gain for path-lateral distance control.
+            lateral_control_max_speed: Absolute cap for lateral correction velocity.
+                If None, defaults to `0.5 * max_speed`.
         """
         if pref_velocity_noise_std < 0.0:
             raise ValueError("pref_velocity_noise_std must be >= 0")
@@ -69,6 +74,11 @@ class ORCASim:
         self.path_segment_remaining_switch_ratio = path_segment_remaining_switch_ratio
         self.pref_velocity_noise_std = float(pref_velocity_noise_std)
         self.pref_velocity_noise_interval = int(pref_velocity_noise_interval)
+        self.lateral_control_gain = float(lateral_control_gain)
+        if lateral_control_max_speed is None:
+            self.lateral_control_max_speed = 0.5 * self.max_speed
+        else:
+            self.lateral_control_max_speed = float(max(0.0, lateral_control_max_speed))
         self._pref_velocity_rng = np.random.default_rng(pref_velocity_noise_seed)
         self._pref_velocity_step_count = 0
         self.sim = rvo2.PyRVOSimulator(
@@ -83,6 +93,7 @@ class ORCASim:
         self.agent_desired_speeds: List[float] = []
         self.agent_direct_goal_latched: List[bool] = []
         self.agent_pref_velocity_noise: List[np.ndarray] = []
+        self.agent_reference_lateral_offsets: List[float | None] = []
         self._setup_obstacles()
         self.agent_ids = self._setup_agents()
         self._region_pairs_initialized = False
@@ -92,13 +103,96 @@ class ORCASim:
     def _setup_agents(self) -> List[int]:
         """Create ORCA agents from scene specifications and return simulator IDs."""
         ids: List[int] = []
-        for agent in self.scene.agents:
+        for idx, agent in enumerate(self.scene.agents):
             agent_id = self.sim.addAgent(agent.position)
             ids.append(agent_id)
             self.agent_desired_speeds.append(self.max_speed)
             self.agent_direct_goal_latched.append(False)
             self.agent_pref_velocity_noise.append(np.zeros(2, dtype=np.float32))
+            self._initialize_agent_lateral_state(
+                agent_index=idx,
+                initial_position=np.array(agent.position, dtype=np.float32),
+            )
         return ids
+
+    def _compute_signed_lateral_distance_to_path(
+        self,
+        point: np.ndarray,
+        path_points: list[tuple[float, float]],
+    ) -> float | None:
+        """Return signed distance from point to path using local path orientation."""
+        closest, path_direction, _, _ = self._closest_point_and_direction_on_path(point, path_points)
+        dir_norm = float(np.linalg.norm(path_direction))
+        if dir_norm <= 1e-6:
+            return None
+
+        unit_dir = (path_direction / dir_norm).astype(np.float32)
+        # Left-hand normal of path direction.
+        normal = np.array([-unit_dir[1], unit_dir[0]], dtype=np.float32)
+        signed_distance = float(np.dot(point - closest, normal))
+        return signed_distance
+
+    def _initialize_agent_lateral_state(
+        self,
+        agent_index: int,
+        initial_position: np.ndarray,
+    ) -> None:
+        """Record initial path-relative lateral offset for proportional control."""
+        path_index = getattr(self.scene.agents[agent_index], "path_index", None)
+        scene_paths = getattr(self.scene, "paths", [])
+
+        ref_offset: float | None = None
+        if path_index is not None and 0 <= path_index < len(scene_paths):
+            ref_offset = self._compute_signed_lateral_distance_to_path(
+                initial_position,
+                scene_paths[path_index].points,
+            )
+
+        self.agent_reference_lateral_offsets.append(ref_offset)
+
+    def _compute_lateral_control_velocity(
+        self,
+        agent_index: int,
+        pos: np.ndarray,
+        preferred_direction: np.ndarray,
+    ) -> np.ndarray:
+        """Compute proportional lateral correction that keeps initial path-relative offset."""
+        if self.lateral_control_max_speed <= 1e-9:
+            return np.zeros(2, dtype=np.float32)
+
+        path_index = getattr(self.scene.agents[agent_index], "path_index", None)
+        scene_paths = getattr(self.scene, "paths", [])
+        if path_index is None or path_index < 0 or path_index >= len(scene_paths):
+            return np.zeros(2, dtype=np.float32)
+
+        path_points = scene_paths[path_index].points
+        current_signed_offset = self._compute_signed_lateral_distance_to_path(pos, path_points)
+        if current_signed_offset is None:
+            return np.zeros(2, dtype=np.float32)
+
+        reference_offset = self.agent_reference_lateral_offsets[agent_index]
+        if reference_offset is None:
+            reference_offset = current_signed_offset
+            self.agent_reference_lateral_offsets[agent_index] = reference_offset
+
+        dir_norm = float(np.linalg.norm(preferred_direction))
+        if dir_norm <= 1e-6:
+            return np.zeros(2, dtype=np.float32)
+
+        error = float(reference_offset - current_signed_offset)
+        lateral_speed = self.lateral_control_gain * error
+        lateral_speed = float(
+            np.clip(
+                lateral_speed,
+                -self.lateral_control_max_speed,
+                self.lateral_control_max_speed,
+            )
+        )
+
+        unit_dir = (preferred_direction / dir_norm).astype(np.float32)
+        # Lateral correction is perpendicular to preferred direction.
+        lateral_unit = np.array([-unit_dir[1], unit_dir[0]], dtype=np.float32)
+        return lateral_unit * lateral_speed
 
     @staticmethod
     def _sample_point_in_region(region, rng: np.random.Generator) -> tuple[float, float]:
@@ -278,6 +372,11 @@ class ORCASim:
             direction = self._compute_preferred_direction(pos, goal, path_index, idx)
             desired_speed = self.agent_desired_speeds[idx]
             velocity = direction * desired_speed
+            velocity = velocity + self._compute_lateral_control_velocity(
+                agent_index=idx,
+                pos=pos,
+                preferred_direction=direction,
+            )
 
             if float(np.linalg.norm(direction)) > 1e-6 and self.pref_velocity_noise_std > 0.0:
                 velocity = velocity + self.agent_pref_velocity_noise[idx]
@@ -305,6 +404,10 @@ class ORCASim:
         self.agent_desired_speeds.append(sampled_speed)
         self.agent_direct_goal_latched.append(False)
         self.agent_pref_velocity_noise.append(np.zeros(2, dtype=np.float32))
+        self._initialize_agent_lateral_state(
+            agent_index=len(self.scene.agents) - 1,
+            initial_position=np.array(spawn_pos, dtype=np.float32),
+        )
         return agent_id
 
     def initialize_agents_from_region_pairs(self, seed: int | None = None) -> None:
