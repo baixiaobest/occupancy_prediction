@@ -9,7 +9,7 @@ from typing import Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from matplotlib.widgets import RadioButtons, Slider
+from matplotlib.widgets import CheckButtons, RadioButtons, Slider
 
 # Ensure project root is on sys.path so `from src...` works when running this script.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -472,8 +472,8 @@ def main() -> None:
     im_overlay_gt = ax_overlay_gt.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
 
     ax_past.set_title("Past + Static Stack")
-    ax_pred.set_title("Predicted Horizon Stack (Mode1=Red, Mode2=Green)")
-    ax_overlay_pred.set_title("Overlay: Static (Gray) + Past (Blue) + Pred1 (Red) + Pred2 (Green)")
+    ax_pred.set_title("Predicted Horizon Stack (Mode 0=Red, Mode 1=Green)")
+    ax_overlay_pred.set_title("Overlay: Static (Gray) + Past (Blue) + Mode0 (Red) + Mode1 (Green)")
     ax_overlay_gt.set_title("Overlay: Past (Blue) + GT Future (Green)")
 
     for ax in [ax_past, ax_pred, ax_overlay_pred, ax_overlay_gt]:
@@ -482,15 +482,17 @@ def main() -> None:
 
     # Sliders.
     slider_color = "lightgoldenrodyellow"
-    ax_mode = plt.axes([0.02, 0.12, 0.08, 0.10], facecolor=slider_color)
+    ax_mode = plt.axes([0.02, 0.10, 0.09, 0.14], facecolor=slider_color)
     ax_scene = plt.axes([0.12, 0.12, 0.18, 0.10], facecolor=slider_color)
     ax_origin = plt.axes([0.34, 0.17, 0.56, 0.03], facecolor=slider_color)
     ax_t = plt.axes([0.12, 0.09, 0.78, 0.03], facecolor=slider_color)
     ax_h = plt.axes([0.12, 0.04, 0.78, 0.03], facecolor=slider_color)
 
-    mode_radio = RadioButtons(ax_mode, labels=["1", "2"], active=0)
+    max_mode_count = 2
+    mode_labels = [f"Mode {i}" for i in range(max_mode_count)]
+    mode_checks = CheckButtons(ax_mode, labels=mode_labels, actives=[True, False])
     ax_mode.set_title("Modes", fontsize=9)
-    mode_state = {"count": 1}
+    mode_state = {"selected": {0}}
 
     scene_options = [str(i) for i in range(len(scene_sequences))]
     scene_radio = RadioButtons(ax_scene, labels=scene_options, active=init_scene)
@@ -528,10 +530,18 @@ def main() -> None:
         refresh(None)
 
     def _on_mode_select(selection: str) -> None:
-        try:
-            mode_state["count"] = int(selection)
-        except ValueError:
+        if selection not in mode_labels:
             return
+        mode_idx = mode_labels.index(selection)
+        selected_modes = mode_state["selected"]
+        if mode_idx in selected_modes:
+            if len(selected_modes) == 1:
+                # Keep at least one mode visible.
+                mode_checks.set_active(mode_idx)
+                return
+            selected_modes.remove(mode_idx)
+        else:
+            selected_modes.add(mode_idx)
         refresh(None)
 
     def refresh(_: float | None = None) -> None:
@@ -548,7 +558,7 @@ def main() -> None:
             return
 
         horizon = int(h_slider.val)
-        num_modalities = int(mode_state["count"])
+        selected_modes = sorted(mode_state["selected"])
 
         agent_anchor_count = int(scene_sequences[scene_idx][agent_idx].shape[0])
         anchor_max = max(0, agent_anchor_count - 1)
@@ -566,7 +576,7 @@ def main() -> None:
         static_seq = scene_static_maps[scene_idx][agent_idx][anchor_idx]
         t_total, h_img, w_img = seq.shape
 
-        preds = get_predictions(scene_idx, agent_idx, anchor_idx, horizon, num_modalities)
+        preds = get_predictions(scene_idx, agent_idx, anchor_idx, horizon, max_mode_count)
 
         t_anchor = int(history_len)
         past = seq[t_anchor - history_len : t_anchor]  # (history_len, H, W)
@@ -577,9 +587,10 @@ def main() -> None:
         pred_stack_2 = torch.zeros((h_img, w_img), dtype=torch.float32)
         if preds.shape[1] > 0:
             pred_index = 0
-            pred_seq_1 = preds[0, pred_index]  # (horizon, H, W)
-            pred_stack_1 = pred_seq_1.max(dim=0).values
-            if num_modalities > 1 and preds.shape[0] > 1:
+            if 0 in selected_modes and preds.shape[0] > 0:
+                pred_seq_1 = preds[0, pred_index]  # (horizon, H, W)
+                pred_stack_1 = pred_seq_1.max(dim=0).values
+            if 1 in selected_modes and preds.shape[0] > 1:
                 pred_seq_2 = preds[1, pred_index]
                 pred_stack_2 = pred_seq_2.max(dim=0).values
 
@@ -618,20 +629,21 @@ def main() -> None:
         im_overlay_gt.set_data(np.clip(overlay_gt, 0.0, 1.0))
 
         ax_past.set_title(f"Past+Static Stack (anchor={anchor_idx}, hist={history_len})")
-        ax_pred.set_title(f"Pred Stack (h={horizon}, modes={num_modalities})")
+        selected_label = ",".join(str(m) for m in selected_modes)
+        ax_pred.set_title(f"Pred Stack (h={horizon}, modes=[{selected_label}])")
 
         anchor_time = scene_anchor_times[scene_idx][agent_idx][anchor_idx]
 
-        total_infer = max(t_total - history_len, 0) * horizon * num_modalities
+        total_infer = max(t_total - history_len, 0) * horizon * max_mode_count
         info_text.set_text(
             f"scene={scene_idx} | agent={agent_idx} | anchor_idx={anchor_idx} | anchor_t={anchor_time} | "
             f"window_T={t_total} | horizon={horizon} | "
-            f"modes={num_modalities} | total inferences={total_infer}"
+            f"selected_modes=[{selected_label}] | total inferences={total_infer}"
         )
 
         fig.canvas.draw_idle()
 
-    mode_radio.on_clicked(_on_mode_select)
+    mode_checks.on_clicked(_on_mode_select)
     scene_radio.on_clicked(_on_scene_select)
     agent_slider.on_changed(refresh)
     t_slider.on_changed(refresh)

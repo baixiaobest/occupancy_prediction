@@ -64,3 +64,25 @@ def weighted_focal_recon_loss(
     if reduction == "none":
         return loss
     return loss.mean()
+
+
+def bernoulli_entropy_loss(
+    logits: torch.Tensor,
+    reduction: str = "mean",
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compute Bernoulli entropy from logits.
+
+    This is the per-cell predictive entropy:
+      H(p) = -p log p - (1-p) log(1-p), where p = sigmoid(logits).
+    """
+    if reduction not in ("mean", "none"):
+        raise ValueError("reduction must be one of: 'mean', 'none'")
+    if eps <= 0.0:
+        raise ValueError("eps must be > 0")
+
+    probs = torch.sigmoid(logits).clamp(min=eps, max=1.0 - eps)
+    entropy = -(probs * torch.log(probs) + (1.0 - probs) * torch.log(1.0 - probs))
+    if reduction == "none":
+        return entropy
+    return entropy.mean()

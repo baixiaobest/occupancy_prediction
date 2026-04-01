@@ -28,7 +28,13 @@ from src.VAE_prediction import (
     build_prediction_vae_models,
 )
 from src.Dataset import build_datasets
-from src.loss import kl_divergence, kl_target_loss, weighted_bernoulli_recon_loss, weighted_focal_recon_loss
+from src.loss import (
+    bernoulli_entropy_loss,
+    kl_divergence,
+    kl_target_loss,
+    weighted_bernoulli_recon_loss,
+    weighted_focal_recon_loss,
+)
 
 
 def get_rollout_length(
@@ -76,13 +82,14 @@ def run_epoch(
     recon_loss_type: str,
     occupied_weight: float,
     focal_gamma: float,
+    entropy_weight: float,
     kl_weight: float,
     target_kl: float,
     rollout_len: int,
     teacher_forcing_prob: float,
     num_latent_samples: int,
     latent_selection_max_steps: int,
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, float]:
     """Run one epoch (training or evaluation) over `loader`.
 
     If `optimizer` is provided the model parameters are updated (training
@@ -99,6 +106,7 @@ def run_epoch(
         recon_loss_type: Reconstruction loss type: `bce` or `focal`.
         occupied_weight: Absolute occupied-cell weight for both BCE and focal losses.
         focal_gamma: Focal exponent used to focus on hard examples.
+        entropy_weight: Weight for predictive entropy regularization.
         kl_weight: Weight to scale the KL objective when computing total loss.
         target_kl: Target KL value used in quadratic penalty `(KL - target_kl)^2`.
         rollout_len: Number of autoregressive steps used for reconstruction loss.
@@ -107,7 +115,7 @@ def run_epoch(
         latent_selection_max_steps: Max rollout steps used to choose best `z`.
 
     Returns:
-        A tuple `(avg_loss, avg_recon, avg_kl, avg_kl_objective)` averaged over batches.
+        A tuple `(avg_loss, avg_recon, avg_entropy, avg_kl, avg_kl_objective)` averaged over batches.
     """
     is_train = optimizer is not None
     encoder.train(is_train)
@@ -115,6 +123,7 @@ def run_epoch(
 
     total_loss = 0.0
     total_recon = 0.0
+    total_entropy = 0.0
     total_kl = 0.0
     total_kl_objective = 0.0
     total_batches = 0
@@ -140,7 +149,7 @@ def run_epoch(
             z_step: torch.Tensor,
             context_step: torch.Tensor,
             step: int,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             logits_full = decoder(z_step, context_step, x_static, current_velocity)
             logits_step = logits_full[:, :, :1]
             target_step = y[:, :, step : step + 1]
@@ -164,6 +173,8 @@ def run_epoch(
                 raise ValueError(f"Unsupported recon_loss_type: {recon_loss_type}")
 
             step_recon = step_recon_cells.reshape(batch_size, -1).mean(dim=1)
+            step_entropy_cells = bernoulli_entropy_loss(logits_step, reduction="none")
+            step_entropy = step_entropy_cells.reshape(batch_size, -1).mean(dim=1)
 
             pred_step = torch.sigmoid(logits_step.detach())
             if is_train and teacher_forcing_prob < 1.0:
@@ -175,9 +186,14 @@ def run_epoch(
                 feedback_step = target_step if teacher_forcing_prob >= 1.0 else pred_step
 
             next_context = torch.cat([context_step[:, :, 1:], feedback_step], dim=2)
-            return step_recon, next_context
+            return step_recon, step_entropy, next_context
 
         selection_step_recons = torch.empty(
+            (num_latent_samples, batch_size, selection_steps),
+            device=device,
+            dtype=y.dtype,
+        )
+        selection_step_entropies = torch.empty(
             (num_latent_samples, batch_size, selection_steps),
             device=device,
             dtype=y.dtype,
@@ -199,8 +215,9 @@ def run_epoch(
             context = x_decoder_dynamic.clone()
 
             for step in range(selection_steps):
-                step_recon, context = _rollout_step(z, context, step)
+                step_recon, step_entropy, context = _rollout_step(z, context, step)
                 selection_step_recons[z_idx, :, step] = step_recon
+                selection_step_entropies[z_idx, :, step] = step_entropy
 
             context_candidates[z_idx] = context
 
@@ -209,6 +226,7 @@ def run_epoch(
         batch_indices = torch.arange(batch_size, device=device)
 
         selected_step_recons = selection_step_recons[best_z_indices, batch_indices, :]
+        selected_step_entropies = selection_step_entropies[best_z_indices, batch_indices, :]
 
         if effective_k > selection_steps:
             rollout_step_recons = torch.empty(
@@ -216,21 +234,30 @@ def run_epoch(
                 device=device,
                 dtype=y.dtype,
             )
+            rollout_step_entropies = torch.empty(
+                (batch_size, effective_k),
+                device=device,
+                dtype=y.dtype,
+            )
             rollout_step_recons[:, :selection_steps] = selected_step_recons
+            rollout_step_entropies[:, :selection_steps] = selected_step_entropies
 
             best_z = z_candidates[best_z_indices, batch_indices, ...]
             context = context_candidates[best_z_indices, batch_indices, ...]
 
             for step in range(selection_steps, effective_k):
-                step_recon, context = _rollout_step(best_z, context, step)
+                step_recon, step_entropy, context = _rollout_step(best_z, context, step)
                 rollout_step_recons[:, step] = step_recon
+                rollout_step_entropies[:, step] = step_entropy
         else:
             rollout_step_recons = selected_step_recons
+            rollout_step_entropies = selected_step_entropies
 
         recon = rollout_step_recons.mean()
+        entropy = rollout_step_entropies.mean()
         kl = kl_divergence(mu, sigma)
         kl_objective = kl_target_loss(kl, target_kl=target_kl)
-        loss = recon + kl_weight * kl_objective
+        loss = recon + entropy_weight * entropy + kl_weight * kl_objective
 
         if is_train:
             loss.backward()
@@ -238,16 +265,18 @@ def run_epoch(
 
         total_loss += float(loss.item())
         total_recon += float(recon.item())
+        total_entropy += float(entropy.item())
         total_kl += float(kl.item())
         total_kl_objective += float(kl_objective.item())
         total_batches += 1
 
     if total_batches == 0:
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     return (
         total_loss / total_batches,
         total_recon / total_batches,
+        total_entropy / total_batches,
         total_kl / total_batches,
         total_kl_objective / total_batches,
     )
@@ -296,6 +325,12 @@ def parse_args() -> argparse.Namespace:
         help="Absolute occupied-cell weight for BCE/focal losses (>=1)",
     )
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (0 disables focal modulation)")
+    parser.add_argument(
+        "--entropy-weight",
+        type=float,
+        default=0.0,
+        help="Weight for per-cell Bernoulli entropy regularization over predicted frames",
+    )
     parser.add_argument("--kl-weight", type=float, default=1e-3)
     parser.add_argument("--target-kl", type=float, default=1.0, help="Target KL value used in quadratic KL objective")
     parser.add_argument("--latent-channel", type=int, default=128)
@@ -468,6 +503,8 @@ def main() -> None:
         raise ValueError("rollout_start_k and rollout_target_k must be > 0")
     if args.num_latent_samples <= 0:
         raise ValueError("num_latent_samples must be > 0")
+    if args.entropy_weight < 0.0:
+        raise ValueError("entropy_weight must be >= 0")
     if args.latent_selection_max_steps <= 0:
         raise ValueError("latent_selection_max_steps must be > 0")
     if not (0.0 <= args.teacher_forcing_start_p <= 1.0 and 0.0 <= args.teacher_forcing_end_p <= 1.0):
@@ -478,6 +515,20 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    wandb_run = None
+    if args.wandb:
+        if wandb is None:
+            raise ImportError("wandb is not installed. Install it with: pip install wandb")
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+            config=vars(args),
+        )
+
+    _log_message("Building datasets...", wandb_run=wandb_run)
     train_dataset, val_dataset, stats = build_datasets(
         data_dir=args.data_dir,
         val_ratio=args.val_ratio,
@@ -488,6 +539,7 @@ def main() -> None:
         seed=args.seed,
         lazy=args.lazy_data_load,
     )
+    _log_message(f"Datasets built.", wandb_run=wandb_run)
 
     if len(train_dataset) == 0:
         raise ValueError("No training samples were created. Check data and window parameters.")
@@ -561,19 +613,6 @@ def main() -> None:
         f"train_samples={stats.num_train_samples}, val_samples={stats.num_val_samples}",
     )
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-
-    wandb_run = None
-    if args.wandb:
-        if wandb is None:
-            raise ImportError("wandb is not installed. Install it with: pip install wandb")
-        wandb_run = wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-            config=vars(args),
-        )
-
     try:
         total_epoch_time = 0.0
         best_val_loss = float("inf")
@@ -598,7 +637,7 @@ def main() -> None:
                 ramp_epochs=curriculum_epochs,
             )
 
-            train_loss, train_recon, train_kl, train_kl_objective = run_epoch(
+            train_loss, train_recon, train_entropy, train_kl, train_kl_objective = run_epoch(
                 encoder,
                 decoder,
                 train_loader,
@@ -607,6 +646,7 @@ def main() -> None:
                 recon_loss_type=args.recon_loss_type,
                 occupied_weight=args.occupied_weight,
                 focal_gamma=args.focal_gamma,
+                entropy_weight=args.entropy_weight,
                 kl_weight=args.kl_weight,
                 target_kl=args.target_kl,
                 rollout_len=current_rollout_k,
@@ -616,7 +656,7 @@ def main() -> None:
             )
 
             with torch.no_grad():
-                val_loss, val_recon, val_kl, val_kl_objective = run_epoch(
+                val_loss, val_recon, val_entropy, val_kl, val_kl_objective = run_epoch(
                     encoder,
                     decoder,
                     val_loader,
@@ -625,6 +665,7 @@ def main() -> None:
                     recon_loss_type=args.recon_loss_type,
                     occupied_weight=args.occupied_weight,
                     focal_gamma=args.focal_gamma,
+                    entropy_weight=args.entropy_weight,
                     kl_weight=args.kl_weight,
                     target_kl=args.target_kl,
                     rollout_len=current_rollout_k,
@@ -643,8 +684,8 @@ def main() -> None:
                 f"Epoch {epoch:03d} | "
                 f"K={current_rollout_k}, tf_p={current_teacher_forcing_p:.3f}, "
                 f"n_z={args.num_latent_samples}, m={args.latent_selection_max_steps} | "
-                f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, kl={train_kl:.6f}, kl_obj={train_kl_objective:.6f} | "
-                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f}, kl_obj={val_kl_objective:.6f} | "
+                f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, entropy={train_entropy:.6f}, kl={train_kl:.6f}, kl_obj={train_kl_objective:.6f} | "
+                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, entropy={val_entropy:.6f}, kl={val_kl:.6f}, kl_obj={val_kl_objective:.6f} | "
                 f"epoch_time={_format_hhmmss(epoch_duration)}, eta={_format_hhmmss(eta_seconds)}",
                 wandb_run=wandb_run,
             )
@@ -686,12 +727,15 @@ def main() -> None:
                         "epoch": epoch,
                         "train/loss": train_loss,
                         "train/recon": train_recon,
+                        "train/entropy": train_entropy,
                         "train/kl": train_kl,
                         "train/kl_objective": train_kl_objective,
                         "val/loss": val_loss,
                         "val/recon": val_recon,
+                        "val/entropy": val_entropy,
                         "val/kl": val_kl,
                         "val/kl_objective": val_kl_objective,
+                        "loss/entropy_weight": args.entropy_weight,
                         "kl/target": args.target_kl,
                         "curriculum/rollout_k": current_rollout_k,
                         "curriculum/teacher_forcing_p": current_teacher_forcing_p,
