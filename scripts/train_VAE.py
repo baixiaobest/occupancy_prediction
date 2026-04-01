@@ -89,7 +89,8 @@ def run_epoch(
     teacher_forcing_prob: float,
     num_latent_samples: int,
     latent_selection_max_steps: int,
-) -> tuple[float, float, float, float, float]:
+    z_separation_weight: float,
+) -> tuple[float, float, float, float, float, float]:
     """Run one epoch (training or evaluation) over `loader`.
 
     If `optimizer` is provided the model parameters are updated (training
@@ -113,9 +114,10 @@ def run_epoch(
         teacher_forcing_prob: Probability of feeding GT at each rollout step.
         num_latent_samples: Number of latent samples (`z`) to evaluate per sample.
         latent_selection_max_steps: Max rollout steps used to choose best `z`.
+        z_separation_weight: Weight for latent/prediction separation regularizer.
 
     Returns:
-        A tuple `(avg_loss, avg_recon, avg_entropy, avg_kl, avg_kl_objective)` averaged over batches.
+        A tuple `(avg_loss, avg_recon, avg_entropy, avg_kl, avg_kl_objective, avg_z_separation)` averaged over batches.
     """
     is_train = optimizer is not None
     encoder.train(is_train)
@@ -126,6 +128,7 @@ def run_epoch(
     total_entropy = 0.0
     total_kl = 0.0
     total_kl_objective = 0.0
+    total_z_separation = 0.0
     total_batches = 0
 
     for x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y in loader:
@@ -149,7 +152,7 @@ def run_epoch(
             z_step: torch.Tensor,
             context_step: torch.Tensor,
             step: int,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             logits_full = decoder(z_step, context_step, x_static, current_velocity)
             logits_step = logits_full[:, :, :1]
             target_step = y[:, :, step : step + 1]
@@ -186,7 +189,7 @@ def run_epoch(
                 feedback_step = target_step if teacher_forcing_prob >= 1.0 else pred_step
 
             next_context = torch.cat([context_step[:, :, 1:], feedback_step], dim=2)
-            return step_recon, step_entropy, next_context
+            return step_recon, step_entropy, next_context, torch.sigmoid(logits_step)
 
         selection_step_recons = torch.empty(
             (num_latent_samples, batch_size, selection_steps),
@@ -208,6 +211,11 @@ def run_epoch(
             device=device,
             dtype=x_decoder_dynamic.dtype,
         )
+        selection_step_probs = torch.empty(
+            (num_latent_samples, batch_size, selection_steps, y.shape[1], y.shape[3], y.shape[4]),
+            device=device,
+            dtype=y.dtype,
+        )
 
         for z_idx in range(num_latent_samples):
             z = encoder.sample(mu, sigma)
@@ -215,11 +223,27 @@ def run_epoch(
             context = x_decoder_dynamic.clone()
 
             for step in range(selection_steps):
-                step_recon, step_entropy, context = _rollout_step(z, context, step)
+                step_recon, step_entropy, context, step_prob = _rollout_step(z, context, step)
                 selection_step_recons[z_idx, :, step] = step_recon
                 selection_step_entropies[z_idx, :, step] = step_entropy
+                selection_step_probs[z_idx, :, step] = step_prob.squeeze(2)
 
             context_candidates[z_idx] = context
+
+        if z_separation_weight > 0.0 and num_latent_samples > 1:
+            z_flat = z_candidates.reshape(num_latent_samples, batch_size, -1)
+            probs_flat = selection_step_probs.reshape(num_latent_samples, batch_size, -1)
+
+            pred_diff_sq = (probs_flat.unsqueeze(1) - probs_flat.unsqueeze(0)).square().mean(dim=-1)
+            z_dist = (z_flat.unsqueeze(1) - z_flat.unsqueeze(0)).abs().mean(dim=-1)
+
+            pair_i, pair_j = torch.triu_indices(num_latent_samples, num_latent_samples, offset=1, device=device)
+            pairwise_weighted_sep = z_dist[pair_i, pair_j] * pred_diff_sq[pair_i, pair_j]
+            z_separation = pairwise_weighted_sep.mean()
+            z_separation_loss = -z_separation_weight * z_separation
+        else:
+            z_separation = torch.zeros((), device=device, dtype=y.dtype)
+            z_separation_loss = torch.zeros((), device=device, dtype=y.dtype)
 
         z_selection_losses = selection_step_recons.mean(dim=2)
         best_z_indices = z_selection_losses.argmin(dim=0)
@@ -253,11 +277,15 @@ def run_epoch(
             rollout_step_recons = selected_step_recons
             rollout_step_entropies = selected_step_entropies
 
+        del selection_step_probs
+
         recon = rollout_step_recons.mean()
         entropy = rollout_step_entropies.mean()
         kl = kl_divergence(mu, sigma)
         kl_objective = kl_target_loss(kl, target_kl=target_kl)
-        loss = recon + entropy_weight * entropy + kl_weight * kl_objective
+        loss = recon + entropy_weight * entropy + kl_weight * kl_objective + z_separation_loss
+
+        del selection_step_recons, selection_step_entropies, z_candidates, context_candidates
 
         if is_train:
             loss.backward()
@@ -268,10 +296,11 @@ def run_epoch(
         total_entropy += float(entropy.item())
         total_kl += float(kl.item())
         total_kl_objective += float(kl_objective.item())
+        total_z_separation += float(z_separation.item())
         total_batches += 1
 
     if total_batches == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     return (
         total_loss / total_batches,
@@ -279,6 +308,7 @@ def run_epoch(
         total_entropy / total_batches,
         total_kl / total_batches,
         total_kl_objective / total_batches,
+        total_z_separation / total_batches,
     )
 
 
@@ -330,6 +360,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Weight for per-cell Bernoulli entropy regularization over predicted frames",
+    )
+    parser.add_argument(
+        "--z-separation-weight",
+        type=float,
+        default=0.0,
+        help="Weight for encouraging different sampled z to produce different predictions",
     )
     parser.add_argument("--kl-weight", type=float, default=1e-3)
     parser.add_argument("--target-kl", type=float, default=1.0, help="Target KL value used in quadratic KL objective")
@@ -456,6 +492,7 @@ def build_checkpoint(
             "teacher_forcing_start_p": args.teacher_forcing_start_p,
             "teacher_forcing_end_p": args.teacher_forcing_end_p,
             "target_kl": args.target_kl,
+            "z_separation_weight": args.z_separation_weight,
             "curriculum_epochs": curriculum_epochs,
             "latent_channel": args.latent_channel,
             "channels": list(args.channels),
@@ -505,6 +542,8 @@ def main() -> None:
         raise ValueError("num_latent_samples must be > 0")
     if args.entropy_weight < 0.0:
         raise ValueError("entropy_weight must be >= 0")
+    if args.z_separation_weight < 0.0:
+        raise ValueError("z_separation_weight must be >= 0")
     if args.latent_selection_max_steps <= 0:
         raise ValueError("latent_selection_max_steps must be > 0")
     if not (0.0 <= args.teacher_forcing_start_p <= 1.0 and 0.0 <= args.teacher_forcing_end_p <= 1.0):
@@ -637,7 +676,7 @@ def main() -> None:
                 ramp_epochs=curriculum_epochs,
             )
 
-            train_loss, train_recon, train_entropy, train_kl, train_kl_objective = run_epoch(
+            train_loss, train_recon, train_entropy, train_kl, train_kl_objective, train_z_separation = run_epoch(
                 encoder,
                 decoder,
                 train_loader,
@@ -653,10 +692,11 @@ def main() -> None:
                 teacher_forcing_prob=current_teacher_forcing_p,
                 num_latent_samples=args.num_latent_samples,
                 latent_selection_max_steps=args.latent_selection_max_steps,
+                z_separation_weight=args.z_separation_weight,
             )
 
             with torch.no_grad():
-                val_loss, val_recon, val_entropy, val_kl, val_kl_objective = run_epoch(
+                val_loss, val_recon, val_entropy, val_kl, val_kl_objective, val_z_separation = run_epoch(
                     encoder,
                     decoder,
                     val_loader,
@@ -672,6 +712,7 @@ def main() -> None:
                     teacher_forcing_prob=current_teacher_forcing_p,
                     num_latent_samples=args.num_latent_samples,
                     latent_selection_max_steps=args.latent_selection_max_steps,
+                    z_separation_weight=args.z_separation_weight,
                 )
 
             epoch_duration = time.perf_counter() - epoch_start
@@ -684,8 +725,8 @@ def main() -> None:
                 f"Epoch {epoch:03d} | "
                 f"K={current_rollout_k}, tf_p={current_teacher_forcing_p:.3f}, "
                 f"n_z={args.num_latent_samples}, m={args.latent_selection_max_steps} | "
-                f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, entropy={train_entropy:.6f}, kl={train_kl:.6f}, kl_obj={train_kl_objective:.6f} | "
-                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, entropy={val_entropy:.6f}, kl={val_kl:.6f}, kl_obj={val_kl_objective:.6f} | "
+                f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, entropy={train_entropy:.6f}, kl={train_kl:.6f}, kl_obj={train_kl_objective:.6f}, z_sep={train_z_separation:.6f} | "
+                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, entropy={val_entropy:.6f}, kl={val_kl:.6f}, kl_obj={val_kl_objective:.6f}, z_sep={val_z_separation:.6f} | "
                 f"epoch_time={_format_hhmmss(epoch_duration)}, eta={_format_hhmmss(eta_seconds)}",
                 wandb_run=wandb_run,
             )
@@ -730,12 +771,15 @@ def main() -> None:
                         "train/entropy": train_entropy,
                         "train/kl": train_kl,
                         "train/kl_objective": train_kl_objective,
+                        "train/z_separation": train_z_separation,
                         "val/loss": val_loss,
                         "val/recon": val_recon,
                         "val/entropy": val_entropy,
                         "val/kl": val_kl,
                         "val/kl_objective": val_kl_objective,
+                        "val/z_separation": val_z_separation,
                         "loss/entropy_weight": args.entropy_weight,
+                        "loss/z_separation_weight": args.z_separation_weight,
                         "kl/target": args.target_kl,
                         "curriculum/rollout_k": current_rollout_k,
                         "curriculum/teacher_forcing_p": current_teacher_forcing_p,
