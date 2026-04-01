@@ -9,7 +9,7 @@ from typing import Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from matplotlib.widgets import CheckButtons, RadioButtons, Slider
+from matplotlib.widgets import Button, CheckButtons, RadioButtons, Slider
 
 # Ensure project root is on sys.path so `from src...` works when running this script.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -462,7 +462,7 @@ def main() -> None:
     # Build figure and axes.
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     ax_past, ax_pred, ax_overlay_pred, ax_overlay_gt = axes.flatten()
-    plt.subplots_adjust(bottom=0.25)
+    plt.subplots_adjust(bottom=0.30)
 
     zero_rgb = np.zeros((init_h, init_w, 3), dtype=np.float32)
     # Occupancy is cell-discrete; nearest interpolation prevents visual blurring.
@@ -487,6 +487,7 @@ def main() -> None:
     ax_origin = plt.axes([0.34, 0.17, 0.56, 0.03], facecolor=slider_color)
     ax_t = plt.axes([0.12, 0.09, 0.78, 0.03], facecolor=slider_color)
     ax_h = plt.axes([0.12, 0.04, 0.78, 0.03], facecolor=slider_color)
+    ax_resample = plt.axes([0.02, 0.03, 0.09, 0.05])
 
     max_mode_count = 2
     mode_labels = [f"Mode {i}" for i in range(max_mode_count)]
@@ -519,6 +520,7 @@ def main() -> None:
         valinit=clamp_int(args.horizon, 1, max(1, args.max_horizon)),
         valstep=1,
     )
+    resample_button = Button(ax_resample, "Resample z")
 
     info_text = fig.text(0.02, 0.96, "", fontsize=10, va="top")
 
@@ -643,11 +645,17 @@ def main() -> None:
 
         fig.canvas.draw_idle()
 
+    def _on_resample_click(_: object) -> None:
+        cache.clear()
+        print("Cleared prediction cache; recomputing with freshly sampled latent z.")
+        refresh(None)
+
     mode_checks.on_clicked(_on_mode_select)
     scene_radio.on_clicked(_on_scene_select)
     agent_slider.on_changed(refresh)
     t_slider.on_changed(refresh)
     h_slider.on_changed(refresh)
+    resample_button.on_clicked(_on_resample_click)
 
     refresh(None)
     plt.show()
