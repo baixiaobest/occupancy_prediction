@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.occupancy_patch import slice_centered_patch
 from src.rollout_data import RollOutData, SceneRollOutData
 
 
@@ -168,70 +168,27 @@ class LazyOccupancyWindowDataset(_OccupancyWindowBase):
         dynamic_frames: list[torch.Tensor] = []
         for absolute_t in range(int(ref.start_t), int(ref.end_t)):
             dynamic_frames.append(
-                _slice_centered_patch_binary(
+                slice_centered_patch(
                     ref.dynamic_global[absolute_t],
                     ref.center_xy,
                     ref.scene_origin,
                     ref.resolution_xy,
                     ref.patch_shape,
+                    binary=True,
                     prefer_view=True,
                 )
             )
         seq = torch.stack(dynamic_frames, dim=0)
-        static_local = _slice_centered_patch_binary(
+        static_local = slice_centered_patch(
             ref.static_global,
             ref.center_xy,
             ref.scene_origin,
             ref.resolution_xy,
             ref.patch_shape,
+            binary=True,
             prefer_view=True,
         )
         return self._format_model_io(seq, static_local, ref.velocity_window)
-
-
-def _slice_centered_patch_binary(
-    grid: torch.Tensor,
-    center_xy: torch.Tensor,
-    origin_xy: tuple[float, float],
-    resolution_xy: tuple[float, float],
-    patch_shape: tuple[int, int],
-    *,
-    prefer_view: bool,
-) -> torch.Tensor:
-    """Slice local patch as binary float tensor.
-
-    When `prefer_view` is True and the full patch is in-bounds, return a view.
-    Otherwise return a zero-padded copy.
-    """
-    patch_h, patch_w = patch_shape
-    res_x, res_y = float(resolution_xy[0]), float(resolution_xy[1])
-    center_x = float(center_xy[0].item())
-    center_y = float(center_xy[1].item())
-    half_w = 0.5 * patch_w * res_x
-    half_h = 0.5 * patch_h * res_y
-
-    start_x = int(np.floor((center_x - half_w - origin_xy[0]) / res_x))
-    start_y = int(np.floor((center_y - half_h - origin_xy[1]) / res_y))
-    end_x = start_x + patch_w
-    end_y = start_y + patch_h
-
-    if prefer_view and start_x >= 0 and start_y >= 0 and end_x <= grid.shape[1] and end_y <= grid.shape[0]:
-        return (grid[start_y:end_y, start_x:end_x] > 0).float()
-
-    out = torch.zeros((patch_h, patch_w), dtype=torch.float32)
-    src_x0 = max(0, start_x)
-    src_y0 = max(0, start_y)
-    src_x1 = min(grid.shape[1], end_x)
-    src_y1 = min(grid.shape[0], end_y)
-    if src_x1 <= src_x0 or src_y1 <= src_y0:
-        return out
-
-    dst_x0 = src_x0 - start_x
-    dst_y0 = src_y0 - start_y
-    dst_x1 = dst_x0 + (src_x1 - src_x0)
-    dst_y1 = dst_y0 + (src_y1 - src_y0)
-    out[dst_y0:dst_y1, dst_x0:dst_x1] = grid[src_y0:src_y1, src_x0:src_x1]
-    return (out > 0).float()
 
 
 class DatasetBuilder:
@@ -408,24 +365,26 @@ class DatasetBuilder:
                 dynamic_maps,
                 scene_velocity_trajectories,
             ):
-                static_local = _slice_centered_patch_binary(
+                static_local = slice_centered_patch(
                     grid=scene_static,
                     center_xy=center_xy,
                     origin_xy=scene_origin,
                     resolution_xy=resolution_xy,
                     patch_shape=patch_shape,
+                    binary=True,
                     prefer_view=False,
                 )
 
                 dynamic_window: list[torch.Tensor] = []
                 for absolute_t in range(start_t, end_t):
                     dynamic_global_t = self._to_2d_binary(agent_dynamic[absolute_t])
-                    dynamic_local_t = _slice_centered_patch_binary(
+                    dynamic_local_t = slice_centered_patch(
                         grid=dynamic_global_t,
                         center_xy=center_xy,
                         origin_xy=scene_origin,
                         resolution_xy=resolution_xy,
                         patch_shape=patch_shape,
+                        binary=True,
                         prefer_view=False,
                     )
                     dynamic_window.append(dynamic_local_t)
