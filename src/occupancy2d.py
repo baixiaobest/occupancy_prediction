@@ -21,7 +21,6 @@ class Occupancy2d:
 		trajectory: np.ndarray | torch.Tensor | None = None,
 		static_obstacles: Sequence[object] | None = None,
 		agent_radius: float = 0.3,
-		center: Tuple[float, float] | torch.Tensor | None = None,
 	) -> None:
 		self.resolution = _to_tensor(resolution)
 		self.size = _to_tensor(size)
@@ -38,75 +37,92 @@ class Occupancy2d:
 		if self.agent_radius < 0:
 			raise ValueError("agent_radius must be non-negative")
 
-		default_center = self.size * 0.5
-		if center is not None:
-			center_tensor = _to_tensor(center)
-		else:
-			center_tensor = default_center
-
-		if center_tensor.numel() != 2:
-			raise ValueError("center must have exactly two elements")
-
-		self.center = center_tensor.to(dtype=torch.float32)
-
 	def update_inputs(
 		self,
-		trajectory: np.ndarray | torch.Tensor,
+		trajectory: np.ndarray | torch.Tensor | None,
 		static_obstacles: Sequence[object] | None = None,
 	) -> None:
-		self.trajectory = _to_float_tensor(trajectory)
+		self.trajectory = _to_float_tensor(trajectory) if trajectory is not None else None
 		if static_obstacles is not None:
 			self.static_obstacles = _normalize_obstacles(static_obstacles)
 
-	def generate(self) -> List[torch.Tensor]:
+	def generate(
+		self,
+		center_offset: Tuple[float, float] | torch.Tensor | None = None,
+	) -> List[torch.Tensor]:
 		"""Generate a list of occupancy grids (one per timestep).
+
+		Args:
+			center_offset: optional absolute grid center (x, y) in world coordinates.
+				When omitted, center defaults to (0.0, 0.0).
 
 		Returns:
 			List[torch.Tensor]: each grid has shape (H, W), with 1 occupied and 0 free.
 		"""
-		if self.trajectory is None:
-			raise ValueError("trajectory is not set. Call update_inputs() or pass it in __init__.")
-
-		if self.trajectory.ndim != 3 or self.trajectory.shape[-1] != 2:
-			raise ValueError("trajectory must have shape (T, N, 2)")
-
 		cells_x = int(torch.floor(self.size[0] / self.resolution[0]).item())
 		cells_y = int(torch.floor(self.size[1] / self.resolution[1]).item())
 
 		if cells_x <= 0 or cells_y <= 0:
 			raise ValueError("size/resolution yields non-positive grid dimensions")
 
-		trajectory = self.trajectory.to(dtype=torch.float32)
-		device = trajectory.device
+		if self.trajectory is not None:
+			if self.trajectory.ndim != 3 or self.trajectory.shape[-1] != 2:
+				raise ValueError("trajectory must have shape (T, N, 2)")
+			trajectory = self.trajectory.to(dtype=torch.float32)
+			device = trajectory.device
+			num_steps = int(trajectory.shape[0])
+			num_agents = int(trajectory.shape[1])
+		else:
+			trajectory = None
+			device = self.resolution.device
+			num_steps = 1
+			num_agents = 0
+
+		if center_offset is not None:
+			offset_tensor = _to_tensor(center_offset, device=device).to(dtype=torch.float32)
+			if offset_tensor.numel() != 2:
+				raise ValueError("center_offset must have exactly two elements")
+			grid_center = offset_tensor
+		else:
+			grid_center = torch.zeros(2, device=device, dtype=torch.float32)
 
 		grids: List[torch.Tensor] = []
-		for t in range(trajectory.shape[0]):
+		for t in range(num_steps):
 			grid = torch.zeros((cells_y, cells_x), dtype=torch.uint8, device=device)
 
 			# Static obstacles are present in every frame.
 			for polygon in self.static_obstacles:
-				self._rasterize_polygon(grid, polygon)
+				self._rasterize_polygon(grid, polygon, grid_center)
 
 			# Dynamic occupancy from agent positions at this timestep.
-			for n in range(trajectory.shape[1]):
-				self._rasterize_agent(grid, trajectory[t, n])
+			for n in range(num_agents):
+				self._rasterize_agent(grid, trajectory[t, n], grid_center)
 
 			grids.append(grid)
 
 		return grids
 
-	def _rasterize_agent(self, grid: torch.Tensor, position: torch.Tensor) -> None:
+	def _rasterize_agent(
+		self,
+		grid: torch.Tensor,
+		position: torch.Tensor,
+		grid_center: torch.Tensor,
+	) -> None:
 		half_size = torch.tensor(
 			[self.agent_radius, self.agent_radius], device=grid.device, dtype=torch.float32
 		)
-		self._rasterize_box(grid, position.to(grid.device), half_size)
+		self._rasterize_box(grid, position.to(grid.device), half_size, grid_center)
 
 	def _rasterize_box(
-		self, grid: torch.Tensor, center_xy: torch.Tensor, half_size_xy: torch.Tensor
+		self,
+		grid: torch.Tensor,
+		center_xy: torch.Tensor,
+		half_size_xy: torch.Tensor,
+		grid_center: torch.Tensor,
 	) -> None:
 		cells_y, cells_x = grid.shape
 		resolution = self.resolution.to(device=grid.device, dtype=torch.float32)
-		grid_min = (self.center - self.size * 0.5).to(device=grid.device, dtype=torch.float32)
+		grid_min = (grid_center - self.size * 0.5).to(device=grid.device, dtype=torch.float32)
 		grid_max = grid_min + torch.tensor(
 			[cells_x, cells_y], device=grid.device, dtype=torch.float32
 		) * resolution
@@ -135,7 +151,12 @@ class Occupancy2d:
 
 		grid[min_iy : max_iy + 1, min_ix : max_ix + 1] = 1
 
-	def _rasterize_polygon(self, grid: torch.Tensor, polygon: List[Tuple[float, float]]) -> None:
+	def _rasterize_polygon(
+		self,
+		grid: torch.Tensor,
+		polygon: List[Tuple[float, float]],
+		grid_center: torch.Tensor,
+	) -> None:
 		if len(polygon) < 3:
 			return
 
@@ -149,8 +170,8 @@ class Occupancy2d:
 
 		res_x = float(self.resolution[0].item())
 		res_y = float(self.resolution[1].item())
-		grid_min_x = float((self.center[0] - self.size[0] * 0.5).item())
-		grid_min_y = float((self.center[1] - self.size[1] * 0.5).item())
+		grid_min_x = float((grid_center[0] - self.size[0] * 0.5).item())
+		grid_min_y = float((grid_center[1] - self.size[1] * 0.5).item())
 
 		min_ix = max(0, int(np.floor((min_x - grid_min_x) / res_x)))
 		max_ix = min(cells_x - 1, int(np.floor((max_x - grid_min_x) / res_x)))
@@ -234,14 +255,25 @@ def main() -> None:
 		static_obstacles=static_obstacles,
 		agent_radius=0.25,
 	)
-	grids = occ2d.generate()
-	occ = grids[-1].cpu().numpy()
+	grids_default = occ2d.generate()
+	occ_default = grids_default[-1].cpu().numpy()
+	offset = np.array([2.5, -2.0], dtype=np.float32)
+	grids_offset = occ2d.generate(center_offset=tuple(offset.tolist()))
+	occ_offset = grids_offset[-1].cpu().numpy()
 
-	plt.figure(figsize=(6, 6))
-	plt.imshow(occ, origin="lower", cmap="gray_r")
-	plt.title("Occupancy Grid")
-	plt.xlabel("X")
-	plt.ylabel("Y")
+	fig, axes = plt.subplots(1, 2, figsize=(10, 5), squeeze=False)
+	ax_default = axes[0, 0]
+	ax_offset = axes[0, 1]
+
+	ax_default.imshow(occ_default, origin="lower", cmap="gray_r", vmin=0, vmax=1)
+	ax_default.set_title("Default Center")
+	ax_default.set_xlabel("X cell")
+	ax_default.set_ylabel("Y cell")
+
+	ax_offset.imshow(occ_offset, origin="lower", cmap="gray_r", vmin=0, vmax=1)
+	ax_offset.set_title(f"Offset Center (dx={offset[0]:.1f}, dy={offset[1]:.1f})")
+	ax_offset.set_xlabel("X cell")
+	ax_offset.set_ylabel("Y cell")
 	plt.tight_layout()
 	plt.show()
 

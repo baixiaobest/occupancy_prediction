@@ -1,15 +1,48 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
 
 import torch
 
 
 @dataclass
-class RollOutData:
-    """Stored rollout data containing static+dynamic occupancy and timestep length."""
+class AgentRollOutData:
+    """Compact per-agent metadata for one scene rollout."""
 
-    static_maps: List[torch.Tensor]
-    dynamic_grids: List[List[torch.Tensor]]
+    agent_index: int
+    anchor_times: List[int] = field(default_factory=list)
+    anchor_centers: torch.Tensor | None = None
+    current_velocities: torch.Tensor | None = None
+
+
+@dataclass
+class SceneRollOutData:
+    """Stored rollout payload for one scene.
+
+        Compact hierarchy:
+        - scene_static_map: one static map for the full scene canvas.
+        - scene_dynamic_maps: global dynamic occupancy with shape
+            (num_agents, total_time, H, W).
+            `scene_dynamic_maps[i, t]` is the global occupancy map at absolute
+            timestep `t` with centered agent `i` removed.
+        - agents[agent_index] contains anchor_times + anchor_centers + current_velocities.
+        - local_map_shape gives the local crop size (H, W) used by dataset loading.
+    """
+
     dt: float
+    occupancy_resolution: Tuple[float, float]
+    occupancy_origin: Tuple[float, float]
+    frame_offsets: List[int]
+    agents: Dict[int, AgentRollOutData] = field(default_factory=dict)
+    scene_static_map: torch.Tensor | None = None
+    scene_dynamic_maps: torch.Tensor | None = None
+    scene_map_origin: Tuple[float, float] | None = None
+    local_map_shape: Tuple[int, int] | None = None
+
+
+@dataclass
+class RollOutData:
+    """Top-level rollout payload containing multiple scenes."""
+
+    scenes: List[SceneRollOutData] = field(default_factory=list)

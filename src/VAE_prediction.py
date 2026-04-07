@@ -24,6 +24,7 @@ DEFAULT_UPSAMPLE_STRIDES: tuple[tuple[int, int], ...] = (
 )
 
 DEFAULT_UPSAMPLE_CHANNELS: tuple[int, ...] = (128, 64, 32, 16, 8, 4)
+HUMAN_WALKING_SPEED_MPS: float = 1.4
 
 
 def _to_stride2(value: int | Sequence[int]) -> tuple[int, int]:
@@ -127,6 +128,8 @@ class VAEPredictionEncoder(nn.Module):
         latent_channel: int,
         channels: Sequence[int] = (32, 64, 128, 128, 128, 128),
         static_stem_channels: int = 8,
+        velocity_mlp_dim: int = 16,
+        velocity_condition_channels: int = 4,
         downsample_strides: Sequence[int | Sequence[int]] = DEFAULT_DOWNSAMPLE_STRIDES,
     ) -> None:
         super().__init__()
@@ -145,6 +148,12 @@ class VAEPredictionEncoder(nn.Module):
         self.static_stem_channels = int(static_stem_channels)
         if self.static_stem_channels <= 0:
             raise ValueError("static_stem_channels must be > 0")
+        self.velocity_mlp_dim = int(velocity_mlp_dim)
+        self.velocity_condition_channels = int(velocity_condition_channels)
+        if self.velocity_mlp_dim <= 0:
+            raise ValueError("velocity_mlp_dim must be > 0")
+        if self.velocity_condition_channels < 0:
+            raise ValueError("velocity_condition_channels must be >= 0")
 
         self.channels = [int(c) for c in channels]
         if len(self.channels) < 2:
@@ -167,8 +176,17 @@ class VAEPredictionEncoder(nn.Module):
             nn.BatchNorm2d(self.static_stem_channels),
             nn.ReLU(inplace=True),
         )
+        if self.velocity_condition_channels > 0:
+            self.velocity_mlp = nn.Sequential(
+                nn.Linear(2, self.velocity_mlp_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.velocity_mlp_dim, self.velocity_condition_channels),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.velocity_mlp = None
         down_blocks: list[nn.Module] = []
-        in_ch = self.channels[0] + self.static_stem_channels
+        in_ch = self.channels[0] + self.static_stem_channels + self.velocity_condition_channels
         for out_ch, stride in zip(self.channels[1:], stride_list):
             down_blocks.append(_DownsampleBlock2d(in_ch, out_ch, stride=stride))
             in_ch = out_ch
@@ -178,7 +196,12 @@ class VAEPredictionEncoder(nn.Module):
         self.mu_head = nn.Conv2d(self.channels[-1], self.latent_channel, kernel_size=1)
         self.sigma_head = nn.Conv2d(self.channels[-1], self.latent_channel, kernel_size=1)
 
-    def forward(self, dynamic_x: torch.Tensor, static_x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        dynamic_x: torch.Tensor,
+        static_x: torch.Tensor,
+        current_velocity: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if dynamic_x.ndim != 5:
             raise ValueError("dynamic_x must have shape (B, C, T, H, W)")
         if dynamic_x.shape[2] != self.input_time_steps:
@@ -204,7 +227,15 @@ class VAEPredictionEncoder(nn.Module):
 
         h_dyn = self.dynamic_stem(_pack_video_time_to_channel(dynamic_x))
         h_static = self.static_stem(_pack_video_time_to_channel(static_x))
-        h = torch.cat([h_dyn, h_static], dim=1)
+        if current_velocity is None:
+            velocity_vec = torch.zeros((dynamic_x.shape[0], 2), dtype=torch.float32, device=dynamic_x.device)
+        else:
+            velocity_vec = torch.as_tensor(current_velocity, dtype=torch.float32, device=dynamic_x.device)
+        velocity_vec = velocity_vec / float(HUMAN_WALKING_SPEED_MPS)
+        velocity_embed = self.velocity_mlp(velocity_vec)
+        velocity_map = velocity_embed.view(velocity_embed.shape[0], velocity_embed.shape[1], 1, 1)
+        velocity_map = velocity_map.expand(-1, -1, h_dyn.shape[2], h_dyn.shape[3])
+        h = torch.cat([h_dyn, h_static, velocity_map], dim=1)
 
         for down_block in self.down_blocks:
             h = down_block(h)
@@ -234,6 +265,8 @@ class VAEPredictionDecoder(nn.Module):
         context_latent_channels: int | None = 32,
         downsample_channels: Sequence[int] = (8, 16, 32, 32, 32, 32),
         static_stem_channels: int = 8,
+        velocity_mlp_dim: int = 16,
+        velocity_condition_channels: int = 8,
         context_downsample_strides: Sequence[int | Sequence[int]] = DEFAULT_DOWNSAMPLE_STRIDES,
         upsample_channels: Sequence[int] | None = (
             128,
@@ -259,6 +292,12 @@ class VAEPredictionDecoder(nn.Module):
         self.static_stem_channels = int(static_stem_channels)
         if self.static_stem_channels <= 0:
             raise ValueError("static_stem_channels must be > 0")
+        self.velocity_mlp_dim = int(velocity_mlp_dim)
+        self.velocity_condition_channels = int(velocity_condition_channels)
+        if self.velocity_mlp_dim <= 0:
+            raise ValueError("velocity_mlp_dim must be > 0")
+        if self.velocity_condition_channels < 0:
+            raise ValueError("velocity_condition_channels must be >= 0")
 
         latent_dim = int(latent_dim)
 
@@ -300,8 +339,18 @@ class VAEPredictionDecoder(nn.Module):
             nn.BatchNorm2d(self.static_stem_channels),
             nn.ReLU(inplace=True),
         )
+        if self.velocity_condition_channels > 0:
+            self.velocity_mlp = nn.Sequential(
+                nn.Linear(2, self.velocity_mlp_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.velocity_mlp_dim, self.velocity_condition_channels),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.velocity_mlp = None
+            self.velocity_to_map = None
         context_down_blocks: list[nn.Module] = []
-        in_ch = self.downsample_channels[0] + self.static_stem_channels
+        in_ch = self.downsample_channels[0] + self.static_stem_channels + self.velocity_condition_channels
         for out_ch, stride in zip(self.downsample_channels[1:], context_stride_list):
             context_down_blocks.append(_DownsampleBlock2d(in_ch, out_ch, stride=stride))
             in_ch = out_ch
@@ -337,6 +386,7 @@ class VAEPredictionDecoder(nn.Module):
         z: torch.Tensor,
         dynamic_context: torch.Tensor,
         static_x: torch.Tensor,
+        current_velocity: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if z.ndim != 5:
             raise ValueError("z must have shape (B, C_latent, 1, H, W)")
@@ -373,7 +423,15 @@ class VAEPredictionDecoder(nn.Module):
 
         cond_dyn = self.context_dynamic_stem(_pack_video_time_to_channel(dynamic_context))
         cond_static = self.context_static_stem(_pack_video_time_to_channel(static_x))
-        cond = torch.cat([cond_dyn, cond_static], dim=1)
+        if current_velocity is None:
+            velocity_vec = torch.zeros((dynamic_context.shape[0], 2), dtype=torch.float32, device=dynamic_context.device)
+        else:
+            velocity_vec = torch.as_tensor(current_velocity, dtype=torch.float32, device=dynamic_context.device)
+        velocity_vec = velocity_vec / float(HUMAN_WALKING_SPEED_MPS)
+        velocity_embed = self.velocity_mlp(velocity_vec)
+        velocity_map = velocity_embed.view(velocity_embed.shape[0], velocity_embed.shape[1], 1, 1)
+        velocity_map = velocity_map.expand(-1, -1, cond_dyn.shape[2], cond_dyn.shape[3])
+        cond = torch.cat([cond_dyn, cond_static, velocity_map], dim=1)
         for down_block in self.context_down_blocks:
             cond = down_block(cond)
         cond = self.context_to_latent(cond).unsqueeze(2)
@@ -398,6 +456,9 @@ def build_prediction_vae_models(
     decoder_downsample_channels: Sequence[int] | None = None,
     decoder_context_latent_channel: int | None = None,
     static_stem_channels: int = 8,
+    velocity_mlp_dim: int = 16,
+    encoder_velocity_condition_channels: int = 8,
+    decoder_velocity_condition_channels: int = 8,
     decoder_context_frames: int = 8,
     downsample_strides: Sequence[int | Sequence[int]] = DEFAULT_DOWNSAMPLE_STRIDES,
     decoder_context_downsample_strides: Sequence[int | Sequence[int]] | None = None,
@@ -423,6 +484,8 @@ def build_prediction_vae_models(
         latent_channel=latent_channel,
         channels=channels,
         static_stem_channels=static_stem_channels,
+        velocity_mlp_dim=velocity_mlp_dim,
+        velocity_condition_channels=encoder_velocity_condition_channels,
         downsample_strides=downsample_strides,
     )
     decoder = VAEPredictionDecoder(
@@ -432,6 +495,8 @@ def build_prediction_vae_models(
         context_latent_channels=decoder_context_latent_channel,
         downsample_channels=decoder_downsample_channels,
         static_stem_channels=static_stem_channels,
+        velocity_mlp_dim=velocity_mlp_dim,
+        velocity_condition_channels=decoder_velocity_condition_channels,
         context_downsample_strides=context_downsample_strides,
         upsample_channels=upsample_channels,
         upsample_strides=upsample_strides,

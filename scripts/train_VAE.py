@@ -28,7 +28,13 @@ from src.VAE_prediction import (
     build_prediction_vae_models,
 )
 from src.Dataset import build_datasets
-from src.loss import kl_divergence, weighted_bernoulli_recon_loss, weighted_focal_recon_loss
+from src.loss import (
+    bernoulli_entropy_loss,
+    kl_divergence,
+    kl_target_loss,
+    weighted_bernoulli_recon_loss,
+    weighted_focal_recon_loss,
+)
 
 
 def get_rollout_length(
@@ -76,10 +82,14 @@ def run_epoch(
     recon_loss_type: str,
     occupied_weight: float,
     focal_gamma: float,
+    entropy_weight: float,
     kl_weight: float,
+    target_kl: float,
     rollout_len: int,
     teacher_forcing_prob: float,
-) -> tuple[float, float, float]:
+    num_latent_samples: int,
+    latent_selection_max_steps: int,
+) -> tuple[float, float, float, float, float]:
     """Run one epoch (training or evaluation) over `loader`.
 
     If `optimizer` is provided the model parameters are updated (training
@@ -89,18 +99,23 @@ def run_epoch(
     Args:
         encoder: VAE encoder instance.
         decoder: VAE decoder instance.
-        loader: DataLoader yielding `(x, y)` pairs.
+        loader: DataLoader yielding
+            `(x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y)`.
         optimizer: Optimizer to use for training, or `None` for evaluation.
         device: Device to run tensors on.
         recon_loss_type: Reconstruction loss type: `bce` or `focal`.
         occupied_weight: Absolute occupied-cell weight for both BCE and focal losses.
         focal_gamma: Focal exponent used to focus on hard examples.
-        kl_weight: Weight to scale the KL term when computing total loss.
+        entropy_weight: Weight for predictive entropy regularization.
+        kl_weight: Weight to scale the KL objective when computing total loss.
+        target_kl: Target KL value used in quadratic penalty `(KL - target_kl)^2`.
         rollout_len: Number of autoregressive steps used for reconstruction loss.
         teacher_forcing_prob: Probability of feeding GT at each rollout step.
+        num_latent_samples: Number of latent samples (`z`) to evaluate per sample.
+        latent_selection_max_steps: Max rollout steps used to choose best `z`.
 
     Returns:
-        A tuple `(avg_loss, avg_recon, avg_kl)` averaged over batches.
+        A tuple `(avg_loss, avg_recon, avg_entropy, avg_kl, avg_kl_objective)` averaged over batches.
     """
     is_train = optimizer is not None
     encoder.train(is_train)
@@ -108,61 +123,141 @@ def run_epoch(
 
     total_loss = 0.0
     total_recon = 0.0
+    total_entropy = 0.0
     total_kl = 0.0
+    total_kl_objective = 0.0
     total_batches = 0
 
-    for x_encoder_dynamic, x_decoder_dynamic, x_static, y in loader:
+    for x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y in loader:
         x_encoder_dynamic = x_encoder_dynamic.to(device)
         x_decoder_dynamic = x_decoder_dynamic.to(device)
         x_static = x_static.to(device)
+        current_velocity = current_velocity.to(device)
         y = y.to(device)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
-        mu, sigma = encoder(x_encoder_dynamic, x_static)
-        z = encoder.sample(mu, sigma)
+        mu, sigma = encoder(x_encoder_dynamic, x_static, current_velocity)
 
         horizon = int(y.shape[2])
         effective_k = max(1, min(int(rollout_len), horizon))
-        context = x_decoder_dynamic.clone()
-        step_recons: list[torch.Tensor] = []
+        selection_steps = max(1, min(effective_k, int(latent_selection_max_steps)))
+        batch_size = y.shape[0]
 
-        for step in range(effective_k):
-            logits_full = decoder(z, context, x_static)
+        def _rollout_step(
+            z_step: torch.Tensor,
+            context_step: torch.Tensor,
+            step: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            logits_full = decoder(z_step, context_step, x_static, current_velocity)
             logits_step = logits_full[:, :, :1]
             target_step = y[:, :, step : step + 1]
 
             if recon_loss_type == "focal":
-                step_recon = weighted_focal_recon_loss(
+                step_recon_cells = weighted_focal_recon_loss(
                     logits_step,
                     target_step,
                     occupied_weight=occupied_weight,
                     focal_gamma=focal_gamma,
+                    reduction="none",
                 )
             elif recon_loss_type == "bce":
-                step_recon = weighted_bernoulli_recon_loss(
+                step_recon_cells = weighted_bernoulli_recon_loss(
                     logits_step,
                     target_step,
                     occupied_weight=occupied_weight,
+                    reduction="none",
                 )
             else:
                 raise ValueError(f"Unsupported recon_loss_type: {recon_loss_type}")
-            step_recons.append(step_recon)
+
+            step_recon = step_recon_cells.reshape(batch_size, -1).mean(dim=1)
+            step_entropy_cells = bernoulli_entropy_loss(logits_step, reduction="none")
+            step_entropy = step_entropy_cells.reshape(batch_size, -1).mean(dim=1)
 
             pred_step = torch.sigmoid(logits_step.detach())
             if is_train and teacher_forcing_prob < 1.0:
-                batch_size = target_step.shape[0]
-                use_gt = (torch.rand((batch_size, 1, 1, 1, 1), device=device) < teacher_forcing_prob).to(target_step.dtype)
+                use_gt = (
+                    torch.rand((batch_size, 1, 1, 1, 1), device=device) < teacher_forcing_prob
+                ).to(target_step.dtype)
                 feedback_step = use_gt * target_step + (1.0 - use_gt) * pred_step
             else:
                 feedback_step = target_step if teacher_forcing_prob >= 1.0 else pred_step
 
-            context = torch.cat([context[:, :, 1:], feedback_step], dim=2)
+            next_context = torch.cat([context_step[:, :, 1:], feedback_step], dim=2)
+            return step_recon, step_entropy, next_context
 
-        recon = torch.stack(step_recons).mean()
+        selection_step_recons = torch.empty(
+            (num_latent_samples, batch_size, selection_steps),
+            device=device,
+            dtype=y.dtype,
+        )
+        selection_step_entropies = torch.empty(
+            (num_latent_samples, batch_size, selection_steps),
+            device=device,
+            dtype=y.dtype,
+        )
+        z_candidates = torch.empty(
+            (num_latent_samples,) + tuple(mu.shape),
+            device=device,
+            dtype=mu.dtype,
+        )
+        context_candidates = torch.empty(
+            (num_latent_samples,) + tuple(x_decoder_dynamic.shape),
+            device=device,
+            dtype=x_decoder_dynamic.dtype,
+        )
+
+        for z_idx in range(num_latent_samples):
+            z = encoder.sample(mu, sigma)
+            z_candidates[z_idx] = z
+            context = x_decoder_dynamic.clone()
+
+            for step in range(selection_steps):
+                step_recon, step_entropy, context = _rollout_step(z, context, step)
+                selection_step_recons[z_idx, :, step] = step_recon
+                selection_step_entropies[z_idx, :, step] = step_entropy
+
+            context_candidates[z_idx] = context
+
+        z_selection_losses = selection_step_recons.mean(dim=2)
+        best_z_indices = z_selection_losses.argmin(dim=0)
+        batch_indices = torch.arange(batch_size, device=device)
+
+        selected_step_recons = selection_step_recons[best_z_indices, batch_indices, :]
+        selected_step_entropies = selection_step_entropies[best_z_indices, batch_indices, :]
+
+        if effective_k > selection_steps:
+            rollout_step_recons = torch.empty(
+                (batch_size, effective_k),
+                device=device,
+                dtype=y.dtype,
+            )
+            rollout_step_entropies = torch.empty(
+                (batch_size, effective_k),
+                device=device,
+                dtype=y.dtype,
+            )
+            rollout_step_recons[:, :selection_steps] = selected_step_recons
+            rollout_step_entropies[:, :selection_steps] = selected_step_entropies
+
+            best_z = z_candidates[best_z_indices, batch_indices, ...]
+            context = context_candidates[best_z_indices, batch_indices, ...]
+
+            for step in range(selection_steps, effective_k):
+                step_recon, step_entropy, context = _rollout_step(best_z, context, step)
+                rollout_step_recons[:, step] = step_recon
+                rollout_step_entropies[:, step] = step_entropy
+        else:
+            rollout_step_recons = selected_step_recons
+            rollout_step_entropies = selected_step_entropies
+
+        recon = rollout_step_recons.mean()
+        entropy = rollout_step_entropies.mean()
         kl = kl_divergence(mu, sigma)
-        loss = recon + kl_weight * kl
+        kl_objective = kl_target_loss(kl, target_kl=target_kl)
+        loss = recon + entropy_weight * entropy + kl_weight * kl_objective
 
         if is_train:
             loss.backward()
@@ -170,16 +265,20 @@ def run_epoch(
 
         total_loss += float(loss.item())
         total_recon += float(recon.item())
+        total_entropy += float(entropy.item())
         total_kl += float(kl.item())
+        total_kl_objective += float(kl_objective.item())
         total_batches += 1
 
     if total_batches == 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     return (
         total_loss / total_batches,
         total_recon / total_batches,
+        total_entropy / total_batches,
         total_kl / total_batches,
+        total_kl_objective / total_batches,
     )
 
 
@@ -196,6 +295,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-context-len", type=int, default=8, help="Number of past/current frames used to condition decoder")
     parser.add_argument("--rollout-start-k", type=int, default=1, help="Initial autoregressive rollout length")
     parser.add_argument("--rollout-target-k", type=int, default=8, help="Target autoregressive rollout length")
+    parser.add_argument("--num-latent-samples", type=int, default=2, help="Number of sampled z per sample for best-of-N training")
+    parser.add_argument(
+        "--latent-selection-max-steps",
+        type=int,
+        default=8,
+        help="Max rollout steps used to pick best z (m); full rollout still uses selected z",
+    )
     parser.add_argument("--teacher-forcing-start-p", type=float, default=1.0, help="Initial teacher forcing probability")
     parser.add_argument("--teacher-forcing-end-p", type=float, default=0.2, help="Final teacher forcing probability")
     parser.add_argument("--curriculum-epochs", type=int, default=0, help="Epochs to ramp curriculum (0 uses total epochs)")
@@ -219,7 +325,14 @@ def parse_args() -> argparse.Namespace:
         help="Absolute occupied-cell weight for BCE/focal losses (>=1)",
     )
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (0 disables focal modulation)")
+    parser.add_argument(
+        "--entropy-weight",
+        type=float,
+        default=0.0,
+        help="Weight for per-cell Bernoulli entropy regularization over predicted frames",
+    )
     parser.add_argument("--kl-weight", type=float, default=1e-3)
+    parser.add_argument("--target-kl", type=float, default=1.0, help="Target KL value used in quadratic KL objective")
     parser.add_argument("--latent-channel", type=int, default=128)
     parser.add_argument(
         "--channels",
@@ -243,8 +356,31 @@ def parse_args() -> argparse.Namespace:
         help="Context branch latent channels in decoder (defaults to latent-channel)",
     )
     parser.add_argument("--static-stem-channels", type=int, default=8)
+    parser.add_argument(
+        "--velocity-mlp-dim",
+        type=int,
+        default=16,
+        help="Velocity embedding dimension C after MLP",
+    )
+    parser.add_argument(
+        "--encoder-velocity-condition-channels",
+        type=int,
+        default=4,
+        help="Velocity conditioning channel count C1 fused in encoder",
+    )
+    parser.add_argument(
+        "--decoder-velocity-condition-channels",
+        type=int,
+        default=4,
+        help="Velocity conditioning channel count C2 fused in decoder context branch",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--lazy-data-load",
+        action="store_true",
+        help="Enable lazy on-the-fly occupancy window slicing during dataset loading",
+    )
     parser.add_argument("--output", type=Path, default=Path("checkpoints/vae_prediction.pt"))
     parser.add_argument(
         "--save-interval",
@@ -315,8 +451,11 @@ def build_checkpoint(
             "decoder_context_len": args.decoder_context_len,
             "rollout_start_k": args.rollout_start_k,
             "rollout_target_k": args.rollout_target_k,
+            "num_latent_samples": args.num_latent_samples,
+            "latent_selection_max_steps": args.latent_selection_max_steps,
             "teacher_forcing_start_p": args.teacher_forcing_start_p,
             "teacher_forcing_end_p": args.teacher_forcing_end_p,
+            "target_kl": args.target_kl,
             "curriculum_epochs": curriculum_epochs,
             "latent_channel": args.latent_channel,
             "channels": list(args.channels),
@@ -328,6 +467,9 @@ def build_checkpoint(
             ),
             "decoder_context_latent_channel": decoder_context_latent_channel,
             "static_stem_channels": args.static_stem_channels,
+            "velocity_mlp_dim": args.velocity_mlp_dim,
+            "encoder_velocity_condition_channels": args.encoder_velocity_condition_channels,
+            "decoder_velocity_condition_channels": args.decoder_velocity_condition_channels,
             "downsample_strides": downsample_strides,
             "upsample_strides": upsample_strides,
             "upsample_channels": upsample_channels,
@@ -359,6 +501,12 @@ def main() -> None:
         raise ValueError("save_interval must be > 0")
     if args.rollout_start_k <= 0 or args.rollout_target_k <= 0:
         raise ValueError("rollout_start_k and rollout_target_k must be > 0")
+    if args.num_latent_samples <= 0:
+        raise ValueError("num_latent_samples must be > 0")
+    if args.entropy_weight < 0.0:
+        raise ValueError("entropy_weight must be >= 0")
+    if args.latent_selection_max_steps <= 0:
+        raise ValueError("latent_selection_max_steps must be > 0")
     if not (0.0 <= args.teacher_forcing_start_p <= 1.0 and 0.0 <= args.teacher_forcing_end_p <= 1.0):
         raise ValueError("teacher forcing probabilities must be in [0, 1]")
 
@@ -367,6 +515,20 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    wandb_run = None
+    if args.wandb:
+        if wandb is None:
+            raise ImportError("wandb is not installed. Install it with: pip install wandb")
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+            config=vars(args),
+        )
+
+    _log_message("Building datasets...", wandb_run=wandb_run)
     train_dataset, val_dataset, stats = build_datasets(
         data_dir=args.data_dir,
         val_ratio=args.val_ratio,
@@ -375,7 +537,9 @@ def main() -> None:
         decoder_context_len=args.decoder_context_len,
         window_stride=args.window_stride,
         seed=args.seed,
+        lazy=args.lazy_data_load,
     )
+    _log_message(f"Datasets built.", wandb_run=wandb_run)
 
     if len(train_dataset) == 0:
         raise ValueError("No training samples were created. Check data and window parameters.")
@@ -395,7 +559,7 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    sample_x_encoder_dynamic, sample_x_decoder_dynamic, sample_x_static, sample_y = train_dataset[0]
+    sample_x_encoder_dynamic, sample_x_decoder_dynamic, sample_x_static, _sample_current_velocity, sample_y = train_dataset[0]
     _, enc_t, h, w = sample_x_encoder_dynamic.shape
     _, dec_ctx_t, _, _ = sample_x_decoder_dynamic.shape
     input_shape = (1, enc_t, h, w)
@@ -423,6 +587,9 @@ def main() -> None:
         decoder_downsample_channels=args.decoder_downsample_channels,
         decoder_context_latent_channel=decoder_context_latent_channel,
         static_stem_channels=args.static_stem_channels,
+        velocity_mlp_dim=args.velocity_mlp_dim,
+        encoder_velocity_condition_channels=args.encoder_velocity_condition_channels,
+        decoder_velocity_condition_channels=args.decoder_velocity_condition_channels,
         decoder_context_frames=dec_ctx_t,
         downsample_strides=downsample_strides,
         decoder_context_downsample_strides=downsample_strides,
@@ -440,22 +607,11 @@ def main() -> None:
     _log_message(
         "Dataset summary: "
         f"files={stats.num_scene_files}, "
-        f"train_origins={stats.num_train_origins}, val_origins={stats.num_val_origins}, "
+        f"train_agent_sequences={stats.num_train_agent_sequences}, "
+        f"val_agent_sequences={stats.num_val_agent_sequences}, "
+        f"train_anchors={stats.num_train_anchors}, val_anchors={stats.num_val_anchors}, "
         f"train_samples={stats.num_train_samples}, val_samples={stats.num_val_samples}",
     )
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-
-    wandb_run = None
-    if args.wandb:
-        if wandb is None:
-            raise ImportError("wandb is not installed. Install it with: pip install wandb")
-        wandb_run = wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-            config=vars(args),
-        )
 
     try:
         total_epoch_time = 0.0
@@ -481,7 +637,7 @@ def main() -> None:
                 ramp_epochs=curriculum_epochs,
             )
 
-            train_loss, train_recon, train_kl = run_epoch(
+            train_loss, train_recon, train_entropy, train_kl, train_kl_objective = run_epoch(
                 encoder,
                 decoder,
                 train_loader,
@@ -490,13 +646,17 @@ def main() -> None:
                 recon_loss_type=args.recon_loss_type,
                 occupied_weight=args.occupied_weight,
                 focal_gamma=args.focal_gamma,
+                entropy_weight=args.entropy_weight,
                 kl_weight=args.kl_weight,
+                target_kl=args.target_kl,
                 rollout_len=current_rollout_k,
                 teacher_forcing_prob=current_teacher_forcing_p,
+                num_latent_samples=args.num_latent_samples,
+                latent_selection_max_steps=args.latent_selection_max_steps,
             )
 
             with torch.no_grad():
-                val_loss, val_recon, val_kl = run_epoch(
+                val_loss, val_recon, val_entropy, val_kl, val_kl_objective = run_epoch(
                     encoder,
                     decoder,
                     val_loader,
@@ -505,9 +665,13 @@ def main() -> None:
                     recon_loss_type=args.recon_loss_type,
                     occupied_weight=args.occupied_weight,
                     focal_gamma=args.focal_gamma,
+                    entropy_weight=args.entropy_weight,
                     kl_weight=args.kl_weight,
+                    target_kl=args.target_kl,
                     rollout_len=current_rollout_k,
-                    teacher_forcing_prob=0.0,
+                    teacher_forcing_prob=current_teacher_forcing_p,
+                    num_latent_samples=args.num_latent_samples,
+                    latent_selection_max_steps=args.latent_selection_max_steps,
                 )
 
             epoch_duration = time.perf_counter() - epoch_start
@@ -518,9 +682,10 @@ def main() -> None:
 
             _log_message(
                 f"Epoch {epoch:03d} | "
-                f"K={current_rollout_k}, tf_p={current_teacher_forcing_p:.3f} | "
-                f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, kl={train_kl:.6f} | "
-                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, kl={val_kl:.6f} | "
+                f"K={current_rollout_k}, tf_p={current_teacher_forcing_p:.3f}, "
+                f"n_z={args.num_latent_samples}, m={args.latent_selection_max_steps} | "
+                f"train: loss={train_loss:.6f}, recon={train_recon:.6f}, entropy={train_entropy:.6f}, kl={train_kl:.6f}, kl_obj={train_kl_objective:.6f} | "
+                f"val: loss={val_loss:.6f}, recon={val_recon:.6f}, entropy={val_entropy:.6f}, kl={val_kl:.6f}, kl_obj={val_kl_objective:.6f} | "
                 f"epoch_time={_format_hhmmss(epoch_duration)}, eta={_format_hhmmss(eta_seconds)}",
                 wandb_run=wandb_run,
             )
@@ -562,10 +727,16 @@ def main() -> None:
                         "epoch": epoch,
                         "train/loss": train_loss,
                         "train/recon": train_recon,
+                        "train/entropy": train_entropy,
                         "train/kl": train_kl,
+                        "train/kl_objective": train_kl_objective,
                         "val/loss": val_loss,
                         "val/recon": val_recon,
+                        "val/entropy": val_entropy,
                         "val/kl": val_kl,
+                        "val/kl_objective": val_kl_objective,
+                        "loss/entropy_weight": args.entropy_weight,
+                        "kl/target": args.target_kl,
                         "curriculum/rollout_k": current_rollout_k,
                         "curriculum/teacher_forcing_p": current_teacher_forcing_p,
                         "best/val_loss": min(best_val_loss, val_loss),
