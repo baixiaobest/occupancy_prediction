@@ -12,6 +12,49 @@ from src.occupancy_patch import slice_centered_patch
 from src.rollout_data import RollOutData, SceneRollOutData
 
 
+def _build_window_centers(
+    position_window: torch.Tensor,
+    history_len: int,
+    future_len: int,
+) -> torch.Tensor:
+    """Build per-frame crop centers for one window.
+
+    Past frames are pinned to the current timestep center. Future frames keep
+    their own timestep centers.
+    """
+    window_size = int(history_len + future_len)
+    centers = torch.as_tensor(position_window, dtype=torch.float32).clone()
+    if centers.shape != (window_size, 2):
+        raise ValueError("Position window must have shape (history_len+future_len, 2)")
+
+    current_center = centers[history_len].clone()
+    centers[:history_len] = current_center
+    return centers
+
+
+def _compute_future_center_shifts_px(
+    centers_window: torch.Tensor,
+    resolution_xy: tuple[float, float],
+    history_len: int,
+    future_len: int,
+) -> torch.Tensor:
+    """Compute per-step center displacement in pixel units for rollout shifting."""
+    shifts = torch.zeros((int(future_len), 2), dtype=torch.float32)
+    if future_len <= 1:
+        return shifts
+
+    res_x = float(resolution_xy[0])
+    res_y = float(resolution_xy[1])
+    if res_x <= 0.0 or res_y <= 0.0:
+        raise ValueError("resolution components must be > 0")
+
+    current_centers = centers_window[int(history_len) : int(history_len + future_len)]
+    deltas = current_centers[1:] - current_centers[:-1]
+    shifts[:-1, 0] = deltas[:, 0] / res_x
+    shifts[:-1, 1] = deltas[:, 1] / res_y
+    return shifts
+
+
 @dataclass
 class DatasetStats:
     num_scene_files: int
@@ -25,15 +68,15 @@ class DatasetStats:
 
 @dataclass
 class LazySampleRef:
-    """Reference record for one anchor-centered lazy sample.
+    """Reference record for one moving-center lazy sample.
 
     The dynamic/static global maps are shared across many refs. Local windows are
-    sliced in `__getitem__` using the fixed anchor center.
+    sliced in `__getitem__` using per-timestep ego centers.
     """
 
     dynamic_global: torch.Tensor
     static_global: torch.Tensor
-    center_xy: torch.Tensor
+    position_global: torch.Tensor
     velocity_window: torch.Tensor
     scene_origin: tuple[float, float]
     resolution_xy: tuple[float, float]
@@ -71,17 +114,28 @@ class _OccupancyWindowBase(Dataset):
     def _format_model_io(
         self,
         seq: torch.Tensor,
-        current_static: torch.Tensor,
+        static_seq: torch.Tensor,
         velocity_window: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        future_center_shifts_px: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         if seq.ndim != 3:
             raise ValueError("Sequence must have shape (history+future, H, W)")
         if seq.shape[0] != self.window_size:
             raise ValueError("Sequence length must be history_len + future_len")
-        if current_static.ndim != 2:
-            raise ValueError("Static map must have shape (H, W)")
-        if current_static.shape != seq.shape[-2:]:
-            raise ValueError("Static map shape must match sequence spatial shape")
+        if static_seq.ndim != 3:
+            raise ValueError("Static sequence must have shape (history+future, H, W)")
+        if static_seq.shape[0] != self.window_size:
+            raise ValueError("Static sequence length must be history_len + future_len")
+        if static_seq.shape[-2:] != seq.shape[-2:]:
+            raise ValueError("Static sequence shape must match sequence spatial shape")
 
         vel_window = torch.as_tensor(velocity_window, dtype=torch.float32)
         if vel_window.shape == (2,):
@@ -94,18 +148,33 @@ class _OccupancyWindowBase(Dataset):
         current_velocity = vel_window[self.history_len]
         future_velocities = vel_window[self.history_len : self.window_size]
 
+        shifts_px = torch.as_tensor(future_center_shifts_px, dtype=torch.float32)
+        if shifts_px.shape != (self.future_len, 2):
+            raise ValueError("future_center_shifts_px must have shape (future_len, 2)")
+
         x_encoder_dynamic = torch.cat([past, future], dim=0).unsqueeze(0)
         x_decoder_dynamic = past[-self.decoder_context_len :].unsqueeze(0)
-        x_static = current_static.unsqueeze(0)
+        x_static = static_seq.unsqueeze(0)
         y = future.unsqueeze(0)
-        return x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, future_velocities, y
+        return x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, future_velocities, y, shifts_px
+
+    def _centers_from_motion(
+        self,
+        *,
+        position_window: torch.Tensor,
+    ) -> torch.Tensor:
+        return _build_window_centers(
+            position_window=position_window,
+            history_len=self.history_len,
+            future_len=self.future_len,
+        )
 
 class OccupancyWindowDataset(_OccupancyWindowBase):
-    """Anchor-window dataset over precomputed local occupancy windows."""
+    """Window dataset over precomputed local occupancy windows."""
 
     def __init__(
         self,
-        sequences: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        sequences: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
         history_len: int = 16,
         future_len: int = 8,
         decoder_context_len: int = 8,
@@ -119,29 +188,42 @@ class OccupancyWindowDataset(_OccupancyWindowBase):
         )
         self.samples = list(sequences)
 
-        for seq, static_map, velocity in self.samples:
+        for seq, static_seq, velocity, shifts_px in self.samples:
             if seq.ndim != 3:
                 raise ValueError("Each sequence must have shape (history+future, H, W)")
             if seq.shape[0] != self.window_size:
                 raise ValueError("Each sequence must have exactly history_len + future_len frames")
-            if static_map.ndim != 2:
-                raise ValueError("Each static map must have shape (H, W)")
-            if static_map.shape != seq.shape[-2:]:
-                raise ValueError("Static map spatial shape must match sequence shape")
+            if static_seq.ndim != 3:
+                raise ValueError("Each static sequence must have shape (history+future, H, W)")
+            if static_seq.shape[0] != self.window_size:
+                raise ValueError("Each static sequence must have exactly history_len + future_len frames")
+            if static_seq.shape[-2:] != seq.shape[-2:]:
+                raise ValueError("Static sequence spatial shape must match sequence shape")
             vel = torch.as_tensor(velocity, dtype=torch.float32)
             if vel.shape != (2,) and vel.shape != (self.window_size, 2):
                 raise ValueError("Each velocity must have shape (2,) or (history_len+future_len, 2)")
+            shift_tensor = torch.as_tensor(shifts_px, dtype=torch.float32)
+            if shift_tensor.shape != (self.future_len, 2):
+                raise ValueError("Each shift tensor must have shape (future_len, 2)")
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        seq, current_static, velocity_window = self.samples[index]
-        return self._format_model_io(seq, current_static, velocity_window)
+    def __getitem__(self, index: int) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        seq, static_seq, velocity_window, future_center_shifts_px = self.samples[index]
+        return self._format_model_io(seq, static_seq, velocity_window, future_center_shifts_px)
 
 
 class LazyOccupancyWindowDataset(_OccupancyWindowBase):
-    """Anchor-window dataset that slices local occupancy on demand in __getitem__."""
+    """Window dataset that slices local occupancy on demand in __getitem__."""
 
     def __init__(
         self,
@@ -162,15 +244,48 @@ class LazyOccupancyWindowDataset(_OccupancyWindowBase):
     def __len__(self) -> int:
         return len(self.sample_refs)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         ref = self.sample_refs[index]
 
+        position_window = torch.as_tensor(ref.position_global[int(ref.start_t) : int(ref.end_t)], dtype=torch.float32)
+
+        centers_window = self._centers_from_motion(
+            position_window=position_window,
+        )
+        future_center_shifts_px = _compute_future_center_shifts_px(
+            centers_window=centers_window,
+            resolution_xy=ref.resolution_xy,
+            history_len=self.history_len,
+            future_len=self.future_len,
+        )
+
         dynamic_frames: list[torch.Tensor] = []
-        for absolute_t in range(int(ref.start_t), int(ref.end_t)):
+        static_frames: list[torch.Tensor] = []
+        for local_t, absolute_t in enumerate(range(int(ref.start_t), int(ref.end_t))):
+            center_xy = centers_window[local_t]
             dynamic_frames.append(
                 slice_centered_patch(
                     ref.dynamic_global[absolute_t],
-                    ref.center_xy,
+                    center_xy,
+                    ref.scene_origin,
+                    ref.resolution_xy,
+                    ref.patch_shape,
+                    binary=True,
+                    prefer_view=True,
+                )
+            )
+            static_frames.append(
+                slice_centered_patch(
+                    ref.static_global,
+                    center_xy,
                     ref.scene_origin,
                     ref.resolution_xy,
                     ref.patch_shape,
@@ -179,16 +294,8 @@ class LazyOccupancyWindowDataset(_OccupancyWindowBase):
                 )
             )
         seq = torch.stack(dynamic_frames, dim=0)
-        static_local = slice_centered_patch(
-            ref.static_global,
-            ref.center_xy,
-            ref.scene_origin,
-            ref.resolution_xy,
-            ref.patch_shape,
-            binary=True,
-            prefer_view=True,
-        )
-        return self._format_model_io(seq, static_local, ref.velocity_window)
+        static_seq = torch.stack(static_frames, dim=0)
+        return self._format_model_io(seq, static_seq, ref.velocity_window, future_center_shifts_px)
 
 
 class DatasetBuilder:
@@ -232,6 +339,7 @@ class DatasetBuilder:
         tuple[int, int],
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         """Validate and unpack common scene-level map fields used by loaders."""
 
@@ -260,6 +368,13 @@ class DatasetBuilder:
         if tuple(scene_velocity_trajectories.shape) != expected_shape:
             raise ValueError("scene_velocity_trajectories must match dynamic_maps agent/time dimensions")
 
+        scene_position_data = getattr(scene, "scene_position_trajectories", None)
+        if scene_position_data is None:
+            raise ValueError("scene_position_trajectories is required")
+        scene_position_trajectories = torch.as_tensor(scene_position_data, dtype=torch.float32)
+        if tuple(scene_position_trajectories.shape) != expected_shape:
+            raise ValueError("scene_position_trajectories must match dynamic_maps agent/time dimensions")
+
         return (
             scene_static,
             scene_origin,
@@ -267,46 +382,37 @@ class DatasetBuilder:
             patch_shape,
             dynamic_maps,
             scene_velocity_trajectories,
+            scene_position_trajectories,
         )
 
-    def _iter_valid_anchors(
+    def _iter_valid_windows(
         self,
-        scene: SceneRollOutData,
         dynamic_maps: torch.Tensor,
         scene_velocity_trajectories: torch.Tensor,
+        scene_position_trajectories: torch.Tensor,
     ):
-        """Yield validated per-anchor metadata for each agent in one scene."""
-        for agent_idx in sorted(scene.agents.keys()):
-            if agent_idx < 0 or agent_idx >= dynamic_maps.shape[0]:
-                continue
+        """Yield validated per-window metadata for each agent in one scene."""
+        window_size = int(self.history_len + self.future_len)
+        if window_size <= 0:
+            return
 
-            agent_data = scene.agents[agent_idx]
-            anchor_times = agent_data.anchor_times
-            if not anchor_times:
-                continue
-            if agent_data.anchor_centers is None:
-                raise ValueError("Agent metadata requires anchor_centers")
+        step = max(1, self.window_stride)
+        total_time = int(dynamic_maps.shape[1])
+        max_start = total_time - window_size
+        if max_start < 0:
+            return
 
-            centers_tensor = torch.as_tensor(agent_data.anchor_centers, dtype=torch.float32)
-            if centers_tensor.shape != (len(anchor_times), 2):
-                raise ValueError("anchor_centers must have shape (num_anchors, 2)")
-
+        for agent_idx in range(int(dynamic_maps.shape[0])):
             agent_dynamic = dynamic_maps[agent_idx]
-            total_time = int(agent_dynamic.shape[0])
+            position_global = scene_position_trajectories[agent_idx]
 
-            anchor_indices = list(range(0, len(anchor_times), max(1, self.window_stride)))
-            for anchor_meta_idx in anchor_indices:
-                anchor_t = int(anchor_times[anchor_meta_idx])
-                start_t = anchor_t - self.history_len
-                end_t = anchor_t + self.future_len
-                if start_t < 0 or end_t > total_time:
-                    continue
-
+            for start_t in range(0, max_start + 1, step):
+                end_t = int(start_t + window_size)
                 velocity_window = scene_velocity_trajectories[agent_idx, start_t:end_t].to(dtype=torch.float32)
 
                 yield (
                     agent_dynamic,
-                    centers_tensor[anchor_meta_idx],
+                    position_global,
                     velocity_window,
                     int(start_t),
                     int(end_t),
@@ -337,7 +443,7 @@ class DatasetBuilder:
         val_samples = [samples[i] for i in val_idx]
         return train_samples, val_samples
 
-    def _load_agent_sequences_from_file(self, pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def _load_agent_sequences_from_file(self, pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         try:
             payload = torch.load(pt_path, map_location="cpu")
         except AttributeError as exc:
@@ -347,8 +453,8 @@ class DatasetBuilder:
                 "Regenerate rollout .pt files using the current scripts/ORCA_rollout.py format."
             ) from exc
 
-        def _from_scene_obj(scene: SceneRollOutData) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-            out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        def _from_scene_obj(scene: SceneRollOutData) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+            out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
             (
                 scene_static,
                 scene_origin,
@@ -356,27 +462,40 @@ class DatasetBuilder:
                 patch_shape,
                 dynamic_maps,
                 scene_velocity_trajectories,
+                scene_position_trajectories,
             ) = self._unpack_scene_maps(scene)
 
             window_size = int(self.history_len + self.future_len)
 
-            for agent_dynamic, center_xy, velocity_window, start_t, end_t in self._iter_valid_anchors(
-                scene,
+            for (
+                agent_dynamic,
+                position_global,
+                velocity_window,
+                start_t,
+                end_t,
+            ) in self._iter_valid_windows(
                 dynamic_maps,
                 scene_velocity_trajectories,
+                scene_position_trajectories,
             ):
-                static_local = slice_centered_patch(
-                    grid=scene_static,
-                    center_xy=center_xy,
-                    origin_xy=scene_origin,
+                position_window = torch.as_tensor(position_global[start_t:end_t], dtype=torch.float32)
+
+                centers_window = _build_window_centers(
+                    position_window=position_window,
+                    history_len=self.history_len,
+                    future_len=self.future_len,
+                )
+                future_center_shifts_px = _compute_future_center_shifts_px(
+                    centers_window=centers_window,
                     resolution_xy=resolution_xy,
-                    patch_shape=patch_shape,
-                    binary=True,
-                    prefer_view=False,
+                    history_len=self.history_len,
+                    future_len=self.future_len,
                 )
 
                 dynamic_window: list[torch.Tensor] = []
-                for absolute_t in range(start_t, end_t):
+                static_window: list[torch.Tensor] = []
+                for local_t, absolute_t in enumerate(range(start_t, end_t)):
+                    center_xy = centers_window[local_t]
                     dynamic_global_t = self._to_2d_binary(agent_dynamic[absolute_t])
                     dynamic_local_t = slice_centered_patch(
                         grid=dynamic_global_t,
@@ -388,6 +507,16 @@ class DatasetBuilder:
                         prefer_view=False,
                     )
                     dynamic_window.append(dynamic_local_t)
+                    static_local_t = slice_centered_patch(
+                        grid=scene_static,
+                        center_xy=center_xy,
+                        origin_xy=scene_origin,
+                        resolution_xy=resolution_xy,
+                        patch_shape=patch_shape,
+                        binary=True,
+                        prefer_view=False,
+                    )
+                    static_window.append(static_local_t)
 
                 if len(dynamic_window) != window_size:
                     continue
@@ -395,14 +524,15 @@ class DatasetBuilder:
                 out.append(
                     (
                         torch.stack(dynamic_window, dim=0),
-                        static_local,
+                        torch.stack(static_window, dim=0),
                         velocity_window,
+                        future_center_shifts_px,
                     )
                 )
 
             return out
 
-        sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
         if isinstance(payload, RollOutData):
             for scene in payload.scenes:
                 sequences.extend(_from_scene_obj(scene))
@@ -412,7 +542,7 @@ class DatasetBuilder:
         return sequences
 
     def _load_lazy_sample_refs_from_file(self, pt_path: Path) -> list[LazySampleRef]:
-        """Load anchor references without materializing local occupancy windows."""
+        """Load window references without materializing local occupancy windows."""
         try:
             payload = torch.load(pt_path, map_location="cpu")
         except AttributeError as exc:
@@ -433,17 +563,24 @@ class DatasetBuilder:
                 patch_shape,
                 dynamic_maps,
                 scene_velocity_trajectories,
+                scene_position_trajectories,
             ) = self._unpack_scene_maps(scene)
-            for agent_dynamic, center_xy, velocity_window, start_t, end_t in self._iter_valid_anchors(
-                scene,
+            for (
+                agent_dynamic,
+                position_global,
+                velocity_window,
+                start_t,
+                end_t,
+            ) in self._iter_valid_windows(
                 dynamic_maps,
                 scene_velocity_trajectories,
+                scene_position_trajectories,
             ):
                 refs.append(
                     LazySampleRef(
                         dynamic_global=agent_dynamic,
                         static_global=scene_static,
-                        center_xy=center_xy.clone(),
+                        position_global=position_global,
                         velocity_window=velocity_window.clone(),
                         scene_origin=scene_origin,
                         resolution_xy=resolution_xy,

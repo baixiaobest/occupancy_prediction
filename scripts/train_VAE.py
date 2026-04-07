@@ -314,6 +314,7 @@ class VAETrainer:
             _sample_current_velocity,
             _sample_future_velocities,
             sample_y,
+            _sample_future_center_shifts_px,
         ) = train_dataset[0]
         _, enc_t, h, w = sample_x_encoder_dynamic.shape
         _, dec_ctx_t, _, _ = sample_x_decoder_dynamic.shape
@@ -427,6 +428,100 @@ class VAETrainer:
             "val_kl": val_kl,
         }
 
+    def _shift_context_by_pixels(
+        self,
+        context_in: torch.Tensor,
+        shift_px: torch.Tensor,
+    ) -> torch.Tensor:
+        """Shift decoder context into the next ego frame with zero padding.
+
+        `shift_px` stores per-sample (dx, dy) offsets in pixel units from the
+        current frame center to the next frame center.
+        """
+        out = torch.zeros_like(context_in)
+        shifts_int = torch.round(shift_px).to(dtype=torch.int64)
+
+        _, _, _, h_ctx, w_ctx = context_in.shape
+        for b_idx in range(context_in.shape[0]):
+            dx = int(shifts_int[b_idx, 0].item())
+            dy = int(shifts_int[b_idx, 1].item())
+
+            if dx >= 0:
+                src_x0, src_x1 = dx, w_ctx
+                dst_x0, dst_x1 = 0, w_ctx - dx
+            else:
+                src_x0, src_x1 = 0, w_ctx + dx
+                dst_x0, dst_x1 = -dx, w_ctx
+
+            if dy >= 0:
+                src_y0, src_y1 = dy, h_ctx
+                dst_y0, dst_y1 = 0, h_ctx - dy
+            else:
+                src_y0, src_y1 = 0, h_ctx + dy
+                dst_y0, dst_y1 = -dy, h_ctx
+
+            if dst_x1 <= dst_x0 or dst_y1 <= dst_y0:
+                continue
+
+            out[b_idx, :, :, dst_y0:dst_y1, dst_x0:dst_x1] = context_in[
+                b_idx, :, :, src_y0:src_y1, src_x0:src_x1
+            ]
+
+        return out
+
+    def _rollout_step(
+        self,
+        *,
+        z_step: torch.Tensor,
+        context_step: torch.Tensor,
+        static_step: torch.Tensor,
+        step_velocity: torch.Tensor,
+        step_shift_px: torch.Tensor,
+        target_step: torch.Tensor,
+        is_train: bool,
+        teacher_forcing_prob: float,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run one autoregressive decoder step and return per-sample losses + next context."""
+        logits_full = self.decoder(z_step, context_step, static_step, step_velocity)
+        logits_step = logits_full[:, :, :1]
+
+        if self.args.recon_loss_type == "focal":
+            step_recon_cells = weighted_focal_recon_loss(
+                logits_step,
+                target_step,
+                occupied_weight=self.args.occupied_weight,
+                focal_gamma=self.args.focal_gamma,
+                reduction="none",
+            )
+        elif self.args.recon_loss_type == "bce":
+            step_recon_cells = weighted_bernoulli_recon_loss(
+                logits_step,
+                target_step,
+                occupied_weight=self.args.occupied_weight,
+                reduction="none",
+            )
+        else:
+            raise ValueError(f"Unsupported recon_loss_type: {self.args.recon_loss_type}")
+
+        step_recon = step_recon_cells.reshape(batch_size, -1).mean(dim=1)
+        step_entropy_cells = bernoulli_entropy_loss(logits_step, reduction="none")
+        step_entropy = step_entropy_cells.reshape(batch_size, -1).mean(dim=1)
+
+        pred_step = torch.sigmoid(logits_step.detach())
+        if is_train and teacher_forcing_prob < 1.0:
+            # Scheduled sampling is applied independently for each sample.
+            use_gt = (
+                torch.rand((batch_size, 1, 1, 1, 1), device=self.device) < teacher_forcing_prob
+            ).to(target_step.dtype)
+            feedback_step = use_gt * target_step + (1.0 - use_gt) * pred_step
+        else:
+            feedback_step = target_step if teacher_forcing_prob >= 1.0 else pred_step
+
+        next_context_base = torch.cat([context_step[:, :, 1:], feedback_step], dim=2)
+        next_context = self._shift_context_by_pixels(next_context_base, step_shift_px)
+        return step_recon, step_entropy, next_context
+
     def run_epoch(
         self,
         loader: DataLoader,
@@ -447,13 +542,22 @@ class VAETrainer:
         total_kl_objective = 0.0
         total_batches = 0
 
-        for x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, future_velocities, y in loader:
+        for (
+            x_encoder_dynamic,
+            x_decoder_dynamic,
+            x_static,
+            current_velocity,
+            future_velocities,
+            y,
+            future_center_shifts_px,
+        ) in loader:
             x_encoder_dynamic = x_encoder_dynamic.to(self.device)
             x_decoder_dynamic = x_decoder_dynamic.to(self.device)
             x_static = x_static.to(self.device)
             current_velocity = current_velocity.to(self.device)
             future_velocities = future_velocities.to(self.device)
             y = y.to(self.device)
+            future_center_shifts_px = future_center_shifts_px.to(self.device)
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -464,50 +568,6 @@ class VAETrainer:
             effective_k = max(1, min(int(rollout_len), horizon))
             selection_steps = max(1, min(effective_k, int(self.args.latent_selection_max_steps)))
             batch_size = y.shape[0]
-
-            def _rollout_step(
-                z_step: torch.Tensor,
-                context_step: torch.Tensor,
-                step_velocity: torch.Tensor,
-                step: int,
-            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                logits_full = self.decoder(z_step, context_step, x_static, step_velocity)
-                logits_step = logits_full[:, :, :1]
-                target_step = y[:, :, step : step + 1]
-
-                if self.args.recon_loss_type == "focal":
-                    step_recon_cells = weighted_focal_recon_loss(
-                        logits_step,
-                        target_step,
-                        occupied_weight=self.args.occupied_weight,
-                        focal_gamma=self.args.focal_gamma,
-                        reduction="none",
-                    )
-                elif self.args.recon_loss_type == "bce":
-                    step_recon_cells = weighted_bernoulli_recon_loss(
-                        logits_step,
-                        target_step,
-                        occupied_weight=self.args.occupied_weight,
-                        reduction="none",
-                    )
-                else:
-                    raise ValueError(f"Unsupported recon_loss_type: {self.args.recon_loss_type}")
-
-                step_recon = step_recon_cells.reshape(batch_size, -1).mean(dim=1)
-                step_entropy_cells = bernoulli_entropy_loss(logits_step, reduction="none")
-                step_entropy = step_entropy_cells.reshape(batch_size, -1).mean(dim=1)
-
-                pred_step = torch.sigmoid(logits_step.detach())
-                if is_train and teacher_forcing_prob < 1.0:
-                    use_gt = (
-                        torch.rand((batch_size, 1, 1, 1, 1), device=self.device) < teacher_forcing_prob
-                    ).to(target_step.dtype)
-                    feedback_step = use_gt * target_step + (1.0 - use_gt) * pred_step
-                else:
-                    feedback_step = target_step if teacher_forcing_prob >= 1.0 else pred_step
-
-                next_context = torch.cat([context_step[:, :, 1:], feedback_step], dim=2)
-                return step_recon, step_entropy, next_context
 
             selection_step_recons = torch.empty(
                 (self.args.num_latent_samples, batch_size, selection_steps),
@@ -537,11 +597,19 @@ class VAETrainer:
 
                 for step in range(selection_steps):
                     step_velocity = future_velocities[:, step, :]
-                    step_recon, step_entropy, context = _rollout_step(
-                        z,
-                        context,
-                        step_velocity,
-                        step,
+                    static_step = x_static[:, :, self.args.history_len + step]
+                    step_shift_px = future_center_shifts_px[:, step, :]
+                    target_step = y[:, :, step : step + 1]
+                    step_recon, step_entropy, context = self._rollout_step(
+                        z_step=z,
+                        context_step=context,
+                        static_step=static_step,
+                        step_velocity=step_velocity,
+                        step_shift_px=step_shift_px,
+                        target_step=target_step,
+                        is_train=is_train,
+                        teacher_forcing_prob=teacher_forcing_prob,
+                        batch_size=batch_size,
                     )
                     selection_step_recons[z_idx, :, step] = step_recon
                     selection_step_entropies[z_idx, :, step] = step_entropy
@@ -574,11 +642,19 @@ class VAETrainer:
 
                 for step in range(selection_steps, effective_k):
                     step_velocity = future_velocities[:, step, :]
-                    step_recon, step_entropy, context = _rollout_step(
-                        best_z,
-                        context,
-                        step_velocity,
-                        step,
+                    static_step = x_static[:, :, self.args.history_len + step]
+                    step_shift_px = future_center_shifts_px[:, step, :]
+                    target_step = y[:, :, step : step + 1]
+                    step_recon, step_entropy, context = self._rollout_step(
+                        z_step=best_z,
+                        context_step=context,
+                        static_step=static_step,
+                        step_velocity=step_velocity,
+                        step_shift_px=step_shift_px,
+                        target_step=target_step,
+                        is_train=is_train,
+                        teacher_forcing_prob=teacher_forcing_prob,
+                        batch_size=batch_size,
                     )
                     rollout_step_recons[:, step] = step_recon
                     rollout_step_entropies[:, step] = step_entropy

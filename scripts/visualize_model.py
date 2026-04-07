@@ -140,45 +140,41 @@ def load_scene_origins(
         if tuple(scene_velocity_trajectories.shape) != expected_shape:
             raise ValueError("scene_velocity_trajectories must have shape (num_agents, total_time, 2)")
 
+        scene_position_data = getattr(scene, "scene_position_trajectories", None)
+        if scene_position_data is None:
+            raise ValueError("scene_position_trajectories is required")
+        scene_position_trajectories = torch.as_tensor(scene_position_data, dtype=torch.float32)
+        if tuple(scene_position_trajectories.shape) != expected_shape:
+            raise ValueError("scene_position_trajectories must have shape (num_agents, total_time, 2)")
+
         window_size = int(history_len + future_len)
         if window_size <= 0:
             raise ValueError("history_len + future_len must be > 0")
 
-        for agent_idx in sorted(scene.agents.keys()):
-            agent_data = scene.agents[agent_idx]
-            if agent_idx < 0 or agent_idx >= dynamic_maps.shape[0]:
-                continue
-
-            if agent_data.anchor_centers is None:
-                raise ValueError("Agent metadata requires anchor_centers")
-
-            centers = torch.as_tensor(agent_data.anchor_centers, dtype=torch.float32)
-            anchor_times = [int(t) for t in agent_data.anchor_times]
-
-            if centers.ndim != 2 or centers.shape[1] != 2:
-                raise ValueError("anchor_centers must have shape (A, 2)")
-            if len(anchor_times) != centers.shape[0]:
-                raise ValueError("anchor_times must match anchor_centers length")
-
+        for agent_idx in range(int(dynamic_maps.shape[0])):
             agent_dynamic = dynamic_maps[agent_idx]
-            total_time = int(agent_dynamic.shape[0])
             velocity_trajectory = scene_velocity_trajectories[agent_idx]
+            position_trajectory = scene_position_trajectories[agent_idx]
+            total_time = int(agent_dynamic.shape[0])
 
             agent_dynamic_windows: list[torch.Tensor] = []
             agent_static_windows: list[torch.Tensor] = []
             agent_velocity_windows: list[torch.Tensor] = []
             agent_anchor_times: list[int] = []
 
-            for anchor_idx, anchor_t in enumerate(anchor_times):
-                start_t = int(anchor_t - history_len)
-                end_t = int(anchor_t + future_len)
-                if start_t < 0 or end_t > total_time:
-                    continue
+            max_start = total_time - window_size
+            if max_start < 0:
+                continue
 
-                center_xy = centers[anchor_idx]
+            for start_t in range(0, max_start + 1):
+                end_t = int(start_t + window_size)
+                anchor_t = int(start_t + history_len)
+                centers_window = position_trajectory[start_t:end_t]
 
                 dynamic_window: list[torch.Tensor] = []
-                for absolute_t in range(start_t, end_t):
+                static_window: list[torch.Tensor] = []
+                for local_t, absolute_t in enumerate(range(start_t, end_t)):
+                    center_xy = centers_window[local_t]
                     dynamic_window.append(
                         _slice_centered_patch(
                             _to_2d(agent_dynamic[absolute_t]),
@@ -188,24 +184,22 @@ def load_scene_origins(
                             patch_shape,
                         )
                     )
+                    static_window.append(
+                        _slice_centered_patch(
+                            scene_static,
+                            center_xy,
+                            scene_origin,
+                            resolution_xy,
+                            patch_shape,
+                        )
+                    )
 
-                if len(dynamic_window) != window_size:
-                    continue
-
-                static_local = _slice_centered_patch(
-                    scene_static,
-                    center_xy,
-                    scene_origin,
-                    resolution_xy,
-                    patch_shape,
-                )
-                static_sequence = torch.stack([static_local.clone() for _ in range(window_size)], dim=0)
                 velocity_sequence = velocity_trajectory[start_t:end_t].to(dtype=torch.float32)
 
                 agent_dynamic_windows.append(torch.stack(dynamic_window, dim=0))
-                agent_static_windows.append(static_sequence)
+                agent_static_windows.append(torch.stack(static_window, dim=0))
                 agent_velocity_windows.append(velocity_sequence)
-                agent_anchor_times.append(int(anchor_t))
+                agent_anchor_times.append(anchor_t)
 
             if not agent_dynamic_windows:
                 continue

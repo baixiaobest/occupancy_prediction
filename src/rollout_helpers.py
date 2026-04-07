@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import torch
 
 from src.occupancy2d import Occupancy2d
 from src.occupancy_patch import slice_centered_patch
-from src.rollout_data import AgentRollOutData, RollOutData, SceneRollOutData
+from src.rollout_data import RollOutData, SceneRollOutData
 from src.scene import ObstacleSpec
 
 
@@ -146,6 +146,7 @@ def build_agent_centric_occupancy_sequences(
     List[torch.Tensor],
     torch.Tensor,
     List[torch.Tensor],
+    List[torch.Tensor],
     Tuple[float, float],
     Tuple[float, float],
     List[int],
@@ -201,6 +202,7 @@ def build_agent_centric_occupancy_sequences(
 
     dynamic_maps: List[torch.Tensor] = []
     velocity_trajectories: List[torch.Tensor] = []
+    position_trajectories: List[torch.Tensor] = []
     anchor_centers: List[torch.Tensor] = []
     frame_offsets = list(range(-past_frames, future_frames + 1))
 
@@ -228,6 +230,9 @@ def build_agent_centric_occupancy_sequences(
         )
 
         dynamic_maps.append(agent_dynamic)
+        position_trajectories.append(
+            torch.as_tensor(traj[:, center_agent_idx], dtype=torch.float32).clone()
+        )
         velocity_trajectories.append(
             torch.as_tensor(velocities[:, center_agent_idx], dtype=torch.float32).clone()
         )
@@ -236,6 +241,7 @@ def build_agent_centric_occupancy_sequences(
     return (
         dynamic_maps,
         scene_static_map,
+        position_trajectories,
         velocity_trajectories,
         scene_origin,
         (resolution, resolution),
@@ -311,22 +317,21 @@ def build_scene_rollout_data(
     occupancy_resolution: Tuple[float, float],
     occupancy_origin: Tuple[float, float],
     frame_offsets: List[int],
-    anchor_steps: List[int],
     total_steps: int,
     scene_static_map: torch.Tensor,
     dynamic_maps: List[torch.Tensor],
+    position_trajectories: List[torch.Tensor],
     velocity_trajectories: List[torch.Tensor],
-    anchor_centers: List[torch.Tensor],
     scene_map_origin: Tuple[float, float],
     local_map_shape: Tuple[int, int],
 ) -> SceneRollOutData:
     if not (
         len(dynamic_maps)
+        == len(position_trajectories)
         == len(velocity_trajectories)
-        == len(anchor_centers)
     ):
         raise ValueError(
-            "dynamic_maps, velocity_trajectories, anchor_centers must have same length"
+            "dynamic_maps, position_trajectories, velocity_trajectories must have same length"
         )
 
     static_2d = torch.as_tensor(scene_static_map, dtype=torch.float32)
@@ -352,28 +357,22 @@ def build_scene_rollout_data(
     if scene_velocity_trajectories.shape != (scene_dynamic_maps.shape[0], int(total_steps), 2):
         raise ValueError("velocity_trajectories must stack into shape (num_agents, total_steps, 2)")
 
-    agents: Dict[int, AgentRollOutData] = {}
-
-    for agent_idx, center_series in enumerate(anchor_centers):
-        centers_tensor = torch.as_tensor(center_series, dtype=torch.float32)
-        if centers_tensor.shape != (len(anchor_steps), 2):
-            raise ValueError("center series must have shape (num_anchors, 2)")
-
-        agents[agent_idx] = AgentRollOutData(
-            agent_index=agent_idx,
-            anchor_times=[int(t) for t in anchor_steps],
-            anchor_centers=centers_tensor.clone(),
-        )
+    scene_position_trajectories = torch.stack(
+        [torch.as_tensor(p, dtype=torch.float32) for p in position_trajectories],
+        dim=0,
+    )
+    if scene_position_trajectories.shape != (scene_dynamic_maps.shape[0], int(total_steps), 2):
+        raise ValueError("position_trajectories must stack into shape (num_agents, total_steps, 2)")
 
     return SceneRollOutData(
         dt=float(dt),
         occupancy_resolution=(float(occupancy_resolution[0]), float(occupancy_resolution[1])),
         occupancy_origin=(float(occupancy_origin[0]), float(occupancy_origin[1])),
         frame_offsets=[int(v) for v in frame_offsets],
-        agents=agents,
         scene_static_map=static_2d,
         scene_dynamic_maps=scene_dynamic_maps,
         scene_velocity_trajectories=scene_velocity_trajectories,
+        scene_position_trajectories=scene_position_trajectories,
         scene_map_origin=(float(scene_map_origin[0]), float(scene_map_origin[1])),
         local_map_shape=(int(local_map_shape[0]), int(local_map_shape[1])),
     )
@@ -384,12 +383,11 @@ def _build_scene_rollout_payload(
     occupancy_resolution: Tuple[float, float],
     occupancy_origin: Tuple[float, float],
     frame_offsets: List[int],
-    anchor_steps: List[int],
     total_steps: int,
     scene_static_map: torch.Tensor,
     dynamic_maps: List[torch.Tensor],
+    position_trajectories: List[torch.Tensor],
     velocity_trajectories: List[torch.Tensor],
-    anchor_centers: List[torch.Tensor],
     scene_map_origin: Tuple[float, float],
     local_map_shape: Tuple[int, int],
 ) -> SceneRollOutData:
@@ -398,12 +396,11 @@ def _build_scene_rollout_payload(
         occupancy_resolution=occupancy_resolution,
         occupancy_origin=occupancy_origin,
         frame_offsets=frame_offsets,
-        anchor_steps=anchor_steps,
         total_steps=total_steps,
         scene_static_map=scene_static_map,
         dynamic_maps=dynamic_maps,
+        position_trajectories=position_trajectories,
         velocity_trajectories=velocity_trajectories,
-        anchor_centers=anchor_centers,
         scene_map_origin=scene_map_origin,
         local_map_shape=local_map_shape,
     )
@@ -416,12 +413,11 @@ def append_scene_rollout_to_template(
     occupancy_resolution: Tuple[float, float],
     occupancy_origin: Tuple[float, float],
     frame_offsets: List[int],
-    anchor_steps: List[int],
     total_steps: int,
     scene_static_map: torch.Tensor,
     dynamic_maps: List[torch.Tensor],
+    position_trajectories: List[torch.Tensor],
     velocity_trajectories: List[torch.Tensor],
-    anchor_centers: List[torch.Tensor],
     scene_map_origin: Tuple[float, float],
     local_map_shape: Tuple[int, int],
 ) -> None:
@@ -430,12 +426,11 @@ def append_scene_rollout_to_template(
         occupancy_resolution=occupancy_resolution,
         occupancy_origin=occupancy_origin,
         frame_offsets=frame_offsets,
-        anchor_steps=anchor_steps,
         total_steps=total_steps,
         scene_static_map=scene_static_map,
         dynamic_maps=dynamic_maps,
+        position_trajectories=position_trajectories,
         velocity_trajectories=velocity_trajectories,
-        anchor_centers=anchor_centers,
         scene_map_origin=scene_map_origin,
         local_map_shape=local_map_shape,
     )
@@ -464,12 +459,11 @@ def save_scene_rollouts(
     occupancy_resolution: Tuple[float, float],
     occupancy_origin: Tuple[float, float],
     frame_offsets: List[int],
-    anchor_steps: List[int],
     total_steps: int,
     scene_static_map: torch.Tensor,
     dynamic_maps: List[torch.Tensor],
+    position_trajectories: List[torch.Tensor],
     velocity_trajectories: List[torch.Tensor],
-    anchor_centers: List[torch.Tensor],
     scene_map_origin: Tuple[float, float],
     local_map_shape: Tuple[int, int],
 ) -> None:
@@ -478,12 +472,11 @@ def save_scene_rollouts(
         occupancy_resolution=occupancy_resolution,
         occupancy_origin=occupancy_origin,
         frame_offsets=frame_offsets,
-        anchor_steps=anchor_steps,
         total_steps=total_steps,
         scene_static_map=scene_static_map,
         dynamic_maps=dynamic_maps,
+        position_trajectories=position_trajectories,
         velocity_trajectories=velocity_trajectories,
-        anchor_centers=anchor_centers,
         scene_map_origin=scene_map_origin,
         local_map_shape=local_map_shape,
     )
