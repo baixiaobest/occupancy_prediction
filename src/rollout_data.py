@@ -13,7 +13,6 @@ class AgentRollOutData:
     agent_index: int
     anchor_times: List[int] = field(default_factory=list)
     anchor_centers: torch.Tensor | None = None
-    current_velocities: torch.Tensor | None = None
 
 
 @dataclass
@@ -26,7 +25,9 @@ class SceneRollOutData:
             (num_agents, total_time, H, W).
             `scene_dynamic_maps[i, t]` is the global occupancy map at absolute
             timestep `t` with centered agent `i` removed.
-        - agents[agent_index] contains anchor_times + anchor_centers + current_velocities.
+        - scene_velocity_trajectories stores per-agent velocity with shape
+            (num_agents, total_time, 2).
+        - agents[agent_index] contains anchor_times + anchor_centers.
         - local_map_shape gives the local crop size (H, W) used by dataset loading.
     """
 
@@ -37,6 +38,7 @@ class SceneRollOutData:
     agents: Dict[int, AgentRollOutData] = field(default_factory=dict)
     scene_static_map: torch.Tensor | None = None
     scene_dynamic_maps: torch.Tensor | None = None
+    scene_velocity_trajectories: torch.Tensor | None = None
     scene_map_origin: Tuple[float, float] | None = None
     local_map_shape: Tuple[int, int] | None = None
 

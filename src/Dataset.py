@@ -34,7 +34,7 @@ class LazySampleRef:
     dynamic_global: torch.Tensor
     static_global: torch.Tensor
     center_xy: torch.Tensor
-    current_velocity: torch.Tensor
+    velocity_window: torch.Tensor
     scene_origin: tuple[float, float]
     resolution_xy: tuple[float, float]
     patch_shape: tuple[int, int]
@@ -72,8 +72,8 @@ class _OccupancyWindowBase(Dataset):
         self,
         seq: torch.Tensor,
         current_static: torch.Tensor,
-        current_velocity: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        velocity_window: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if seq.ndim != 3:
             raise ValueError("Sequence must have shape (history+future, H, W)")
         if seq.shape[0] != self.window_size:
@@ -82,18 +82,23 @@ class _OccupancyWindowBase(Dataset):
             raise ValueError("Static map must have shape (H, W)")
         if current_static.shape != seq.shape[-2:]:
             raise ValueError("Static map shape must match sequence spatial shape")
-        vel = torch.as_tensor(current_velocity, dtype=torch.float32)
-        if vel.shape != (2,):
-            raise ValueError("Current velocity must have shape (2,)")
+
+        vel_window = torch.as_tensor(velocity_window, dtype=torch.float32)
+        if vel_window.shape == (2,):
+            vel_window = vel_window.unsqueeze(0).repeat(self.window_size, 1)
+        if vel_window.shape != (self.window_size, 2):
+            raise ValueError("Velocity window must have shape (history_len+future_len, 2) or (2,)")
 
         past = seq[: self.history_len]
         future = seq[self.history_len : self.window_size]
+        current_velocity = vel_window[self.history_len]
+        future_velocities = vel_window[self.history_len : self.window_size]
 
         x_encoder_dynamic = torch.cat([past, future], dim=0).unsqueeze(0)
         x_decoder_dynamic = past[-self.decoder_context_len :].unsqueeze(0)
         x_static = current_static.unsqueeze(0)
         y = future.unsqueeze(0)
-        return x_encoder_dynamic, x_decoder_dynamic, x_static, vel, y
+        return x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, future_velocities, y
 
 class OccupancyWindowDataset(_OccupancyWindowBase):
     """Anchor-window dataset over precomputed local occupancy windows."""
@@ -124,15 +129,15 @@ class OccupancyWindowDataset(_OccupancyWindowBase):
             if static_map.shape != seq.shape[-2:]:
                 raise ValueError("Static map spatial shape must match sequence shape")
             vel = torch.as_tensor(velocity, dtype=torch.float32)
-            if vel.shape != (2,):
-                raise ValueError("Each velocity must have shape (2,)")
+            if vel.shape != (2,) and vel.shape != (self.window_size, 2):
+                raise ValueError("Each velocity must have shape (2,) or (history_len+future_len, 2)")
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        seq, current_static, current_velocity = self.samples[index]
-        return self._format_model_io(seq, current_static, current_velocity)
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        seq, current_static, velocity_window = self.samples[index]
+        return self._format_model_io(seq, current_static, velocity_window)
 
 
 class LazyOccupancyWindowDataset(_OccupancyWindowBase):
@@ -157,7 +162,7 @@ class LazyOccupancyWindowDataset(_OccupancyWindowBase):
     def __len__(self) -> int:
         return len(self.sample_refs)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         ref = self.sample_refs[index]
 
         dynamic_frames: list[torch.Tensor] = []
@@ -181,7 +186,7 @@ class LazyOccupancyWindowDataset(_OccupancyWindowBase):
             ref.patch_shape,
             prefer_view=True,
         )
-        return self._format_model_io(seq, static_local, ref.current_velocity)
+        return self._format_model_io(seq, static_local, ref.velocity_window)
 
 
 def _slice_centered_patch_binary(
@@ -263,7 +268,14 @@ class DatasetBuilder:
     def _unpack_scene_maps(
         self,
         scene: SceneRollOutData,
-    ) -> tuple[torch.Tensor, tuple[float, float], tuple[float, float], tuple[int, int], torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        tuple[float, float],
+        tuple[float, float],
+        tuple[int, int],
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Validate and unpack common scene-level map fields used by loaders."""
 
         scene_static = self._to_2d_binary(scene.scene_static_map)
@@ -280,9 +292,32 @@ class DatasetBuilder:
         if dynamic_maps.ndim != 4:
             raise ValueError("scene_dynamic_maps must have shape (num_agents, total_time, H, W)")
 
-        return scene_static, scene_origin, resolution_xy, patch_shape, dynamic_maps
+        scene_velocity_data = getattr(scene, "scene_velocity_trajectories", None)
+        if scene_velocity_data is None:
+            raise ValueError("scene_velocity_trajectories is required")
 
-    def _iter_valid_anchors(self, scene: SceneRollOutData, dynamic_maps: torch.Tensor):
+        scene_velocity_trajectories = torch.as_tensor(scene_velocity_data, dtype=torch.float32)
+        if scene_velocity_trajectories.ndim != 3:
+            raise ValueError("scene_velocity_trajectories must have shape (num_agents, total_time, 2)")
+        expected_shape = (int(dynamic_maps.shape[0]), int(dynamic_maps.shape[1]), 2)
+        if tuple(scene_velocity_trajectories.shape) != expected_shape:
+            raise ValueError("scene_velocity_trajectories must match dynamic_maps agent/time dimensions")
+
+        return (
+            scene_static,
+            scene_origin,
+            resolution_xy,
+            patch_shape,
+            dynamic_maps,
+            scene_velocity_trajectories,
+        )
+
+    def _iter_valid_anchors(
+        self,
+        scene: SceneRollOutData,
+        dynamic_maps: torch.Tensor,
+        scene_velocity_trajectories: torch.Tensor,
+    ):
         """Yield validated per-anchor metadata for each agent in one scene."""
         for agent_idx in sorted(scene.agents.keys()):
             if agent_idx < 0 or agent_idx >= dynamic_maps.shape[0]:
@@ -292,18 +327,16 @@ class DatasetBuilder:
             anchor_times = agent_data.anchor_times
             if not anchor_times:
                 continue
-            if agent_data.anchor_centers is None or agent_data.current_velocities is None:
-                raise ValueError("Agent metadata requires anchor_centers and current_velocities")
+            if agent_data.anchor_centers is None:
+                raise ValueError("Agent metadata requires anchor_centers")
 
             centers_tensor = torch.as_tensor(agent_data.anchor_centers, dtype=torch.float32)
-            velocity_tensor = torch.as_tensor(agent_data.current_velocities, dtype=torch.float32)
             if centers_tensor.shape != (len(anchor_times), 2):
                 raise ValueError("anchor_centers must have shape (num_anchors, 2)")
-            if velocity_tensor.shape != (len(anchor_times), 2):
-                raise ValueError("current_velocities must have shape (num_anchors, 2)")
 
             agent_dynamic = dynamic_maps[agent_idx]
             total_time = int(agent_dynamic.shape[0])
+
             anchor_indices = list(range(0, len(anchor_times), max(1, self.window_stride)))
             for anchor_meta_idx in anchor_indices:
                 anchor_t = int(anchor_times[anchor_meta_idx])
@@ -311,10 +344,13 @@ class DatasetBuilder:
                 end_t = anchor_t + self.future_len
                 if start_t < 0 or end_t > total_time:
                     continue
+
+                velocity_window = scene_velocity_trajectories[agent_idx, start_t:end_t].to(dtype=torch.float32)
+
                 yield (
                     agent_dynamic,
                     centers_tensor[anchor_meta_idx],
-                    velocity_tensor[anchor_meta_idx].to(dtype=torch.float32),
+                    velocity_window,
                     int(start_t),
                     int(end_t),
                 )
@@ -356,11 +392,22 @@ class DatasetBuilder:
 
         def _from_scene_obj(scene: SceneRollOutData) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
             out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-            scene_static, scene_origin, resolution_xy, patch_shape, dynamic_maps = self._unpack_scene_maps(scene)
+            (
+                scene_static,
+                scene_origin,
+                resolution_xy,
+                patch_shape,
+                dynamic_maps,
+                scene_velocity_trajectories,
+            ) = self._unpack_scene_maps(scene)
 
             window_size = int(self.history_len + self.future_len)
 
-            for agent_dynamic, center_xy, velocity_xy, start_t, end_t in self._iter_valid_anchors(scene, dynamic_maps):
+            for agent_dynamic, center_xy, velocity_window, start_t, end_t in self._iter_valid_anchors(
+                scene,
+                dynamic_maps,
+                scene_velocity_trajectories,
+            ):
                 static_local = _slice_centered_patch_binary(
                     grid=scene_static,
                     center_xy=center_xy,
@@ -390,7 +437,7 @@ class DatasetBuilder:
                     (
                         torch.stack(dynamic_window, dim=0),
                         static_local,
-                        velocity_xy,
+                        velocity_window,
                     )
                 )
 
@@ -420,14 +467,25 @@ class DatasetBuilder:
             raise ValueError(f"Unsupported payload format in {pt_path}: expected RollOutData")
 
         for scene in payload.scenes:
-            scene_static, scene_origin, resolution_xy, patch_shape, dynamic_maps = self._unpack_scene_maps(scene)
-            for agent_dynamic, center_xy, velocity_xy, start_t, end_t in self._iter_valid_anchors(scene, dynamic_maps):
+            (
+                scene_static,
+                scene_origin,
+                resolution_xy,
+                patch_shape,
+                dynamic_maps,
+                scene_velocity_trajectories,
+            ) = self._unpack_scene_maps(scene)
+            for agent_dynamic, center_xy, velocity_window, start_t, end_t in self._iter_valid_anchors(
+                scene,
+                dynamic_maps,
+                scene_velocity_trajectories,
+            ):
                 refs.append(
                     LazySampleRef(
                         dynamic_global=agent_dynamic,
                         static_global=scene_static,
                         center_xy=center_xy.clone(),
-                        current_velocity=velocity_xy.clone(),
+                        velocity_window=velocity_window.clone(),
                         scene_origin=scene_origin,
                         resolution_xy=resolution_xy,
                         patch_shape=patch_shape,

@@ -100,7 +100,7 @@ def run_epoch(
         encoder: VAE encoder instance.
         decoder: VAE decoder instance.
         loader: DataLoader yielding
-            `(x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y)`.
+            `(x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, future_velocities, y)`.
         optimizer: Optimizer to use for training, or `None` for evaluation.
         device: Device to run tensors on.
         recon_loss_type: Reconstruction loss type: `bce` or `focal`.
@@ -128,11 +128,12 @@ def run_epoch(
     total_kl_objective = 0.0
     total_batches = 0
 
-    for x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, y in loader:
+    for x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, future_velocities, y in loader:
         x_encoder_dynamic = x_encoder_dynamic.to(device)
         x_decoder_dynamic = x_decoder_dynamic.to(device)
         x_static = x_static.to(device)
         current_velocity = current_velocity.to(device)
+        future_velocities = future_velocities.to(device)
         y = y.to(device)
 
         if is_train:
@@ -148,9 +149,10 @@ def run_epoch(
         def _rollout_step(
             z_step: torch.Tensor,
             context_step: torch.Tensor,
+            step_velocity: torch.Tensor,
             step: int,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            logits_full = decoder(z_step, context_step, x_static, current_velocity)
+            logits_full = decoder(z_step, context_step, x_static, step_velocity)
             logits_step = logits_full[:, :, :1]
             target_step = y[:, :, step : step + 1]
 
@@ -215,7 +217,13 @@ def run_epoch(
             context = x_decoder_dynamic.clone()
 
             for step in range(selection_steps):
-                step_recon, step_entropy, context = _rollout_step(z, context, step)
+                step_velocity = future_velocities[:, step, :]
+                step_recon, step_entropy, context = _rollout_step(
+                    z,
+                    context,
+                    step_velocity,
+                    step,
+                )
                 selection_step_recons[z_idx, :, step] = step_recon
                 selection_step_entropies[z_idx, :, step] = step_entropy
 
@@ -246,7 +254,13 @@ def run_epoch(
             context = context_candidates[best_z_indices, batch_indices, ...]
 
             for step in range(selection_steps, effective_k):
-                step_recon, step_entropy, context = _rollout_step(best_z, context, step)
+                step_velocity = future_velocities[:, step, :]
+                step_recon, step_entropy, context = _rollout_step(
+                    best_z,
+                    context,
+                    step_velocity,
+                    step,
+                )
                 rollout_step_recons[:, step] = step_recon
                 rollout_step_entropies[:, step] = step_entropy
         else:
@@ -559,7 +573,14 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    sample_x_encoder_dynamic, sample_x_decoder_dynamic, sample_x_static, _sample_current_velocity, sample_y = train_dataset[0]
+    (
+        sample_x_encoder_dynamic,
+        sample_x_decoder_dynamic,
+        sample_x_static,
+        _sample_current_velocity,
+        _sample_future_velocities,
+        sample_y,
+    ) = train_dataset[0]
     _, enc_t, h, w = sample_x_encoder_dynamic.shape
     _, dec_ctx_t, _, _ = sample_x_decoder_dynamic.shape
     input_shape = (1, enc_t, h, w)

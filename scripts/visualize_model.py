@@ -130,6 +130,16 @@ def load_scene_origins(
         dynamic_maps = torch.as_tensor(scene.scene_dynamic_maps, dtype=torch.float32)
         if dynamic_maps.ndim != 4:
             raise ValueError("scene_dynamic_maps must have shape (num_agents, total_time, H, W)")
+
+        scene_velocity_data = getattr(scene, "scene_velocity_trajectories", None)
+        if scene_velocity_data is None:
+            raise ValueError("scene_velocity_trajectories is required")
+
+        scene_velocity_trajectories = torch.as_tensor(scene_velocity_data, dtype=torch.float32)
+        expected_shape = (int(dynamic_maps.shape[0]), int(dynamic_maps.shape[1]), 2)
+        if tuple(scene_velocity_trajectories.shape) != expected_shape:
+            raise ValueError("scene_velocity_trajectories must have shape (num_agents, total_time, 2)")
+
         window_size = int(history_len + future_len)
         if window_size <= 0:
             raise ValueError("history_len + future_len must be > 0")
@@ -139,22 +149,20 @@ def load_scene_origins(
             if agent_idx < 0 or agent_idx >= dynamic_maps.shape[0]:
                 continue
 
-            if agent_data.anchor_centers is None or agent_data.current_velocities is None:
-                raise ValueError("Agent metadata requires anchor_centers and current_velocities")
+            if agent_data.anchor_centers is None:
+                raise ValueError("Agent metadata requires anchor_centers")
 
             centers = torch.as_tensor(agent_data.anchor_centers, dtype=torch.float32)
-            velocities = torch.as_tensor(agent_data.current_velocities, dtype=torch.float32)
             anchor_times = [int(t) for t in agent_data.anchor_times]
 
             if centers.ndim != 2 or centers.shape[1] != 2:
                 raise ValueError("anchor_centers must have shape (A, 2)")
-            if velocities.shape != centers.shape:
-                raise ValueError("current_velocities must match anchor_centers shape")
             if len(anchor_times) != centers.shape[0]:
                 raise ValueError("anchor_times must match anchor_centers length")
 
             agent_dynamic = dynamic_maps[agent_idx]
             total_time = int(agent_dynamic.shape[0])
+            velocity_trajectory = scene_velocity_trajectories[agent_idx]
 
             agent_dynamic_windows: list[torch.Tensor] = []
             agent_static_windows: list[torch.Tensor] = []
@@ -192,7 +200,7 @@ def load_scene_origins(
                     patch_shape,
                 )
                 static_sequence = torch.stack([static_local.clone() for _ in range(window_size)], dim=0)
-                velocity_sequence = velocities[anchor_idx].to(dtype=torch.float32).unsqueeze(0).repeat(window_size, 1)
+                velocity_sequence = velocity_trajectory[start_t:end_t].to(dtype=torch.float32)
 
                 agent_dynamic_windows.append(torch.stack(dynamic_window, dim=0))
                 agent_static_windows.append(static_sequence)
