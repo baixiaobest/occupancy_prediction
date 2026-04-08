@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import os
 import sys
 from pathlib import Path
@@ -61,7 +62,10 @@ def load_scene_origins(
     uses a fixed anchor center to slice a local window, so it is not a moving frame.
     """
     try:
-        payload = torch.load(pt_path, map_location="cpu")
+        try:
+            payload = torch.load(pt_path, map_location="cpu", mmap=True)
+        except TypeError:
+            payload = torch.load(pt_path, map_location="cpu")
     except AttributeError as exc:
         raise ValueError(
             f"Failed to load {pt_path}: legacy rollout format is no longer supported. "
@@ -74,7 +78,7 @@ def load_scene_origins(
             tensor = tensor[0]
         if tensor.ndim != 2:
             raise ValueError(f"Occupancy frame must be 2D, got shape {tuple(tensor.shape)}")
-        return (tensor > 0).float()
+        return tensor
 
     scene_dynamic_sequences: list[list[torch.Tensor]] = []
     scene_static_maps: list[list[torch.Tensor]] = []
@@ -111,7 +115,7 @@ def load_scene_origins(
         dst_x1 = dst_x0 + (src_x1 - src_x0)
         dst_y1 = dst_y0 + (src_y1 - src_y0)
         out[dst_y0:dst_y1, dst_x0:dst_x1] = grid[src_y0:src_y1, src_x0:src_x1]
-        return (out > 0).float()
+        return out
 
     def _collect_from_scene_obj(
         scene: SceneRollOutData,
@@ -174,16 +178,15 @@ def load_scene_origins(
             for start_t in range(0, max_start + 1):
                 end_t = int(start_t + window_size)
                 anchor_t = int(start_t + history_len)
-                centers_window = position_trajectory[start_t:end_t]
+                anchor_position = position_trajectory[anchor_t].to(dtype=torch.float32)
 
                 dynamic_window: list[torch.Tensor] = []
                 static_window: list[torch.Tensor] = []
-                for local_t, absolute_t in enumerate(range(start_t, end_t)):
-                    center_xy = centers_window[local_t]
+                for absolute_t in range(start_t, end_t):
                     dynamic_window.append(
                         _slice_centered_patch(
                             _to_2d(agent_dynamic[absolute_t]),
-                            center_xy,
+                            anchor_position,
                             scene_origin,
                             resolution_xy,
                             patch_shape,
@@ -192,7 +195,7 @@ def load_scene_origins(
                     static_window.append(
                         _slice_centered_patch(
                             scene_static,
-                            center_xy,
+                            anchor_position,
                             scene_origin,
                             resolution_xy,
                             patch_shape,
@@ -200,11 +203,11 @@ def load_scene_origins(
                     )
 
                 velocity_sequence = velocity_trajectory[start_t:end_t].to(dtype=torch.float32)
-                anchor_position = position_trajectory[anchor_t].to(dtype=torch.float32)
                 position_offset_sequence = position_trajectory[start_t:end_t].to(dtype=torch.float32) - anchor_position
 
-                agent_dynamic_windows.append(torch.stack(dynamic_window, dim=0))
-                agent_static_windows.append(torch.stack(static_window, dim=0))
+                # Keep probabilistic occupancy and use float16 for lower memory.
+                agent_dynamic_windows.append(torch.stack(dynamic_window, dim=0).to(torch.float16))
+                agent_static_windows.append(torch.stack(static_window, dim=0).to(torch.float16))
                 agent_velocity_windows.append(velocity_sequence)
                 agent_position_offset_windows.append(position_offset_sequence)
                 agent_anchor_times.append(anchor_t)
@@ -349,10 +352,10 @@ def autoregressive_predict(
     binary_feedback: bool,
     threshold: float,
 ) -> torch.Tensor:
-    """Compute predictions for all anchors t in [history_len, T-1].
+    """Compute predictions for the current anchored window.
 
-    Returns tensor of shape (M, T-history_len, horizon, H, W), where M is
-    the number of selected modalities.
+    Returns tensor of shape (M, 1, horizon, H, W), where M is the number of
+    selected modalities.
     """
     t_total, h, w = dynamic_sequence.shape
     if static_sequence.ndim != 3:
@@ -362,33 +365,33 @@ def autoregressive_predict(
     if t_total <= history_len:
         return torch.zeros((num_modalities, 0, horizon, h, w), dtype=torch.float32)
 
-    all_preds = torch.zeros((num_modalities, t_total - history_len, horizon, h, w), dtype=torch.float32)
+    all_preds = torch.zeros((num_modalities, 1, horizon, h, w), dtype=torch.float32)
+    anchor_t = int(history_len)
 
     with torch.no_grad():
-        for anchor_t in range(history_len, t_total):
-            for modality_idx in range(num_modalities):
-                context = dynamic_sequence[anchor_t - history_len : anchor_t].clone()  # (history_len, H, W)
-                z = torch.randn((1, latent_channels, latent_shape[0], latent_shape[1], latent_shape[2]), device=device)
-                pred_frames: list[torch.Tensor] = []
-                for _ in range(horizon):
-                    x_decoder_dynamic = context[-decoder_context_len:].unsqueeze(0).unsqueeze(0).to(device)
-                    x_static = static_sequence[anchor_t].unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
-                    current_velocity = velocity_sequence[anchor_t].unsqueeze(0).to(device)
-                    current_position_offset = position_offset_sequence[anchor_t].unsqueeze(0).to(device)
-                    logits = decoder(
-                        z,
-                        x_decoder_dynamic,
-                        x_static,
-                        current_velocity,
-                        current_position_offset,
-                    )
-                    prob = torch.sigmoid(logits)[0, 0, 0].detach().cpu()
-                    pred_frames.append(prob)
+        for modality_idx in range(num_modalities):
+            context = dynamic_sequence[anchor_t - history_len : anchor_t].clone()  # (history_len, H, W)
+            z = torch.randn((1, latent_channels, latent_shape[0], latent_shape[1], latent_shape[2]), device=device)
+            pred_frames: list[torch.Tensor] = []
+            for _ in range(horizon):
+                x_decoder_dynamic = context[-decoder_context_len:].unsqueeze(0).unsqueeze(0).to(device)
+                x_static = static_sequence[anchor_t].unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
+                current_velocity = velocity_sequence[anchor_t].unsqueeze(0).to(device)
+                current_position_offset = position_offset_sequence[anchor_t].unsqueeze(0).to(device)
+                logits = decoder(
+                    z,
+                    x_decoder_dynamic,
+                    x_static,
+                    current_velocity,
+                    current_position_offset,
+                )
+                prob = torch.sigmoid(logits)[0, 0, 0].detach().cpu()
+                pred_frames.append(prob)
 
-                    feedback = (prob >= threshold).float() if binary_feedback else prob
-                    context = torch.cat([context, feedback.unsqueeze(0)], dim=0)
+                feedback = (prob >= threshold).float() if binary_feedback else prob
+                context = torch.cat([context, feedback.unsqueeze(0)], dim=0)
 
-                all_preds[modality_idx, anchor_t - history_len] = torch.stack(pred_frames, dim=0)
+            all_preds[modality_idx, 0] = torch.stack(pred_frames, dim=0)
 
     return all_preds
 
@@ -405,7 +408,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-index", type=int, default=0, help="Initial agent index within selected scene")
     parser.add_argument("--horizon", type=int, default=4, help="Initial autoregressive horizon")
     parser.add_argument("--max-horizon", type=int, default=16, help="Max horizon in GUI slider")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device for model inference")
+    parser.add_argument("--cache-size", type=int, default=6, help="Max prediction entries cached in memory")
     parser.add_argument("--binary-feedback", action="store_true", help="Feed thresholded predictions back into context")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for binary feedback")
     return parser.parse_args()
@@ -415,6 +419,7 @@ def main() -> None:
     args = parse_args()
 
     device = torch.device(args.device)
+    runtime_state = {"device": device}
 
     decoder, history_len, decoder_context_len, latent_shape, latent_channels = build_models(
         checkpoint_path=args.checkpoint,
@@ -450,7 +455,7 @@ def main() -> None:
     _, init_h, init_w = init_seq.shape
 
     # Cache by (scene_index, agent_index, anchor_index, horizon, num_modalities).
-    cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
+    cache: OrderedDict[tuple[int, int, int, int, int], torch.Tensor] = OrderedDict()
 
     def get_predictions(
         scene_idx: int,
@@ -465,30 +470,40 @@ def main() -> None:
                 f"Running inference for scene={scene_idx}, agent={agent_idx}, anchor={anchor_idx}, "
                 f"horizon={horizon}, modalities={num_modalities} ..."
             )
-            seq = scene_sequences[scene_idx][agent_idx][anchor_idx]
-            static_sequence = scene_static_maps[scene_idx][agent_idx][anchor_idx]
+            seq = scene_sequences[scene_idx][agent_idx][anchor_idx].to(dtype=torch.float32)
+            static_sequence = scene_static_maps[scene_idx][agent_idx][anchor_idx].to(dtype=torch.float32)
             velocity_seq = scene_velocity_sequences[scene_idx][agent_idx][anchor_idx]
             position_offset_seq = scene_position_offsets[scene_idx][agent_idx][anchor_idx]
-            cache[key] = autoregressive_predict(
-                dynamic_sequence=seq,
-                static_sequence=static_sequence,
-                velocity_sequence=velocity_seq,
-                position_offset_sequence=position_offset_seq,
-                decoder=decoder,
-                history_len=history_len,
-                decoder_context_len=decoder_context_len,
-                latent_shape=latent_shape,
-                latent_channels=latent_channels,
-                horizon=horizon,
-                num_modalities=num_modalities,
-                device=device,
-                binary_feedback=args.binary_feedback,
-                threshold=args.threshold,
-            )
+            try:
+                preds = autoregressive_predict(
+                    dynamic_sequence=seq,
+                    static_sequence=static_sequence,
+                    velocity_sequence=velocity_seq,
+                    position_offset_sequence=position_offset_seq,
+                    decoder=decoder,
+                    history_len=history_len,
+                    decoder_context_len=decoder_context_len,
+                    latent_shape=latent_shape,
+                    latent_channels=latent_channels,
+                    horizon=horizon,
+                    num_modalities=num_modalities,
+                    device=runtime_state["device"],
+                    binary_feedback=args.binary_feedback,
+                    threshold=args.threshold,
+                )
+            except RuntimeError as exc:
+                exc_msg = str(exc).lower()
+                if runtime_state["device"].type == "cuda" and "out of memory" in exc_msg:
+                    print("CUDA out of memory during inference. Falling back to CPU.")
+                    raise
+
+            cache[key] = preds.to(dtype=torch.float16)
+            while len(cache) > max(1, int(args.cache_size)):
+                cache.popitem(last=False)
             t_total = int(seq.shape[0])
             print(
                 "Done. Total inferences: "
-                f"{(max(t_total - history_len, 0)) * horizon * num_modalities}"
+                f"{horizon * num_modalities}"
             )
         return cache[key]
 
@@ -607,16 +622,16 @@ def main() -> None:
             t_slider.set_val(anchor_idx)
             return
 
-        seq = scene_sequences[scene_idx][agent_idx][anchor_idx]
-        static_seq = scene_static_maps[scene_idx][agent_idx][anchor_idx]
+        seq = scene_sequences[scene_idx][agent_idx][anchor_idx].to(dtype=torch.float32)
+        static_seq = scene_static_maps[scene_idx][agent_idx][anchor_idx].to(dtype=torch.float32)
         t_total, h_img, w_img = seq.shape
 
-        preds = get_predictions(scene_idx, agent_idx, anchor_idx, horizon, max_mode_count)
+        preds = get_predictions(scene_idx, agent_idx, anchor_idx, horizon, max_mode_count).to(dtype=torch.float32)
 
         t_anchor = int(history_len)
         past = seq[t_anchor - history_len : t_anchor]  # (history_len, H, W)
-        past_stack = (past.max(dim=0).values > 0.0).float()
-        static_map = (static_seq[t_anchor] > 0.0).float()
+        past_stack = past.max(dim=0).values.clamp(0.0, 1.0)
+        static_map = static_seq[t_anchor].clamp(0.0, 1.0)
 
         pred_stack_1 = torch.zeros((h_img, w_img), dtype=torch.float32)
         pred_stack_2 = torch.zeros((h_img, w_img), dtype=torch.float32)
@@ -631,7 +646,7 @@ def main() -> None:
 
         gt_future = seq[t_anchor : min(t_anchor + horizon, t_total)]
         if gt_future.shape[0] > 0:
-            gt_stack = (gt_future.max(dim=0).values > 0.0).float()
+            gt_stack = gt_future.max(dim=0).values.clamp(0.0, 1.0)
         else:
             gt_stack = torch.zeros((h_img, w_img), dtype=torch.float32)
 
@@ -669,7 +684,7 @@ def main() -> None:
 
         anchor_time = scene_anchor_times[scene_idx][agent_idx][anchor_idx]
 
-        total_infer = max(t_total - history_len, 0) * horizon * max_mode_count
+        total_infer = horizon * max_mode_count
         info_text.set_text(
             f"scene={scene_idx} | agent={agent_idx} | anchor_idx={anchor_idx} | anchor_t={anchor_time} | "
             f"window_T={t_total} | horizon={horizon} | "

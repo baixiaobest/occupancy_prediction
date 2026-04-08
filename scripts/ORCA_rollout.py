@@ -25,7 +25,7 @@ from src.rollout_visualization import (
     prepare_animation_grids,
     prepare_past_future_dynamic_grids,
 )
-from src.templates import cross_templates, default_templates, test_templates
+from src.templates import cross_templates, default_templates, test_templates, l_shape_templates
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -33,7 +33,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--template-set",
         type=str,
-        choices=["default", "test", "cross"],
+        choices=["default", "test", "cross", "l_shape"],
         default="default",
         help="Template function to use: default_templates, test_templates, or cross_templates.",
     )
@@ -86,6 +86,8 @@ def _select_templates(template_set: str):
         return test_templates(), "test"
     if template_set == "cross":
         return cross_templates(), "cross"
+    if template_set == "l_shape":
+        return l_shape_templates(), "l_shape"
     raise ValueError(f"Unknown template set: {template_set}")
 
 
