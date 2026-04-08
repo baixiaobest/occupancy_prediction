@@ -45,6 +45,7 @@ def load_scene_origins(
     list[list[torch.Tensor]],
     list[list[torch.Tensor]],
     list[list[torch.Tensor]],
+    list[list[torch.Tensor]],
     list[list[list[int]]],
 ]:
     """Load dynamic time-series and static maps grouped by scene and origin.
@@ -53,6 +54,7 @@ def load_scene_origins(
         scene_dynamic_sequences: list[scene] of list[agent] tensors `(A, T, H, W)`
         scene_static_maps: list[scene] of list[agent] tensors `(A, T, H, W)`
         scene_velocity_sequences: list[scene] of list[agent] tensors `(A, T, 2)`
+        scene_position_offsets: list[scene] of list[agent] tensors `(A, T, 2)`
         scene_anchor_times: list[scene] of list[agent] anchor-time lists length `A`
 
     For one selected agent, the time slider indexes anchor slots (A). Each slot
@@ -77,6 +79,7 @@ def load_scene_origins(
     scene_dynamic_sequences: list[list[torch.Tensor]] = []
     scene_static_maps: list[list[torch.Tensor]] = []
     scene_velocity_sequences: list[list[torch.Tensor]] = []
+    scene_position_offsets: list[list[torch.Tensor]] = []
     scene_anchor_times: list[list[list[int]]] = []
 
     def _slice_centered_patch(
@@ -112,7 +115,7 @@ def load_scene_origins(
 
     def _collect_from_scene_obj(
         scene: SceneRollOutData,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[list[int]]]:
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[list[int]]]:
         if scene.scene_static_map is None or scene.scene_map_origin is None or scene.local_map_shape is None:
             raise ValueError("Compact RollOutData fields are required")
         if scene.scene_dynamic_maps is None:
@@ -121,6 +124,7 @@ def load_scene_origins(
         dynamic_sequences: list[torch.Tensor] = []
         static_maps: list[torch.Tensor] = []
         velocity_sequences: list[torch.Tensor] = []
+        position_offsets: list[torch.Tensor] = []
         anchor_times_per_agent: list[list[int]] = []
 
         scene_static = _to_2d(scene.scene_static_map)
@@ -160,6 +164,7 @@ def load_scene_origins(
             agent_dynamic_windows: list[torch.Tensor] = []
             agent_static_windows: list[torch.Tensor] = []
             agent_velocity_windows: list[torch.Tensor] = []
+            agent_position_offset_windows: list[torch.Tensor] = []
             agent_anchor_times: list[int] = []
 
             max_start = total_time - window_size
@@ -195,10 +200,13 @@ def load_scene_origins(
                     )
 
                 velocity_sequence = velocity_trajectory[start_t:end_t].to(dtype=torch.float32)
+                anchor_position = position_trajectory[anchor_t].to(dtype=torch.float32)
+                position_offset_sequence = position_trajectory[start_t:end_t].to(dtype=torch.float32) - anchor_position
 
                 agent_dynamic_windows.append(torch.stack(dynamic_window, dim=0))
                 agent_static_windows.append(torch.stack(static_window, dim=0))
                 agent_velocity_windows.append(velocity_sequence)
+                agent_position_offset_windows.append(position_offset_sequence)
                 agent_anchor_times.append(anchor_t)
 
             if not agent_dynamic_windows:
@@ -207,22 +215,30 @@ def load_scene_origins(
             dynamic_sequences.append(torch.stack(agent_dynamic_windows, dim=0))
             static_maps.append(torch.stack(agent_static_windows, dim=0))
             velocity_sequences.append(torch.stack(agent_velocity_windows, dim=0))
+            position_offsets.append(torch.stack(agent_position_offset_windows, dim=0))
             anchor_times_per_agent.append(agent_anchor_times)
 
-        return dynamic_sequences, static_maps, velocity_sequences, anchor_times_per_agent
+        return dynamic_sequences, static_maps, velocity_sequences, position_offsets, anchor_times_per_agent
 
     if isinstance(payload, RollOutData):
         for scene in payload.scenes:
-            dyn, sta, vel, anchor_times = _collect_from_scene_obj(scene)
+            dyn, sta, vel, pos, anchor_times = _collect_from_scene_obj(scene)
             if dyn:
                 scene_dynamic_sequences.append(dyn)
                 scene_static_maps.append(sta)
                 scene_velocity_sequences.append(vel)
+                scene_position_offsets.append(pos)
                 scene_anchor_times.append(anchor_times)
     else:
         raise ValueError(f"Unsupported payload format in {pt_path}: expected RollOutData")
 
-    return scene_dynamic_sequences, scene_static_maps, scene_velocity_sequences, scene_anchor_times
+    return (
+        scene_dynamic_sequences,
+        scene_static_maps,
+        scene_velocity_sequences,
+        scene_position_offsets,
+        scene_anchor_times,
+    )
 
 
 def build_models(
@@ -272,6 +288,8 @@ def build_models(
     velocity_mlp_dim = int(model_cfg.get("velocity_mlp_dim", 16))
     encoder_velocity_condition_channels = int(model_cfg.get("encoder_velocity_condition_channels", 0))
     decoder_velocity_condition_channels = int(model_cfg.get("decoder_velocity_condition_channels", 0))
+    decoder_position_mlp_dim = int(model_cfg.get("decoder_position_mlp_dim", 16))
+    decoder_position_condition_channels = int(model_cfg.get("decoder_position_condition_channels", 0))
 
     input_shape = tuple(model_cfg["input_shape"])
     output_shape = tuple(model_cfg["output_shape"])
@@ -292,6 +310,8 @@ def build_models(
         velocity_mlp_dim=velocity_mlp_dim,
         encoder_velocity_condition_channels=encoder_velocity_condition_channels,
         decoder_velocity_condition_channels=decoder_velocity_condition_channels,
+        decoder_position_mlp_dim=decoder_position_mlp_dim,
+        decoder_position_condition_channels=decoder_position_condition_channels,
         downsample_strides=model_downsample_strides,
         upsample_strides=model_upsample_strides,
         upsample_channels=model_upsample_channels,
@@ -317,6 +337,7 @@ def autoregressive_predict(
     dynamic_sequence: torch.Tensor,
     static_sequence: torch.Tensor,
     velocity_sequence: torch.Tensor,
+    position_offset_sequence: torch.Tensor,
     decoder: VAEPredictionDecoder,
     history_len: int,
     decoder_context_len: int,
@@ -353,7 +374,14 @@ def autoregressive_predict(
                     x_decoder_dynamic = context[-decoder_context_len:].unsqueeze(0).unsqueeze(0).to(device)
                     x_static = static_sequence[anchor_t].unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
                     current_velocity = velocity_sequence[anchor_t].unsqueeze(0).to(device)
-                    logits = decoder(z, x_decoder_dynamic, x_static, current_velocity)
+                    current_position_offset = position_offset_sequence[anchor_t].unsqueeze(0).to(device)
+                    logits = decoder(
+                        z,
+                        x_decoder_dynamic,
+                        x_static,
+                        current_velocity,
+                        current_position_offset,
+                    )
                     prob = torch.sigmoid(logits)[0, 0, 0].detach().cpu()
                     pred_frames.append(prob)
 
@@ -397,6 +425,7 @@ def main() -> None:
         scene_sequences,
         scene_static_maps,
         scene_velocity_sequences,
+        scene_position_offsets,
         scene_anchor_times,
     ) = load_scene_origins(
         args.data_file,
@@ -439,10 +468,12 @@ def main() -> None:
             seq = scene_sequences[scene_idx][agent_idx][anchor_idx]
             static_sequence = scene_static_maps[scene_idx][agent_idx][anchor_idx]
             velocity_seq = scene_velocity_sequences[scene_idx][agent_idx][anchor_idx]
+            position_offset_seq = scene_position_offsets[scene_idx][agent_idx][anchor_idx]
             cache[key] = autoregressive_predict(
                 dynamic_sequence=seq,
                 static_sequence=static_sequence,
                 velocity_sequence=velocity_seq,
+                position_offset_sequence=position_offset_seq,
                 decoder=decoder,
                 history_len=history_len,
                 decoder_context_len=decoder_context_len,

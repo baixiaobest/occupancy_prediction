@@ -158,8 +158,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-velocity-condition-channels",
         type=int,
-        default=4,
+        default=2,
         help="Velocity conditioning channel count C2 fused in decoder context branch",
+    )
+    parser.add_argument(
+        "--decoder-position-mlp-dim",
+        type=int,
+        default=16,
+        help="Position-offset embedding dimension after MLP",
+    )
+    parser.add_argument(
+        "--decoder-position-condition-channels",
+        type=int,
+        default=2,
+        help="Position-offset conditioning channel count C3 fused in decoder context branch",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -313,6 +325,7 @@ class VAETrainer:
             _sample_x_static,
             _sample_current_velocity,
             _sample_future_velocities,
+            _sample_future_position_offsets,
             sample_y,
         ) = train_dataset[0]
         _, enc_t, h, w = sample_x_encoder_dynamic.shape
@@ -358,6 +371,8 @@ class VAETrainer:
             velocity_mlp_dim=self.args.velocity_mlp_dim,
             encoder_velocity_condition_channels=self.args.encoder_velocity_condition_channels,
             decoder_velocity_condition_channels=self.args.decoder_velocity_condition_channels,
+            decoder_position_mlp_dim=self.args.decoder_position_mlp_dim,
+            decoder_position_condition_channels=self.args.decoder_position_condition_channels,
             decoder_context_frames=self.decoder_context_frames,
             downsample_strides=self.downsample_strides,
             decoder_context_downsample_strides=self.downsample_strides,
@@ -412,6 +427,8 @@ class VAETrainer:
                 "velocity_mlp_dim": self.args.velocity_mlp_dim,
                 "encoder_velocity_condition_channels": self.args.encoder_velocity_condition_channels,
                 "decoder_velocity_condition_channels": self.args.decoder_velocity_condition_channels,
+                "decoder_position_mlp_dim": self.args.decoder_position_mlp_dim,
+                "decoder_position_condition_channels": self.args.decoder_position_condition_channels,
                 "downsample_strides": self.downsample_strides,
                 "upsample_strides": self.upsample_strides,
                 "upsample_channels": self.upsample_channels,
@@ -434,13 +451,20 @@ class VAETrainer:
         context_step: torch.Tensor,
         static_step: torch.Tensor,
         step_velocity: torch.Tensor,
+        step_position_offset: torch.Tensor,
         target_step: torch.Tensor,
         is_train: bool,
         teacher_forcing_prob: float,
         batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run one autoregressive decoder step and return per-sample losses + next context."""
-        logits_full = self.decoder(z_step, context_step, static_step, step_velocity)
+        logits_full = self.decoder(
+            z_step,
+            context_step,
+            static_step,
+            step_velocity,
+            step_position_offset,
+        )
         logits_step = logits_full[:, :, :1]
 
         if self.args.recon_loss_type == "focal":
@@ -505,6 +529,7 @@ class VAETrainer:
             x_static,
             current_velocity,
             future_velocities,
+            future_position_offsets,
             y,
         ) in loader:
             x_encoder_dynamic = x_encoder_dynamic.to(self.device)
@@ -512,6 +537,7 @@ class VAETrainer:
             x_static = x_static.to(self.device)
             current_velocity = current_velocity.to(self.device)
             future_velocities = future_velocities.to(self.device)
+            future_position_offsets = future_position_offsets.to(self.device)
             y = y.to(self.device)
 
             if is_train:
@@ -552,6 +578,7 @@ class VAETrainer:
 
                 for step in range(selection_steps):
                     step_velocity = future_velocities[:, step, :]
+                    step_position_offset = future_position_offsets[:, step, :]
                     static_step = x_static[:, :, self.args.history_len + step]
                     target_step = y[:, :, step : step + 1]
                     step_recon, step_entropy, context = self._rollout_step(
@@ -559,6 +586,7 @@ class VAETrainer:
                         context_step=context,
                         static_step=static_step,
                         step_velocity=step_velocity,
+                        step_position_offset=step_position_offset,
                         target_step=target_step,
                         is_train=is_train,
                         teacher_forcing_prob=teacher_forcing_prob,
@@ -595,6 +623,7 @@ class VAETrainer:
 
                 for step in range(selection_steps, effective_k):
                     step_velocity = future_velocities[:, step, :]
+                    step_position_offset = future_position_offsets[:, step, :]
                     static_step = x_static[:, :, self.args.history_len + step]
                     target_step = y[:, :, step : step + 1]
                     step_recon, step_entropy, context = self._rollout_step(
@@ -602,6 +631,7 @@ class VAETrainer:
                         context_step=context,
                         static_step=static_step,
                         step_velocity=step_velocity,
+                        step_position_offset=step_position_offset,
                         target_step=target_step,
                         is_train=is_train,
                         teacher_forcing_prob=teacher_forcing_prob,
