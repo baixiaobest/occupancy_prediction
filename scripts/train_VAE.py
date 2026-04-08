@@ -314,7 +314,6 @@ class VAETrainer:
             _sample_current_velocity,
             _sample_future_velocities,
             sample_y,
-            _sample_future_center_shifts_px,
         ) = train_dataset[0]
         _, enc_t, h, w = sample_x_encoder_dynamic.shape
         _, dec_ctx_t, _, _ = sample_x_decoder_dynamic.shape
@@ -428,47 +427,6 @@ class VAETrainer:
             "val_kl": val_kl,
         }
 
-    def _shift_context_by_pixels(
-        self,
-        context_in: torch.Tensor,
-        shift_px: torch.Tensor,
-    ) -> torch.Tensor:
-        """Shift decoder context into the next ego frame with zero padding.
-
-        `shift_px` stores per-sample (dx, dy) offsets in pixel units from the
-        current frame center to the next frame center.
-        """
-        out = torch.zeros_like(context_in)
-        shifts_int = torch.round(shift_px).to(dtype=torch.int64)
-
-        _, _, _, h_ctx, w_ctx = context_in.shape
-        for b_idx in range(context_in.shape[0]):
-            dx = int(shifts_int[b_idx, 0].item())
-            dy = int(shifts_int[b_idx, 1].item())
-
-            if dx >= 0:
-                src_x0, src_x1 = dx, w_ctx
-                dst_x0, dst_x1 = 0, w_ctx - dx
-            else:
-                src_x0, src_x1 = 0, w_ctx + dx
-                dst_x0, dst_x1 = -dx, w_ctx
-
-            if dy >= 0:
-                src_y0, src_y1 = dy, h_ctx
-                dst_y0, dst_y1 = 0, h_ctx - dy
-            else:
-                src_y0, src_y1 = 0, h_ctx + dy
-                dst_y0, dst_y1 = -dy, h_ctx
-
-            if dst_x1 <= dst_x0 or dst_y1 <= dst_y0:
-                continue
-
-            out[b_idx, :, :, dst_y0:dst_y1, dst_x0:dst_x1] = context_in[
-                b_idx, :, :, src_y0:src_y1, src_x0:src_x1
-            ]
-
-        return out
-
     def _rollout_step(
         self,
         *,
@@ -476,7 +434,6 @@ class VAETrainer:
         context_step: torch.Tensor,
         static_step: torch.Tensor,
         step_velocity: torch.Tensor,
-        step_shift_px: torch.Tensor,
         target_step: torch.Tensor,
         is_train: bool,
         teacher_forcing_prob: float,
@@ -518,8 +475,8 @@ class VAETrainer:
         else:
             feedback_step = target_step if teacher_forcing_prob >= 1.0 else pred_step
 
-        next_context_base = torch.cat([context_step[:, :, 1:], feedback_step], dim=2)
-        next_context = self._shift_context_by_pixels(next_context_base, step_shift_px)
+        # Keep decoder context in the same anchor-centered frame across rollout.
+        next_context = torch.cat([context_step[:, :, 1:], feedback_step], dim=2)
         return step_recon, step_entropy, next_context
 
     def run_epoch(
@@ -549,7 +506,6 @@ class VAETrainer:
             current_velocity,
             future_velocities,
             y,
-            future_center_shifts_px,
         ) in loader:
             x_encoder_dynamic = x_encoder_dynamic.to(self.device)
             x_decoder_dynamic = x_decoder_dynamic.to(self.device)
@@ -557,7 +513,6 @@ class VAETrainer:
             current_velocity = current_velocity.to(self.device)
             future_velocities = future_velocities.to(self.device)
             y = y.to(self.device)
-            future_center_shifts_px = future_center_shifts_px.to(self.device)
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -598,14 +553,12 @@ class VAETrainer:
                 for step in range(selection_steps):
                     step_velocity = future_velocities[:, step, :]
                     static_step = x_static[:, :, self.args.history_len + step]
-                    step_shift_px = future_center_shifts_px[:, step, :]
                     target_step = y[:, :, step : step + 1]
                     step_recon, step_entropy, context = self._rollout_step(
                         z_step=z,
                         context_step=context,
                         static_step=static_step,
                         step_velocity=step_velocity,
-                        step_shift_px=step_shift_px,
                         target_step=target_step,
                         is_train=is_train,
                         teacher_forcing_prob=teacher_forcing_prob,
@@ -643,14 +596,12 @@ class VAETrainer:
                 for step in range(selection_steps, effective_k):
                     step_velocity = future_velocities[:, step, :]
                     static_step = x_static[:, :, self.args.history_len + step]
-                    step_shift_px = future_center_shifts_px[:, step, :]
                     target_step = y[:, :, step : step + 1]
                     step_recon, step_entropy, context = self._rollout_step(
                         z_step=best_z,
                         context_step=context,
                         static_step=static_step,
                         step_velocity=step_velocity,
-                        step_shift_px=step_shift_px,
                         target_step=target_step,
                         is_train=is_train,
                         teacher_forcing_prob=teacher_forcing_prob,

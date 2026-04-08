@@ -19,8 +19,8 @@ def _build_window_centers(
 ) -> torch.Tensor:
     """Build per-frame crop centers for one window.
 
-    Past frames are pinned to the current timestep center. Future frames keep
-    their own timestep centers.
+    All frames are pinned to the current timestep center so rollout context
+    stays in the anchor ego frame.
     """
     window_size = int(history_len + future_len)
     centers = torch.as_tensor(position_window, dtype=torch.float32).clone()
@@ -28,31 +28,8 @@ def _build_window_centers(
         raise ValueError("Position window must have shape (history_len+future_len, 2)")
 
     current_center = centers[history_len].clone()
-    centers[:history_len] = current_center
+    centers[:] = current_center
     return centers
-
-
-def _compute_future_center_shifts_px(
-    centers_window: torch.Tensor,
-    resolution_xy: tuple[float, float],
-    history_len: int,
-    future_len: int,
-) -> torch.Tensor:
-    """Compute per-step center displacement in pixel units for rollout shifting."""
-    shifts = torch.zeros((int(future_len), 2), dtype=torch.float32)
-    if future_len <= 1:
-        return shifts
-
-    res_x = float(resolution_xy[0])
-    res_y = float(resolution_xy[1])
-    if res_x <= 0.0 or res_y <= 0.0:
-        raise ValueError("resolution components must be > 0")
-
-    current_centers = centers_window[int(history_len) : int(history_len + future_len)]
-    deltas = current_centers[1:] - current_centers[:-1]
-    shifts[:-1, 0] = deltas[:, 0] / res_x
-    shifts[:-1, 1] = deltas[:, 1] / res_y
-    return shifts
 
 
 @dataclass
@@ -68,10 +45,10 @@ class DatasetStats:
 
 @dataclass
 class LazySampleRef:
-    """Reference record for one moving-center lazy sample.
+    """Reference record for one fixed-center lazy sample.
 
     The dynamic/static global maps are shared across many refs. Local windows are
-    sliced in `__getitem__` using per-timestep ego centers.
+    sliced in `__getitem__` using the anchor ego center for the full window.
     """
 
     dynamic_global: torch.Tensor
@@ -116,9 +93,7 @@ class _OccupancyWindowBase(Dataset):
         seq: torch.Tensor,
         static_seq: torch.Tensor,
         velocity_window: torch.Tensor,
-        future_center_shifts_px: torch.Tensor,
     ) -> tuple[
-        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -148,15 +123,11 @@ class _OccupancyWindowBase(Dataset):
         current_velocity = vel_window[self.history_len]
         future_velocities = vel_window[self.history_len : self.window_size]
 
-        shifts_px = torch.as_tensor(future_center_shifts_px, dtype=torch.float32)
-        if shifts_px.shape != (self.future_len, 2):
-            raise ValueError("future_center_shifts_px must have shape (future_len, 2)")
-
         x_encoder_dynamic = torch.cat([past, future], dim=0).unsqueeze(0)
         x_decoder_dynamic = past[-self.decoder_context_len :].unsqueeze(0)
         x_static = static_seq.unsqueeze(0)
         y = future.unsqueeze(0)
-        return x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, future_velocities, y, shifts_px
+        return x_encoder_dynamic, x_decoder_dynamic, x_static, current_velocity, future_velocities, y
 
     def _centers_from_motion(
         self,
@@ -174,7 +145,7 @@ class OccupancyWindowDataset(_OccupancyWindowBase):
 
     def __init__(
         self,
-        sequences: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+        sequences: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         history_len: int = 16,
         future_len: int = 8,
         decoder_context_len: int = 8,
@@ -188,7 +159,7 @@ class OccupancyWindowDataset(_OccupancyWindowBase):
         )
         self.samples = list(sequences)
 
-        for seq, static_seq, velocity, shifts_px in self.samples:
+        for seq, static_seq, velocity in self.samples:
             if seq.ndim != 3:
                 raise ValueError("Each sequence must have shape (history+future, H, W)")
             if seq.shape[0] != self.window_size:
@@ -202,9 +173,6 @@ class OccupancyWindowDataset(_OccupancyWindowBase):
             vel = torch.as_tensor(velocity, dtype=torch.float32)
             if vel.shape != (2,) and vel.shape != (self.window_size, 2):
                 raise ValueError("Each velocity must have shape (2,) or (history_len+future_len, 2)")
-            shift_tensor = torch.as_tensor(shifts_px, dtype=torch.float32)
-            if shift_tensor.shape != (self.future_len, 2):
-                raise ValueError("Each shift tensor must have shape (future_len, 2)")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -216,10 +184,9 @@ class OccupancyWindowDataset(_OccupancyWindowBase):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
     ]:
-        seq, static_seq, velocity_window, future_center_shifts_px = self.samples[index]
-        return self._format_model_io(seq, static_seq, velocity_window, future_center_shifts_px)
+        seq, static_seq, velocity_window = self.samples[index]
+        return self._format_model_io(seq, static_seq, velocity_window)
 
 
 class LazyOccupancyWindowDataset(_OccupancyWindowBase):
@@ -251,7 +218,6 @@ class LazyOccupancyWindowDataset(_OccupancyWindowBase):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
     ]:
         ref = self.sample_refs[index]
 
@@ -259,12 +225,6 @@ class LazyOccupancyWindowDataset(_OccupancyWindowBase):
 
         centers_window = self._centers_from_motion(
             position_window=position_window,
-        )
-        future_center_shifts_px = _compute_future_center_shifts_px(
-            centers_window=centers_window,
-            resolution_xy=ref.resolution_xy,
-            history_len=self.history_len,
-            future_len=self.future_len,
         )
 
         dynamic_frames: list[torch.Tensor] = []
@@ -295,7 +255,7 @@ class LazyOccupancyWindowDataset(_OccupancyWindowBase):
             )
         seq = torch.stack(dynamic_frames, dim=0)
         static_seq = torch.stack(static_frames, dim=0)
-        return self._format_model_io(seq, static_seq, ref.velocity_window, future_center_shifts_px)
+        return self._format_model_io(seq, static_seq, ref.velocity_window)
 
 
 class DatasetBuilder:
@@ -443,7 +403,7 @@ class DatasetBuilder:
         val_samples = [samples[i] for i in val_idx]
         return train_samples, val_samples
 
-    def _load_agent_sequences_from_file(self, pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def _load_agent_sequences_from_file(self, pt_path: Path) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         try:
             payload = torch.load(pt_path, map_location="cpu")
         except AttributeError as exc:
@@ -453,8 +413,8 @@ class DatasetBuilder:
                 "Regenerate rollout .pt files using the current scripts/ORCA_rollout.py format."
             ) from exc
 
-        def _from_scene_obj(scene: SceneRollOutData) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-            out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        def _from_scene_obj(scene: SceneRollOutData) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+            out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
             (
                 scene_static,
                 scene_origin,
@@ -482,12 +442,6 @@ class DatasetBuilder:
 
                 centers_window = _build_window_centers(
                     position_window=position_window,
-                    history_len=self.history_len,
-                    future_len=self.future_len,
-                )
-                future_center_shifts_px = _compute_future_center_shifts_px(
-                    centers_window=centers_window,
-                    resolution_xy=resolution_xy,
                     history_len=self.history_len,
                     future_len=self.future_len,
                 )
@@ -526,13 +480,12 @@ class DatasetBuilder:
                         torch.stack(dynamic_window, dim=0),
                         torch.stack(static_window, dim=0),
                         velocity_window,
-                        future_center_shifts_px,
                     )
                 )
 
             return out
 
-        sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         if isinstance(payload, RollOutData):
             for scene in payload.scenes:
                 sequences.extend(_from_scene_obj(scene))
