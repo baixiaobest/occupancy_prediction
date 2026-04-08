@@ -34,7 +34,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--template-set",
         type=str,
         choices=["default", "test", "cross"],
-        default="cross",
+        default="default",
         help="Template function to use: default_templates, test_templates, or cross_templates.",
     )
     parser.add_argument(

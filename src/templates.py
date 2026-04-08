@@ -62,10 +62,10 @@ def default_templates() -> List[SceneTemplate]:
         ego_center_spacing=2.0,
         ego_center_noise_std=0.1,
         num_enabled_start_regions=2,
-        num_levels=4,
+        num_levels=5,
     )
 
-    return [cross_template]
+    return [straight_template, l_template, t_template, cross_template]
 
 
 def test_templates():
