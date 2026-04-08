@@ -114,22 +114,6 @@ def _build_agent_dynamic_map(
     return torch.stack([grid.to(dtype=torch.float32) for grid in generated_frames], dim=0)
 
 
-def _collect_anchor_centers(
-    traj: np.ndarray,
-    center_agent_idx: int,
-    anchor_steps: List[int],
-) -> torch.Tensor:
-    """Collect anchor center positions for one agent."""
-    center_series = torch.zeros((len(anchor_steps), 2), dtype=torch.float32)
-
-    for anchor_idx, anchor_t in enumerate(anchor_steps):
-        center_series[anchor_idx] = torch.as_tensor(
-            traj[anchor_t, center_agent_idx], dtype=torch.float32
-        )
-
-    return center_series
-
-
 def build_agent_centric_occupancy_sequences(
     traj: np.ndarray,
     velocities: np.ndarray,
@@ -138,7 +122,6 @@ def build_agent_centric_occupancy_sequences(
     agent_radius: float,
     occupancy_length: float,
     occupancy_width: float,
-    sample_interval: int,
     past_frames: int,
     future_frames: int,
     center_agent_indices: List[int] | None = None,
@@ -150,15 +133,11 @@ def build_agent_centric_occupancy_sequences(
     Tuple[float, float],
     Tuple[float, float],
     List[int],
-    List[int],
-    List[torch.Tensor],
     Tuple[int, int],
 ]:
-    """Build scene-global occupancy maps and per-agent anchor metadata."""
+    """Build scene-global occupancy maps and per-agent trajectories."""
     if occupancy_length <= 0 or occupancy_width <= 0:
         raise ValueError("occupancy_length and occupancy_width must be positive")
-    if sample_interval <= 0:
-        raise ValueError("sample_interval must be > 0")
     if past_frames < 0 or future_frames < 0:
         raise ValueError("past_frames/future_frames must be >= 0")
     if traj.shape != velocities.shape:
@@ -168,12 +147,10 @@ def build_agent_centric_occupancy_sequences(
     if num_agents == 0:
         raise ValueError("trajectory has no agents")
 
-    first_anchor = int(past_frames)
-    last_anchor = int(num_steps - future_frames)
-    anchor_steps = list(range(first_anchor, last_anchor, sample_interval))
-    if not anchor_steps:
+    frame_offsets = list(range(-past_frames, future_frames + 1))
+    if int(num_steps) < len(frame_offsets):
         raise ValueError(
-            "No valid anchor timestep. Reduce past/future window or sample interval."
+            "trajectory too short for requested past/future window"
         )
 
     size_xy = np.array([float(occupancy_length), float(occupancy_width)], dtype=np.float32)
@@ -203,8 +180,6 @@ def build_agent_centric_occupancy_sequences(
     dynamic_maps: List[torch.Tensor] = []
     velocity_trajectories: List[torch.Tensor] = []
     position_trajectories: List[torch.Tensor] = []
-    anchor_centers: List[torch.Tensor] = []
-    frame_offsets = list(range(-past_frames, future_frames + 1))
 
     if center_agent_indices is None:
         center_agent_indices = list(range(num_agents))
@@ -223,11 +198,6 @@ def build_agent_centric_occupancy_sequences(
             scene_center=scene_center,
             canvas_shape=scene_canvas_shape,
         )
-        center_series = _collect_anchor_centers(
-            traj=traj,
-            center_agent_idx=center_agent_idx,
-            anchor_steps=anchor_steps,
-        )
 
         dynamic_maps.append(agent_dynamic)
         position_trajectories.append(
@@ -236,7 +206,6 @@ def build_agent_centric_occupancy_sequences(
         velocity_trajectories.append(
             torch.as_tensor(velocities[:, center_agent_idx], dtype=torch.float32).clone()
         )
-        anchor_centers.append(center_series)
 
     return (
         dynamic_maps,
@@ -245,37 +214,34 @@ def build_agent_centric_occupancy_sequences(
         velocity_trajectories,
         scene_origin,
         (resolution, resolution),
-        anchor_steps,
         frame_offsets,
-        anchor_centers,
         (local_h, local_w),
     )
 
 
-def build_anchor_local_windows(
+def build_local_windows_over_time(
     *,
     scene_static_map: torch.Tensor,
     dynamic_maps: List[torch.Tensor],
-    anchor_centers: List[torch.Tensor],
-    anchor_steps: List[int],
+    center_trajectories: List[torch.Tensor],
     frame_offsets: List[int],
     scene_origin: Tuple[float, float],
     occupancy_resolution: Tuple[float, float],
     local_map_shape: Tuple[int, int],
     total_steps: int,
 ) -> Tuple[List[List[torch.Tensor]], List[List[List[torch.Tensor]]]]:
-    """Reconstruct per-anchor local static/dynamic windows from global maps."""
+    """Reconstruct per-timestep local static/dynamic windows from global maps."""
     static_maps: List[List[torch.Tensor]] = []
     dynamic_windows: List[List[List[torch.Tensor]]] = []
 
-    for agent_idx, centers in enumerate(anchor_centers):
+    for agent_idx, centers in enumerate(center_trajectories):
         centers_tensor = torch.as_tensor(centers, dtype=torch.float32)
         agent_static_series: List[torch.Tensor] = []
         agent_dynamic_windows: List[List[torch.Tensor]] = []
         agent_dynamic = torch.as_tensor(dynamic_maps[agent_idx], dtype=torch.float32)
 
-        for local_idx, anchor_t in enumerate(anchor_steps):
-            center_xy = centers_tensor[local_idx]
+        for sim_t in range(int(total_steps)):
+            center_xy = centers_tensor[sim_t]
             static_local = slice_centered_patch(
                 scene_static_map,
                 center_xy,
@@ -287,11 +253,11 @@ def build_anchor_local_windows(
             )
             agent_static_series.append(static_local)
 
-            anchor_frames: List[torch.Tensor] = []
+            time_frames: List[torch.Tensor] = []
             for dt_offset in frame_offsets:
-                absolute_t = int(anchor_t + dt_offset)
+                absolute_t = int(sim_t + dt_offset)
                 if absolute_t < 0 or absolute_t >= int(total_steps):
-                    anchor_frames.append(torch.zeros(local_map_shape, dtype=torch.float32))
+                    time_frames.append(torch.zeros(local_map_shape, dtype=torch.float32))
                     continue
                 dynamic_local = slice_centered_patch(
                     agent_dynamic[absolute_t],
@@ -302,9 +268,9 @@ def build_anchor_local_windows(
                     binary=False,
                     prefer_view=False,
                 )
-                anchor_frames.append(dynamic_local)
+                time_frames.append(dynamic_local)
 
-            agent_dynamic_windows.append(anchor_frames)
+            agent_dynamic_windows.append(time_frames)
 
         static_maps.append(agent_static_series)
         dynamic_windows.append(agent_dynamic_windows)
@@ -493,7 +459,7 @@ def print_scene_occupancy_summary(
     scene_static_map: torch.Tensor,
     dynamic_maps: List[torch.Tensor],
     velocity_trajectories: List[torch.Tensor],
-    anchor_steps: List[int],
+    frame_offsets: List[int],
 ) -> None:
     for i, pos in enumerate(traj[-1]):
         print(
@@ -506,7 +472,7 @@ def print_scene_occupancy_summary(
     print(
         f"scene[{scene_index}] occupancy generated: "
         f"orig_maps={len(dynamic_maps)}; "
-        f"{len(anchor_steps)} anchors each (sampled), "
+        f"window_frames={len(frame_offsets)}, "
         f"global static shape {tuple(scene_static_map.shape)}, "
         f"global dynamic shape {dynamic_shape}, "
         f"velocity trajectory shape {trajectory_shape}"

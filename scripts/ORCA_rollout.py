@@ -14,7 +14,7 @@ from src.rollout_data import SceneRollOutData
 from src.rollout_helpers import (
     append_scene_rollout_to_template,
     build_agent_centric_occupancy_sequences,
-    build_anchor_local_windows,
+    build_local_windows_over_time,
     print_scene_occupancy_summary,
     save_scene_rollouts,
     save_template_rollouts,
@@ -54,22 +54,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Directory to save rollout .pt files (defaults to ../data)",
     )
     parser.add_argument(
-        "--occ-sample-interval",
-        type=int,
-        default=1,
-        help="Anchor timestep interval for occupancy generation.",
-    )
-    parser.add_argument(
         "--occ-past-frames",
         type=int,
         default=16,
-        help="Past frame count rendered on each anchor occupancy grid.",
+        help="Past frame count rendered on each occupancy grid.",
     )
     parser.add_argument(
         "--occ-future-frames",
         type=int,
         default=16,
-        help="Future frame count rendered on each anchor occupancy grid.",
+        help="Future frame count rendered on each occupancy grid.",
     )
     parser.add_argument(
         "--save-every-scene",
@@ -197,9 +191,7 @@ def main() -> None:
                 velocity_trajectories,
                 scene_map_origin,
                 occupancy_resolution,
-                anchor_steps,
                 frame_offsets,
-                anchor_centers,
                 local_map_shape,
             ) = build_agent_centric_occupancy_sequences(
                 traj=traj,
@@ -209,7 +201,6 @@ def main() -> None:
                 agent_radius=occ_agent_radius,
                 occupancy_width=occ_width,
                 occupancy_length=occ_length,
-                sample_interval=int(args.occ_sample_interval),
                 past_frames=int(args.occ_past_frames),
                 future_frames=int(args.occ_future_frames),
             )
@@ -259,11 +250,10 @@ def main() -> None:
 
             title_prefix = f"{tpl.__class__.__name__} {local_idx + 1}/{len(scenes)}"
             if animate:
-                static_maps, dynamic_windows = build_anchor_local_windows(
+                static_maps, dynamic_windows = build_local_windows_over_time(
                     scene_static_map=scene_static_map,
                     dynamic_maps=dynamic_maps,
-                    anchor_centers=anchor_centers,
-                    anchor_steps=anchor_steps,
+                    center_trajectories=position_trajectories,
                     frame_offsets=frame_offsets,
                     scene_origin=scene_map_origin,
                     occupancy_resolution=occupancy_resolution,
@@ -298,7 +288,6 @@ def main() -> None:
                     dynamic_future_grids=dynamic_future_grids_np,
                     occupancy_origins=local_origins,
                     occupancy_resolution=occupancy_resolution,
-                    anchor_steps=anchor_steps,
                     time_step=time_step,
                     title_prefix=title_prefix,
                 )
@@ -309,7 +298,7 @@ def main() -> None:
                     scene_static_map=scene_static_map,
                     dynamic_maps=dynamic_maps,
                     velocity_trajectories=velocity_trajectories,
-                    anchor_steps=anchor_steps,
+                    frame_offsets=frame_offsets,
                 )
 
             global_scene_index += 1

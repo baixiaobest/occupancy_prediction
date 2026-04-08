@@ -28,13 +28,13 @@ def prepare_past_future_dynamic_grids(
     for agent_windows in dynamic_windows:
         agent_past: List[np.ndarray] = []
         agent_future: List[np.ndarray] = []
-        for anchor_frames in agent_windows:
-            if not anchor_frames:
+        for time_frames in agent_windows:
+            if not time_frames:
                 continue
-            if len(anchor_frames) != len(frame_offsets):
-                raise ValueError("anchor frame count must match frame_offsets length")
+            if len(time_frames) != len(frame_offsets):
+                raise ValueError("time frame count must match frame_offsets length")
 
-            frame_tensors = [torch.as_tensor(frame, dtype=torch.float32) for frame in anchor_frames]
+            frame_tensors = [torch.as_tensor(frame, dtype=torch.float32) for frame in time_frames]
             zero_grid = torch.zeros_like(frame_tensors[0])
             past_frames = [frame_tensors[idx] for idx, dt in enumerate(frame_offsets) if dt < 0]
             future_frames = [frame_tensors[idx] for idx, dt in enumerate(frame_offsets) if dt >= 0]
@@ -62,7 +62,6 @@ def animate_rollout(
     dynamic_future_grids: List[List[np.ndarray]],
     occupancy_origins: List[np.ndarray],
     occupancy_resolution: Tuple[float, float],
-    anchor_steps: List[int],
     time_step: float,
     title_prefix: str = "",
 ) -> None:
@@ -77,9 +76,6 @@ def animate_rollout(
         raise ValueError("traj and velocities must have the same shape")
 
     num_steps, _, _ = traj.shape
-    occ_steps = len(anchor_steps)
-    if occ_steps == 0:
-        raise ValueError("anchor_steps must contain at least one timestep")
 
     fig_traj, ax_traj = plt.subplots(figsize=(6, 6))
     traj_title = "ORCA Pedestrian Simulation"
@@ -134,12 +130,12 @@ def animate_rollout(
             alpha=0.9,
         )
 
-    scat = ax_traj.scatter(traj[anchor_steps[0], :, 0], traj[anchor_steps[0], :, 1], s=60, c="tab:blue")
+    scat = ax_traj.scatter(traj[0, :, 0], traj[0, :, 1], s=60, c="tab:blue")
     vel_quiver = ax_traj.quiver(
-        traj[anchor_steps[0], :, 0],
-        traj[anchor_steps[0], :, 1],
-        velocities[anchor_steps[0], :, 0],
-        velocities[anchor_steps[0], :, 1],
+        traj[0, :, 0],
+        traj[0, :, 1],
+        velocities[0, :, 0],
+        velocities[0, :, 1],
         color="tab:green",
         angles="xy",
         scale_units="xy",
@@ -243,9 +239,6 @@ def animate_rollout(
 
     def update(frame: int):
         sim_step = int(frame)
-        anchor_idx = int(np.searchsorted(anchor_steps, sim_step, side="right") - 1)
-        anchor_idx = max(0, min(anchor_idx, occ_steps - 1))
-        anchor_step = anchor_steps[anchor_idx]
 
         scat.set_offsets(traj[sim_step])
         vel_quiver.set_offsets(traj[sim_step])
@@ -253,23 +246,23 @@ def animate_rollout(
         traj_time_text.set_text(f"t={sim_step * time_step:.2f}s")
         artists = [scat, vel_quiver, traj_time_text]
         for occ_idx, (im_static, time_text_static) in enumerate(zip(static_images, static_time_texts)):
-            im_static.set_data(static_maps[occ_idx][anchor_idx])
+            im_static.set_data(static_maps[occ_idx][sim_step])
             time_text_static.set_text(
-                f"sim t={sim_step * time_step:.2f}s\\nocc@t={anchor_step * time_step:.2f}s"
+                f"sim t={sim_step * time_step:.2f}s\\nocc@t={sim_step * time_step:.2f}s"
             )
             artists.extend([im_static, time_text_static])
         for occ_idx, (im_overlay, time_text_overlay) in enumerate(zip(overlay_images, overlay_time_texts)):
             overlay_rgb = np.stack(
                 [
-                    dynamic_past_grids[occ_idx][anchor_idx],
-                    dynamic_future_grids[occ_idx][anchor_idx],
-                    np.zeros_like(dynamic_past_grids[occ_idx][anchor_idx]),
+                    dynamic_past_grids[occ_idx][sim_step],
+                    dynamic_future_grids[occ_idx][sim_step],
+                    np.zeros_like(dynamic_past_grids[occ_idx][sim_step]),
                 ],
                 axis=-1,
             )
             im_overlay.set_data(np.clip(overlay_rgb, 0.0, 1.0))
             time_text_overlay.set_text(
-                f"sim t={sim_step * time_step:.2f}s\\nocc@t={anchor_step * time_step:.2f}s"
+                f"sim t={sim_step * time_step:.2f}s\\nocc@t={sim_step * time_step:.2f}s"
             )
             artists.extend([im_overlay, time_text_overlay])
         return tuple(artists)
