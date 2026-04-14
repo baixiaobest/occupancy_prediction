@@ -319,13 +319,11 @@ class VAEPredictionDecoder(nn.Module):
             padding=1,
         )
 
-    def forward(
+    def _validate_decoder_inputs(
         self,
         z: torch.Tensor,
         dynamic_context: torch.Tensor,
         static_x: torch.Tensor,
-        current_velocity: torch.Tensor | None = None,
-        current_position_offset: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if z.ndim != 5:
             raise ValueError("z must have shape (B, C_latent, 1, H, W)")
@@ -359,6 +357,30 @@ class VAEPredictionDecoder(nn.Module):
             static_x = static_x.expand(-1, -1, dynamic_context.shape[2], -1, -1)
         elif static_x.shape[2] != dynamic_context.shape[2]:
             raise ValueError("static_x time dimension must be 1 or match dynamic_context")
+
+        return static_x
+
+    def _validate_tap_layer(self, tap_layer: int) -> int:
+        tap_layer_idx = int(tap_layer)
+        if tap_layer_idx < 1 or tap_layer_idx > len(self.upsample_blocks):
+            raise ValueError(
+                f"tap_layer must be in [1, {len(self.upsample_blocks)}], got {tap_layer_idx}"
+            )
+        return tap_layer_idx
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        dynamic_context: torch.Tensor,
+        static_x: torch.Tensor,
+        current_velocity: torch.Tensor | None = None,
+        current_position_offset: torch.Tensor | None = None,
+        tap_layer: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        static_x = self._validate_decoder_inputs(z, dynamic_context, static_x)
+        tap_layer_idx: int | None = None
+        if tap_layer is not None:
+            tap_layer_idx = self._validate_tap_layer(tap_layer)
 
         cond_dyn = self.context_dynamic_stem(_pack_video_time_to_channel(dynamic_context))
         cond_static = self.context_static_stem(_pack_video_time_to_channel(static_x))
@@ -395,11 +417,18 @@ class VAEPredictionDecoder(nn.Module):
         merged = torch.cat([z, cond], dim=1)
 
         h = self.input_proj(_pack_video_time_to_channel(merged))
-        for up_block in self.upsample_blocks:
+        tapped_feature: torch.Tensor | None = None
+        for layer_idx, up_block in enumerate(self.upsample_blocks, start=1):
             h = up_block(h)
+            if tap_layer_idx is not None and layer_idx == tap_layer_idx:
+                tapped_feature = h
         h = _unpack_channel_to_video(self.to_output(h), self.output_shape[1])
 
         h = _resize_video_spatial(h, (self.output_shape[2], self.output_shape[3]))
+        if tap_layer_idx is not None:
+            if tapped_feature is None:
+                raise RuntimeError("tap feature was not captured; check tap_layer value")
+            return h, tapped_feature
         return h
 
 
