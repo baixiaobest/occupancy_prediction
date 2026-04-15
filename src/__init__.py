@@ -8,4 +8,5 @@ __all__ = [
 	"proposal_network",
 	"network_common",
 	"q_network",
+	"rl",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import List
+import warnings
+from typing import List, Mapping
 
 import numpy as np
 
@@ -34,6 +35,9 @@ class ORCASim:
         pref_velocity_noise_seed: int | None = 0,
         lateral_control_gain: float = 1.0,
         lateral_control_max_speed: float | None = None,
+        strict_controlled_agent_index: int | None = None,
+        strict_control_velocity_tolerance: float = 1e-3,
+        strict_control_assert: bool = False,
     ) -> None:
         """Initialize ORCA simulator and scene-dependent guidance parameters.
 
@@ -60,11 +64,21 @@ class ORCASim:
             lateral_control_gain: Proportional gain for path-lateral distance control.
             lateral_control_max_speed: Absolute cap for lateral correction velocity.
                 If None, defaults to `0.5 * max_speed`.
+            strict_controlled_agent_index: Optional single controlled scene-agent index.
+                When set, this agent is configured to ignore ORCA avoidance and follow
+                externally commanded preferred velocity each step.
+            strict_control_velocity_tolerance: Allowed L2 velocity error between
+                commanded and realized controlled-agent velocity.
+            strict_control_assert: If True, raise when strict-control constraints cannot
+                be enforced or velocity tracking error exceeds tolerance. If False,
+                emit warnings.
         """
         if pref_velocity_noise_std < 0.0:
             raise ValueError("pref_velocity_noise_std must be >= 0")
         if pref_velocity_noise_interval < 1:
             raise ValueError("pref_velocity_noise_interval must be >= 1")
+        if strict_control_velocity_tolerance < 0.0:
+            raise ValueError("strict_control_velocity_tolerance must be >= 0")
 
         self.scene = scene
         self.time_step = time_step
@@ -74,6 +88,15 @@ class ORCASim:
         self.path_segment_remaining_switch_ratio = path_segment_remaining_switch_ratio
         self.pref_velocity_noise_std = float(pref_velocity_noise_std)
         self.pref_velocity_noise_interval = int(pref_velocity_noise_interval)
+        self.strict_controlled_agent_index = (
+            None
+            if strict_controlled_agent_index is None
+            else int(strict_controlled_agent_index)
+        )
+        self.strict_control_velocity_tolerance = float(strict_control_velocity_tolerance)
+        self.strict_control_assert = bool(strict_control_assert)
+        self._strict_control_configured = False
+        self._strict_control_expected_velocity: np.ndarray | None = None
         self.lateral_control_gain = float(lateral_control_gain)
         if lateral_control_max_speed is None:
             self.lateral_control_max_speed = 0.5 * self.max_speed
@@ -99,6 +122,92 @@ class ORCASim:
         self._region_pairs_initialized = False
         if len(self.scene.agents) == 0 and len(getattr(self.scene, "region_pairs", [])) > 0:
             self.initialize_agents_from_region_pairs(seed=region_pair_seed)
+        self._maybe_configure_strict_controlled_agent()
+
+    def _maybe_configure_strict_controlled_agent(self) -> None:
+        """Configure strict-control mode once when a controlled agent is requested."""
+        if self.strict_controlled_agent_index is None or self._strict_control_configured:
+            return
+
+        idx = int(self.strict_controlled_agent_index)
+        if idx < 0 or idx >= len(self.agent_ids):
+            raise ValueError(
+                f"strict_controlled_agent_index {idx} is out of range for "
+                f"{len(self.agent_ids)} agents"
+            )
+
+        self._configure_strict_controlled_agent(idx)
+        self._strict_control_configured = True
+
+    def _configure_strict_controlled_agent(self, controlled_idx: int) -> None:
+        """Disable ORCA avoidance for the controlled agent while keeping others reactive."""
+        agent_id = self.agent_ids[controlled_idx]
+
+        required_setters = (
+            "setAgentMaxNeighbors",
+            "setAgentNeighborDist",
+            "setAgentTimeHorizon",
+            "setAgentTimeHorizonObst",
+        )
+        missing = [name for name in required_setters if not hasattr(self.sim, name)]
+        if missing:
+            message = (
+                "Strict control requested but python-rvo2 binding is missing required "
+                f"per-agent setters: {missing}."
+            )
+            if self.strict_control_assert:
+                raise RuntimeError(message)
+            warnings.warn(message, RuntimeWarning)
+            return
+
+        self.sim.setAgentMaxNeighbors(agent_id, 0)
+        self.sim.setAgentNeighborDist(agent_id, 0.0)
+        self.sim.setAgentTimeHorizon(agent_id, 0.0)
+        self.sim.setAgentTimeHorizonObst(agent_id, 0.0)
+
+    def _set_controlled_agent_max_speed_if_needed(
+        self,
+        controlled_idx: int,
+        velocity: np.ndarray,
+    ) -> None:
+        """Raise controlled-agent max speed to avoid internal clipping of commands."""
+        speed = float(np.linalg.norm(velocity))
+        if speed <= self.max_speed + 1e-9:
+            return
+
+        if not hasattr(self.sim, "setAgentMaxSpeed"):
+            message = (
+                "Controlled command speed exceeds simulator max_speed, but "
+                "python-rvo2 binding lacks setAgentMaxSpeed; command may be clipped."
+            )
+            if self.strict_control_assert:
+                raise RuntimeError(message)
+            warnings.warn(message, RuntimeWarning)
+            return
+
+        agent_id = self.agent_ids[controlled_idx]
+        self.sim.setAgentMaxSpeed(agent_id, speed + 1e-4)
+
+    def _verify_strict_control_velocity_tracking(self, realized_velocities: np.ndarray) -> None:
+        """Validate controlled-agent realized velocity matches commanded velocity."""
+        idx = self.strict_controlled_agent_index
+        expected = self._strict_control_expected_velocity
+        if idx is None or expected is None:
+            return
+
+        realized = np.asarray(realized_velocities[idx], dtype=np.float32)
+        error = float(np.linalg.norm(realized - expected))
+        if error <= self.strict_control_velocity_tolerance:
+            return
+
+        message = (
+            "Strict-control velocity mismatch for controlled agent "
+            f"{idx}: error={error:.6f}, tolerance={self.strict_control_velocity_tolerance:.6f}, "
+            f"expected={expected.tolist()}, realized={realized.tolist()}"
+        )
+        if self.strict_control_assert:
+            raise RuntimeError(message)
+        warnings.warn(message, RuntimeWarning)
 
     def _setup_agents(self) -> List[int]:
         """Create ORCA agents from scene specifications and return simulator IDs."""
@@ -349,8 +458,62 @@ class ORCASim:
 
         return (to_goal / max(goal_dist, 1e-6)).astype(np.float32)
 
-    def _set_preferred_velocities(self) -> None:
+    def _normalize_controlled_pref_velocities(
+        self,
+        controlled_pref_velocities: Mapping[int, np.ndarray] | None,
+    ) -> dict[int, np.ndarray]:
+        """Validate and normalize external preferred-velocity overrides.
+
+        Keys are scene-agent indices. Values are 2D preferred velocity vectors.
+        """
+        if controlled_pref_velocities is None:
+            if self.strict_controlled_agent_index is not None:
+                raise ValueError(
+                    "strict_controlled_agent_index is set, so controlled_pref_velocities "
+                    "must include that agent every step"
+                )
+            return {}
+
+        normalized: dict[int, np.ndarray] = {}
+        strict_idx = self.strict_controlled_agent_index
+        for raw_idx, raw_velocity in controlled_pref_velocities.items():
+            idx = int(raw_idx)
+            if idx < 0 or idx >= len(self.agent_ids):
+                raise ValueError(f"controlled agent index {idx} is out of range")
+            if strict_idx is not None and idx != strict_idx:
+                raise ValueError(
+                    "strict_controlled_agent_index is set; only that agent may be externally controlled"
+                )
+
+            velocity = np.asarray(raw_velocity, dtype=np.float32)
+            if velocity.shape != (2,):
+                raise ValueError("controlled preferred velocity must have shape (2,)")
+            if not np.isfinite(velocity).all():
+                raise ValueError("controlled preferred velocity contains non-finite values")
+
+            speed = float(np.linalg.norm(velocity))
+            if strict_idx is None and speed > self.max_speed + 1e-9:
+                velocity = velocity * (self.max_speed / max(speed, 1e-9))
+
+            normalized[idx] = velocity
+
+        if strict_idx is not None and strict_idx not in normalized:
+            raise ValueError(
+                "strict_controlled_agent_index is set, but controlled_pref_velocities "
+                "did not include that agent"
+            )
+
+        return normalized
+
+    def _set_preferred_velocities(
+        self,
+        controlled_pref_velocities: Mapping[int, np.ndarray] | None = None,
+    ) -> None:
         """Update preferred velocity vectors for all agents before each ORCA step."""
+        self._maybe_configure_strict_controlled_agent()
+        controlled = self._normalize_controlled_pref_velocities(controlled_pref_velocities)
+        self._strict_control_expected_velocity = None
+
         should_resample_noise = (
             self.pref_velocity_noise_std > 0.0
             and self._pref_velocity_step_count % self.pref_velocity_noise_interval == 0
@@ -366,24 +529,79 @@ class ORCASim:
                 self.agent_pref_velocity_noise[idx] = sampled_noise
 
         for idx, agent_id in enumerate(self.agent_ids):
-            pos = np.array(self.sim.getAgentPosition(agent_id), dtype=np.float32)
-            goal = np.array(self.scene.agents[idx].goal, dtype=np.float32)
-            path_index = getattr(self.scene.agents[idx], "path_index", None)
-            direction = self._compute_preferred_direction(pos, goal, path_index, idx)
-            desired_speed = self.agent_desired_speeds[idx]
-            velocity = direction * desired_speed
-            velocity = velocity + self._compute_lateral_control_velocity(
-                agent_index=idx,
-                pos=pos,
-                preferred_direction=direction,
-            )
+            controlled_velocity = controlled.get(idx)
+            if controlled_velocity is None:
+                pos = np.array(self.sim.getAgentPosition(agent_id), dtype=np.float32)
+                goal = np.array(self.scene.agents[idx].goal, dtype=np.float32)
+                path_index = getattr(self.scene.agents[idx], "path_index", None)
+                direction = self._compute_preferred_direction(pos, goal, path_index, idx)
+                desired_speed = self.agent_desired_speeds[idx]
+                velocity = direction * desired_speed
+                velocity = velocity + self._compute_lateral_control_velocity(
+                    agent_index=idx,
+                    pos=pos,
+                    preferred_direction=direction,
+                )
 
-            if float(np.linalg.norm(direction)) > 1e-6 and self.pref_velocity_noise_std > 0.0:
-                velocity = velocity + self.agent_pref_velocity_noise[idx]
+                if float(np.linalg.norm(direction)) > 1e-6 and self.pref_velocity_noise_std > 0.0:
+                    velocity = velocity + self.agent_pref_velocity_noise[idx]
+            else:
+                velocity = controlled_velocity
+                if self.strict_controlled_agent_index is not None and idx == self.strict_controlled_agent_index:
+                    self._set_controlled_agent_max_speed_if_needed(idx, velocity)
+                    self._strict_control_expected_velocity = velocity.copy()
 
             self.sim.setAgentPrefVelocity(agent_id, (float(velocity[0]), float(velocity[1])))
 
         self._pref_velocity_step_count += 1
+
+    def get_agent_positions(self) -> np.ndarray:
+        """Return current simulator positions with shape (N, 2)."""
+        positions = np.zeros((len(self.agent_ids), 2), dtype=np.float32)
+        for idx, agent_id in enumerate(self.agent_ids):
+            positions[idx] = np.array(self.sim.getAgentPosition(agent_id), dtype=np.float32)
+        return positions
+
+    def get_agent_velocities(self) -> np.ndarray:
+        """Return current simulator velocities with shape (N, 2)."""
+        velocities = np.zeros((len(self.agent_ids), 2), dtype=np.float32)
+        for idx, agent_id in enumerate(self.agent_ids):
+            velocities[idx] = np.array(self.sim.getAgentVelocity(agent_id), dtype=np.float32)
+        return velocities
+
+    def all_agents_reached_goals(self) -> bool:
+        """Return True if all agents are within goal_tolerance of their goals."""
+        for idx, agent_id in enumerate(self.agent_ids):
+            pos = np.array(self.sim.getAgentPosition(agent_id), dtype=np.float32)
+            goal = np.array(self.scene.agents[idx].goal, dtype=np.float32)
+            if np.linalg.norm(goal - pos) > self.goal_tolerance:
+                return False
+        return True
+
+    def step(
+        self,
+        controlled_pref_velocities: Mapping[int, np.ndarray] | None = None,
+        return_velocities: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        """Advance simulation by one step with optional controlled preferred velocities.
+
+        Args:
+            controlled_pref_velocities: Optional mapping from scene-agent index to
+                preferred velocity (2,) for this step.
+            return_velocities: When True, also return per-agent velocities.
+
+        Returns:
+            positions or (positions, velocities), each shape (N, 2).
+        """
+        self._set_preferred_velocities(controlled_pref_velocities=controlled_pref_velocities)
+        self.sim.doStep()
+
+        positions = self.get_agent_positions()
+        velocities = self.get_agent_velocities()
+        self._verify_strict_control_velocity_tracking(velocities)
+        if not return_velocities:
+            return positions
+        return positions, velocities
 
     def _spawn_from_region_pair(self, pair, rng: np.random.Generator) -> int:
         """Spawn one startup agent for a region pair using sampled spawn and destination points."""
@@ -431,6 +649,7 @@ class ORCASim:
                 self.agent_ids.append(agent_id)
 
         self._region_pairs_initialized = True
+        self._maybe_configure_strict_controlled_agent()
 
     def simulate(
         self,
@@ -454,22 +673,12 @@ class ORCASim:
         traj = np.zeros((steps, len(self.agent_ids), 2), dtype=np.float32)
         vel_traj = np.zeros((steps, len(self.agent_ids), 2), dtype=np.float32)
         for step in range(steps):
-            self._set_preferred_velocities()
-            self.sim.doStep()
-            for j, agent_id in enumerate(self.agent_ids):
-                traj[step, j] = np.array(self.sim.getAgentPosition(agent_id), dtype=np.float32)
-                vel_traj[step, j] = np.array(self.sim.getAgentVelocity(agent_id), dtype=np.float32)
+            step_positions, step_velocities = self.step(return_velocities=True)
+            traj[step] = step_positions
+            vel_traj[step] = step_velocities
 
             if stop_on_goal and (step + 1) >= min_steps:
-                # Check whether all agents are within tolerance to their goals
-                all_reached = True
-                for idx in range(len(self.agent_ids)):
-                    pos = traj[step, idx]
-                    goal = np.array(self.scene.agents[idx].goal, dtype=np.float32)
-                    if np.linalg.norm(goal - pos) > self.goal_tolerance:
-                        all_reached = False
-                        break
-                if all_reached:
+                if self.all_agents_reached_goals():
                     if return_velocities:
                         return traj[: step + 1], vel_traj[: step + 1]
                     return traj[: step + 1]
