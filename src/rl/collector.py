@@ -45,6 +45,14 @@ class CollectSummary:
     total_reward: float
 
 
+@dataclass
+class ActionSelectionResult:
+    selected_plan: torch.Tensor
+    selected_indices: torch.Tensor
+    candidate_plans: torch.Tensor
+    candidate_log_probs: torch.Tensor | None
+
+
 class RandomPlanCollector:
     """Collect single-env rollouts with random candidate velocity plans."""
 
@@ -131,31 +139,18 @@ class RandomPlanCollector:
                 raise RuntimeError("Collector observation state is not initialized")
 
             obs = self._prepared_obs
-            rng = self._get_rng(torch.as_tensor(obs["current_velocity"]).device)
-            candidate_plans = self.candidate_sampler(
-                current_velocity=obs["current_velocity"],
-                num_candidates=int(self.config.num_candidates),
-                horizon=int(self.config.horizon),
-                max_speed=float(self.config.max_speed),
-                delta_std=float(self.config.delta_std),
-                dt=float(self.config.dt),
-                include_current_velocity_candidate=bool(self.config.include_current_velocity_candidate),
-                generator=rng,
-            )
-            selected_plan, _selected_indices, candidate_log_probs = self._select_plans(obs, candidate_plans)
-            next_raw_obs, rewards, dones, _infos = self.env.step(selected_plan[0, 0])
-            next_obs = self.observation_manager.compute(
-                ObservationBatchContext(raw_obs=next_raw_obs, scene=self._get_scene())
-            )
+            action_selection = self.select_action(obs)
+            next_raw_obs, rewards, dones, _infos = self.env.step(action_selection.selected_plan[0, 0])
+            next_obs = self.prepare_observation(next_raw_obs)
 
             self.replay_buffer.add_batch(
                 obs=obs,
-                actions=selected_plan,
+                actions=action_selection.selected_plan,
                 rewards=torch.as_tensor(rewards, dtype=torch.float32),
                 next_obs=next_obs,
                 dones=torch.as_tensor(dones),
-                candidate_actions=candidate_plans,
-                candidate_log_probs=candidate_log_probs,
+                candidate_actions=action_selection.candidate_plans,
+                candidate_log_probs=action_selection.candidate_log_probs,
             )
 
             transitions_added += 1
@@ -171,6 +166,32 @@ class RandomPlanCollector:
             transitions_added=transitions_added,
             episodes_completed=episodes_completed,
             total_reward=total_reward,
+        )
+
+    def prepare_observation(self, raw_obs: TensorDict) -> TensorDict:
+        self._prepared_obs = self.observation_manager.compute(
+            ObservationBatchContext(raw_obs=raw_obs, scene=self._get_scene())
+        )
+        return self._prepared_obs
+
+    def select_action(self, obs: TensorDict) -> ActionSelectionResult:
+        rng = self._get_rng(torch.as_tensor(obs["current_velocity"]).device)
+        candidate_plans = self.candidate_sampler(
+            current_velocity=obs["current_velocity"],
+            num_candidates=int(self.config.num_candidates),
+            horizon=int(self.config.horizon),
+            max_speed=float(self.config.max_speed),
+            delta_std=float(self.config.delta_std),
+            dt=float(self.config.dt),
+            include_current_velocity_candidate=bool(self.config.include_current_velocity_candidate),
+            generator=rng,
+        )
+        selected_plan, selected_indices, candidate_log_probs = self._select_plans(obs, candidate_plans)
+        return ActionSelectionResult(
+            selected_plan=selected_plan,
+            selected_indices=selected_indices,
+            candidate_plans=candidate_plans,
+            candidate_log_probs=candidate_log_probs,
         )
 
     def _select_plans(
@@ -210,20 +231,27 @@ class RandomPlanCollector:
         if self.q_network is None or self.decoder is None or self.config.q_selection is None:
             raise RuntimeError("Q selection requires q_network, decoder, and config.q_selection")
 
-        rollout = self._rollout_candidates(obs, candidate_plans)
-        planned_velocities, tapped_features = rollout.flatten_candidates_for_q()
-        if tapped_features is None:
-            raise RuntimeError("Counterfactual rollout must return tapped features for Q-based selection")
+        was_training = self.q_network.training
+        self.q_network.eval()
+        try:
+            with torch.no_grad():
+                rollout = self._rollout_candidates(obs, candidate_plans)
+                planned_velocities, tapped_features = rollout.flatten_candidates_for_q()
+                if tapped_features is None:
+                    raise RuntimeError("Counterfactual rollout must return tapped features for Q-based selection")
 
-        batch_size, num_candidates = candidate_plans.shape[:2]
-        goal_position = obs["goal_position"][:, None, :].expand(-1, num_candidates, -1).reshape(batch_size * num_candidates, -1)
-        current_velocity = obs["current_velocity"][:, None, :].expand(-1, num_candidates, -1).reshape(batch_size * num_candidates, -1)
-        q_scores = self.q_network(
-            goal_position=goal_position,
-            current_velocity=current_velocity,
-            planned_velocities=planned_velocities,
-            tapped_future_features=tapped_features,
-        ).reshape(batch_size, num_candidates)
+                batch_size, num_candidates = candidate_plans.shape[:2]
+                goal_position = obs["goal_position"][:, None, :].expand(-1, num_candidates, -1).reshape(batch_size * num_candidates, -1)
+                current_velocity = obs["current_velocity"][:, None, :].expand(-1, num_candidates, -1).reshape(batch_size * num_candidates, -1)
+                q_scores = self.q_network(
+                    goal_position=goal_position,
+                    current_velocity=current_velocity,
+                    planned_velocities=planned_velocities,
+                    tapped_future_features=tapped_features,
+                ).reshape(batch_size, num_candidates)
+        finally:
+            if was_training:
+                self.q_network.train()
 
         selection_indices, selection_probs = sample_action_indices_from_q_scores(
             q_scores,
@@ -293,6 +321,7 @@ class RandomPlanCollector:
 
 
 __all__ = [
+    "ActionSelectionResult",
     "CollectSummary",
     "QActionSelectionConfig",
     "RandomPlanCollector",

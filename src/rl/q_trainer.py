@@ -191,12 +191,18 @@ class RandomCandidateQTrainer:
         batch_size, num_candidates = next_rollout.candidate_velocity_plans.shape[:2]
         next_goal_flat = next_obs["goal_position"][:, None, :].expand(-1, num_candidates, -1).reshape(batch_size * num_candidates, -1)
         next_velocity_flat = next_obs["current_velocity"][:, None, :].expand(-1, num_candidates, -1).reshape(batch_size * num_candidates, -1)
-        next_q_flat = self.target_q_network(
-            goal_position=next_goal_flat,
-            current_velocity=next_velocity_flat,
-            planned_velocities=next_plans_flat,
-            tapped_future_features=next_taps_flat,
-        )
+        was_training = self.target_q_network.training
+        self.target_q_network.eval()
+        try:
+            next_q_flat = self.target_q_network(
+                goal_position=next_goal_flat,
+                current_velocity=next_velocity_flat,
+                planned_velocities=next_plans_flat,
+                tapped_future_features=next_taps_flat,
+            )
+        finally:
+            if was_training:
+                self.target_q_network.train()
         next_q_scores = next_q_flat.reshape(batch_size, num_candidates)
         selection_indices, selection_probs = sample_action_indices_from_q_scores(
             next_q_scores,
