@@ -9,11 +9,17 @@ import random
 import sys
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 
 import torch
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 # Ensure project root is on sys.path so `from src...` works when running this script.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -172,6 +178,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", action="store_true", help="Enable built-in phase timing and cProfile output")
     parser.add_argument("--profile-top-n", type=int, default=30, help="Number of cProfile rows to print")
     parser.add_argument("--profile-output", type=Path, default=None, help="Optional path to save raw cProfile stats")
+    parser.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable/disable Weights & Biases logging",
+    )
+    parser.add_argument("--wandb-project", type=str, default="occupancy-prediction-rl")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -346,6 +361,12 @@ def _log(message: str) -> None:
     stream.flush()
 
 
+def _log_message(message: str, wandb_run: object | None = None) -> None:
+    _log(message)
+    if wandb_run is not None and wandb is not None:
+        wandb.termlog(message)
+
+
 class RLTrainingApp:
     def __init__(self, args: argparse.Namespace, profiler: RunProfiler | None = None) -> None:
         self.args = args
@@ -353,6 +374,7 @@ class RLTrainingApp:
         self.output_path = args.output
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.profiler = profiler or RunProfiler(enabled=False, top_n=0, output_path=None)
+        self.wandb_run: object | None = self._init_wandb()
 
         self.decoder: torch.nn.Module | None = None
         self.history_len: int | None = None
@@ -376,6 +398,25 @@ class RLTrainingApp:
         self.trainer_config: QTrainerConfig | None = None
         self.trainer: RandomCandidateQTrainer | None = None
         self.start_time: float | None = None
+
+    def _init_wandb(self) -> object | None:
+        if not self.args.wandb:
+            return None
+        if wandb is None:
+            raise ImportError("wandb is not installed. Install it with: pip install wandb")
+        return wandb.init(
+            project=self.args.wandb_project,
+            entity=self.args.wandb_entity,
+            name=self.args.wandb_run_name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+            config=vars(self.args),
+        )
+
+    def log(self, message: str) -> None:
+        _log_message(message, wandb_run=self.wandb_run)
+
+    def close(self) -> None:
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
 
     def run(self) -> None:
         self.profiler.start()
@@ -557,7 +598,7 @@ class RLTrainingApp:
         )
 
     def _log_setup(self) -> None:
-        _log(
+        self.log(
             "RL setup: "
             f"{len(self.scenes)} scenes | history_len={self.history_len} | decoder_context_len={self.decoder_context_len} | "
             f"local_map_shape={self.local_map_shape} | tap_channels={self.tap_channels} | device={self.device}"
@@ -569,7 +610,7 @@ class RLTrainingApp:
         if self.collector is None:
             raise RuntimeError("Collector must be initialized before warmup")
         warmup_summary = self.collector.collect_steps(int(self.args.warmup_steps), reset_seed=int(self.args.seed))
-        _log(
+        self.log(
             f"Warmup collected {warmup_summary.transitions_added} transitions | "
             f"episodes={warmup_summary.episodes_completed} | reward={warmup_summary.total_reward:.3f}"
         )
@@ -595,6 +636,7 @@ class RLTrainingApp:
         if iteration == 1 or iteration % int(self.args.log_interval) == 0:
             self._log_iteration(iteration, collect_summary, last_stats)
 
+        eval_summary = None
         if self._should_evaluate(iteration):
             with self.profiler.section("evaluation"):
                 eval_summary = self._evaluate_policy(iteration)
@@ -603,6 +645,8 @@ class RLTrainingApp:
         if iteration % int(self.args.save_interval) == 0:
             with self.profiler.section("save_checkpoint"):
                 self._save_checkpoint(iteration)
+
+        self._log_wandb_iteration(iteration, collect_summary, last_stats, eval_summary)
 
     def _should_evaluate(self, iteration: int) -> bool:
         return (
@@ -684,11 +728,50 @@ class RLTrainingApp:
         )
 
     def _log_evaluation(self, iteration: int, summary: EvaluationSummary) -> None:
-        _log(
+        self.log(
             f"eval iter={iteration:05d} | episodes={summary.episodes:03d} | total_reward={summary.total_reward:.3f} | "
             f"mean_reward={summary.mean_reward:.3f} | mean_ep_len={summary.mean_episode_length:.1f} | "
             f"success={summary.success_rate:.3f} | collision={summary.collision_rate:.3f} | timeout={summary.timeout_rate:.3f}"
         )
+
+    def _log_wandb_iteration(self, iteration: int, collect_summary, last_stats, eval_summary: EvaluationSummary | None) -> None:
+        if self.wandb_run is None or self.replay_buffer is None or self.start_time is None:
+            return
+
+        metrics: dict[str, float | int] = {
+            "iteration": int(iteration),
+            "replay/size": int(len(self.replay_buffer)),
+            "collect/reward": float(collect_summary.total_reward),
+            "collect/episodes": int(collect_summary.episodes_completed),
+            "collect/transitions": int(collect_summary.transitions_added),
+            "time/elapsed_seconds": float(time.time() - self.start_time),
+        }
+        if last_stats is not None:
+            metrics.update(
+                {
+                    "train/loss": float(last_stats.loss),
+                    "train/q_pred_mean": float(last_stats.q_pred_mean),
+                    "train/target_mean": float(last_stats.target_mean),
+                    "train/next_q_mean": float(last_stats.next_q_mean),
+                    "train/selection_entropy_mean": float(last_stats.selection_entropy_mean),
+                    "train/reward_mean": float(last_stats.reward_mean),
+                    "train/done_fraction": float(last_stats.done_fraction),
+                }
+            )
+        if eval_summary is not None:
+            metrics.update(
+                {
+                    "eval/episodes": int(eval_summary.episodes),
+                    "eval/total_reward": float(eval_summary.total_reward),
+                    "eval/mean_reward": float(eval_summary.mean_reward),
+                    "eval/mean_episode_length": float(eval_summary.mean_episode_length),
+                    "eval/success_rate": float(eval_summary.success_rate),
+                    "eval/collision_rate": float(eval_summary.collision_rate),
+                    "eval/timeout_rate": float(eval_summary.timeout_rate),
+                }
+            )
+
+        self.wandb_run.log(metrics, step=int(iteration), commit=True)
 
     def _log_iteration(self, iteration: int, collect_summary, last_stats) -> None:
         if self.replay_buffer is None or self.start_time is None:
@@ -696,14 +779,14 @@ class RLTrainingApp:
 
         elapsed = time.time() - self.start_time
         if last_stats is None:
-            _log(
+            self.log(
                 f"iter={iteration:05d} | replay={len(self.replay_buffer):06d} | "
                 f"collect_reward={collect_summary.total_reward:.3f} | collect_episodes={collect_summary.episodes_completed} | "
                 f"updates=0 | elapsed={elapsed:.1f}s"
             )
             return
 
-        _log(
+        self.log(
             f"iter={iteration:05d} | replay={len(self.replay_buffer):06d} | "
             f"collect_reward={collect_summary.total_reward:.3f} | collect_episodes={collect_summary.episodes_completed} | "
             f"loss={last_stats.loss:.5f} | q={last_stats.q_pred_mean:.3f} | target={last_stats.target_mean:.3f} | "
@@ -736,12 +819,17 @@ class RLTrainingApp:
         periodic_path = self.output_path.with_name(f"{self.output_path.stem}_iter_{iteration:06d}{self.output_path.suffix}")
         torch.save(checkpoint, periodic_path)
         torch.save(checkpoint, self.output_path)
-        _log(f"Checkpoint saved: {periodic_path}")
+        self.log(f"Checkpoint saved: {periodic_path}")
+        if self.wandb_run is not None:
+            self.wandb_run.save(str(periodic_path), base_path=str(self.output_path.parent), policy="now")
+            self.wandb_run.save(str(self.output_path), base_path=str(self.output_path.parent), policy="now")
 
     def _save_final_checkpoint(self) -> None:
         checkpoint = self._build_checkpoint(int(self.args.iterations))
         torch.save(checkpoint, self.output_path)
-        _log(f"Training finished. Final checkpoint saved: {self.output_path}")
+        self.log(f"Training finished. Final checkpoint saved: {self.output_path}")
+        if self.wandb_run is not None:
+            self.wandb_run.save(str(self.output_path), base_path=str(self.output_path.parent), policy="now")
 
 
 def main() -> None:
@@ -751,7 +839,11 @@ def main() -> None:
         top_n=int(args.profile_top_n),
         output_path=args.profile_output,
     )
-    RLTrainingApp(args, profiler=profiler).run()
+    app = RLTrainingApp(args, profiler=profiler)
+    try:
+        app.run()
+    finally:
+        app.close()
 
 
 if __name__ == "__main__":

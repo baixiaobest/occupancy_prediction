@@ -16,6 +16,8 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
 class ORCASim:
     """ORCA simulator wrapper with optional reference-path guided navigation."""
 
+    _strict_control_velocity_warning_emitted_global = False
+
     def __init__(
         self,
         scene,
@@ -207,6 +209,9 @@ class ORCASim:
         )
         if self.strict_control_assert:
             raise RuntimeError(message)
+        if ORCASim._strict_control_velocity_warning_emitted_global:
+            return
+        ORCASim._strict_control_velocity_warning_emitted_global = True
         warnings.warn(message, RuntimeWarning)
 
     def _setup_agents(self) -> List[int]:
