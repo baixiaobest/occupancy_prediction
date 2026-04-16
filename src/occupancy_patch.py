@@ -44,7 +44,7 @@ def slice_centered_patch(
         patch = grid_2d[start_y:end_y, start_x:end_x]
         return (patch > 0).float() if binary else patch
 
-    out = torch.zeros((patch_h, patch_w), dtype=torch.float32)
+    out = torch.zeros((patch_h, patch_w), dtype=torch.float32, device=grid_2d.device)
     src_x0 = max(0, start_x)
     src_y0 = max(0, start_y)
     src_x1 = min(int(grid_2d.shape[1]), end_x)

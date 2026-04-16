@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 import torch
 
+from src.occupancy_patch import slice_centered_patch
 from src.occupancy2d import Occupancy2d
 from src.scene import Scene
 
@@ -176,6 +177,63 @@ def _build_map_size_xy(
     return patch_w * res_x, patch_h * res_y
 
 
+def _iter_scene_points(scene: Scene) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for obstacle in scene.obstacles:
+        points.extend((float(x), float(y)) for x, y in obstacle.vertices)
+    for agent in scene.agents:
+        points.append((float(agent.position[0]), float(agent.position[1])))
+        points.append((float(agent.goal[0]), float(agent.goal[1])))
+    for path in scene.paths:
+        points.extend((float(x), float(y)) for x, y in path.points)
+    points.extend((float(x), float(y)) for x, y in scene.ego_centers)
+    return points
+
+
+def _build_scene_static_canvas(
+    *,
+    scene: Scene,
+    local_map_shape: tuple[int, int],
+    occupancy_resolution: tuple[float, float],
+    agent_radius: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, tuple[float, float]]:
+    points = _iter_scene_points(scene)
+    if not points:
+        points = [(0.0, 0.0)]
+
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    res_x = float(occupancy_resolution[0])
+    res_y = float(occupancy_resolution[1])
+    pad_x = 0.5 * int(local_map_shape[1]) * res_x
+    pad_y = 0.5 * int(local_map_shape[0]) * res_y
+
+    min_x = min(xs) - pad_x
+    max_x = max(xs) + pad_x
+    min_y = min(ys) - pad_y
+    max_y = max(ys) + pad_y
+
+    cells_x = max(1, int(torch.ceil(torch.tensor((max_x - min_x) / res_x)).item()))
+    cells_y = max(1, int(torch.ceil(torch.tensor((max_y - min_y) / res_y)).item()))
+    size_xy = (float(cells_x * res_x), float(cells_y * res_y))
+    origin_xy = (float(min_x), float(min_y))
+    center_xy = (
+        origin_xy[0] + 0.5 * size_xy[0],
+        origin_xy[1] + 0.5 * size_xy[1],
+    )
+
+    static_occ = Occupancy2d(
+        resolution=(res_x, res_y),
+        size=size_xy,
+        trajectory=None,
+        static_obstacles=scene.obstacles,
+        agent_radius=agent_radius,
+    )
+    scene_static_map = static_occ.generate(center_offset=center_xy)[0].to(device=device, dtype=torch.float32)
+    return scene_static_map, origin_xy
+
+
 def _get_manager_state(context: ObservationBatchContext) -> dict[str, Any]:
     state = context.extras.get("manager_state")
     if not isinstance(state, dict):
@@ -221,25 +279,43 @@ def term_static_local_occupancy(
     resolution = tuple(float(v) for v in params["occupancy_resolution"])
     local_map_shape = tuple(int(v) for v in params["local_map_shape"])
     agent_radius = float(params.get("agent_radius", 0.3))
-    state_key = str(params.get("state_key", "static_occupancy_renderers"))
+    state_key = str(params.get("state_key", "static_occupancy_cache"))
 
     state = _get_manager_state(context)
-    renderers = _get_or_create_state_list(
+    caches = _get_or_create_state_list(
         state,
         key=state_key,
         length=context.num_envs,
-        factory=lambda: Occupancy2d(
-            resolution=resolution,
-            size=_build_map_size_xy(local_map_shape, resolution),
-            agent_radius=agent_radius,
-        ),
+        factory=dict,
     )
 
     outputs: list[torch.Tensor] = []
     controlled_positions = context.controlled_positions()
-    for env_idx, renderer in enumerate(renderers):
-        renderer.update_inputs(trajectory=None, static_obstacles=context.scenes[env_idx].obstacles)
-        grid = renderer.generate(center_offset=controlled_positions[env_idx])[0]
+    for env_idx, cache in enumerate(caches):
+        if not isinstance(cache, dict):
+            raise RuntimeError("Static occupancy cache entry must be a dict")
+        scene_static_map = cache.get("scene_static_map")
+        scene_origin = cache.get("scene_origin")
+        if scene_static_map is None or scene_origin is None:
+            scene_static_map, scene_origin = _build_scene_static_canvas(
+                scene=context.scenes[env_idx],
+                local_map_shape=local_map_shape,
+                occupancy_resolution=resolution,
+                agent_radius=agent_radius,
+                device=device,
+            )
+            cache["scene_static_map"] = scene_static_map
+            cache["scene_origin"] = scene_origin
+
+        grid = slice_centered_patch(
+            scene_static_map,
+            controlled_positions[env_idx],
+            scene_origin,
+            resolution,
+            local_map_shape,
+            binary=False,
+            prefer_view=True,
+        )
         outputs.append(grid.to(device=device, dtype=torch.float32).unsqueeze(0))
 
     return torch.stack(outputs, dim=0)
