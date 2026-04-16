@@ -1,5 +1,11 @@
 """RL training utilities and building blocks."""
 
+from .counterfactual import (
+	CounterfactualRolloutBatch,
+	integrate_velocity_plans,
+	rollout_counterfactual_futures,
+	sample_random_velocity_plans,
+)
 from .env_single import ORCASimConfig, ORCASingleEnv, RewardConfig, SingleEnvConfig
 from .reward_manager import (
 	RewardBatchContext,
@@ -14,6 +20,7 @@ from .reward_manager import (
 from .replay_buffer import ReplayBuffer, ReplaySampleBatch, TensorDict
 
 __all__ = [
+	"CounterfactualRolloutBatch",
 	"ORCASimConfig",
 	"ORCASingleEnv",
 	"RewardConfig",
@@ -25,6 +32,9 @@ __all__ = [
 	"ReplayBuffer",
 	"ReplaySampleBatch",
 	"TensorDict",
+	"integrate_velocity_plans",
+	"rollout_counterfactual_futures",
+	"sample_random_velocity_plans",
 	"term_collision_any",
 	"term_constant",
 	"term_progress_to_goal",

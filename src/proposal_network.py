@@ -54,9 +54,9 @@ class _BaseVelocityProposalNetwork(nn.Module):
             head_input_dim = dim
         mlp = nn.Sequential(*mlp_layers) if len(mlp_layers) > 0 else nn.Identity()
 
-        velocity_mean_head = nn.Linear(head_input_dim, horizon * 2)
-        velocity_var_head = nn.Linear(head_input_dim, horizon * 2)
-        return mlp, velocity_mean_head, velocity_var_head
+        delta_velocity_mean_head = nn.Linear(head_input_dim, horizon * 2)
+        delta_velocity_var_head = nn.Linear(head_input_dim, horizon * 2)
+        return mlp, delta_velocity_mean_head, delta_velocity_var_head
 
     @staticmethod
     def _prepare_vector_input(
@@ -82,25 +82,67 @@ class _BaseVelocityProposalNetwork(nn.Module):
             raise ValueError(f"{name} batch size must be {batch_size}, got {vec.shape[0]}")
         return vec
 
-    def _predict_from_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _predict_delta_distribution_from_features(
+        self,
+        features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = features.shape[0]
         shared = self.mlp(features)
-        velocity_mean = self.velocity_mean_head(shared).view(batch_size, self.horizon, 2)
-        velocity_variance = (
-            F.softplus(self.velocity_var_head(shared)).view(batch_size, self.horizon, 2) + self.min_variance
+        delta_velocity_mean = self.delta_velocity_mean_head(shared).view(batch_size, self.horizon, 2)
+        delta_velocity_variance = (
+            F.softplus(self.delta_velocity_var_head(shared)).view(batch_size, self.horizon, 2)
+            + self.min_variance
         )
+        return delta_velocity_mean, delta_velocity_variance
+
+    @classmethod
+    def integrate_delta_velocity_plan(
+        cls,
+        current_velocity: torch.Tensor | None,
+        delta_velocity_plan: torch.Tensor,
+    ) -> torch.Tensor:
+        if delta_velocity_plan.ndim != 3 or delta_velocity_plan.shape[-1] != 2:
+            raise ValueError("delta_velocity_plan must have shape (B, horizon, 2)")
+
+        current_velocity_vec = cls._prepare_vector_input(
+            current_velocity,
+            name="current_velocity",
+            device=delta_velocity_plan.device,
+            batch_size=int(delta_velocity_plan.shape[0]),
+        ).to(dtype=delta_velocity_plan.dtype)
+        return current_velocity_vec.unsqueeze(1) + torch.cumsum(delta_velocity_plan, dim=1)
+
+    @classmethod
+    def delta_distribution_to_absolute_distribution(
+        cls,
+        current_velocity: torch.Tensor | None,
+        delta_velocity_mean: torch.Tensor,
+        delta_velocity_variance: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if delta_velocity_mean.shape != delta_velocity_variance.shape:
+            raise ValueError("delta_velocity_mean and delta_velocity_variance must have matching shapes")
+
+        velocity_mean = cls.integrate_delta_velocity_plan(current_velocity, delta_velocity_mean)
+        velocity_variance = torch.cumsum(delta_velocity_variance, dim=1)
         return velocity_mean, velocity_variance
 
-    @staticmethod
-    def sample(velocity_mean: torch.Tensor, velocity_variance: torch.Tensor) -> torch.Tensor:
-        if velocity_mean.shape != velocity_variance.shape:
-            raise ValueError("velocity_mean and velocity_variance must have matching shapes")
-        eps = torch.randn_like(velocity_mean)
-        return velocity_mean + torch.sqrt(velocity_variance) * eps
+    @classmethod
+    def sample(
+        cls,
+        current_velocity: torch.Tensor | None,
+        delta_velocity_mean: torch.Tensor,
+        delta_velocity_variance: torch.Tensor,
+    ) -> torch.Tensor:
+        if delta_velocity_mean.shape != delta_velocity_variance.shape:
+            raise ValueError("delta_velocity_mean and delta_velocity_variance must have matching shapes")
+
+        eps = torch.randn_like(delta_velocity_mean)
+        delta_velocity_plan = delta_velocity_mean + torch.sqrt(delta_velocity_variance) * eps
+        return cls.integrate_delta_velocity_plan(current_velocity, delta_velocity_plan)
 
 
 class VelocityTrajectoryProposalNetwork(_BaseVelocityProposalNetwork):
-    """Convolutional proposal network for future velocity distributions.
+    """Convolutional proposal network for future delta-velocity distributions.
 
     Inputs:
     - dynamic_x: past occupancy sequence with shape (B, C, T, H, W)
@@ -109,8 +151,10 @@ class VelocityTrajectoryProposalNetwork(_BaseVelocityProposalNetwork):
     - goal_position: optional goal position (B, 2)
 
     Outputs:
-    - velocity_mean: shape (B, horizon, 2)
-    - velocity_variance: shape (B, horizon, 2), strictly positive
+    - delta_velocity_mean: shape (B, horizon, 2)
+    - delta_velocity_variance: shape (B, horizon, 2), strictly positive
+
+    Use `sample(...)` to draw an absolute velocity plan anchored on current_velocity.
     """
 
     def __init__(
@@ -175,7 +219,7 @@ class VelocityTrajectoryProposalNetwork(_BaseVelocityProposalNetwork):
         encoded_h, encoded_w = _downsample_hw((self.input_height, self.input_width), stride_list)
         self.encoded_flat_dim = self.channels[-1] * encoded_h * encoded_w
 
-        self.mlp, self.velocity_mean_head, self.velocity_var_head = self._build_mlp_and_heads(
+        self.mlp, self.delta_velocity_mean_head, self.delta_velocity_var_head = self._build_mlp_and_heads(
             input_dim=self.encoded_flat_dim + 4,
             mlp_hidden_dims=mlp_hidden_dims,
             horizon=self.horizon,
@@ -253,7 +297,7 @@ class VelocityTrajectoryProposalNetwork(_BaseVelocityProposalNetwork):
             ],
             dim=1,
         )
-        return self._predict_from_features(mlp_input)
+        return self._predict_delta_distribution_from_features(mlp_input)
 
 
 class VelocityGoalMLPProposalNetwork(_BaseVelocityProposalNetwork):
@@ -272,7 +316,7 @@ class VelocityGoalMLPProposalNetwork(_BaseVelocityProposalNetwork):
         if self.velocity_scale <= 0:
             raise ValueError("velocity_scale must be > 0")
 
-        self.mlp, self.velocity_mean_head, self.velocity_var_head = self._build_mlp_and_heads(
+        self.mlp, self.delta_velocity_mean_head, self.delta_velocity_var_head = self._build_mlp_and_heads(
             input_dim=4,
             mlp_hidden_dims=mlp_hidden_dims,
             horizon=self.horizon,
@@ -300,7 +344,7 @@ class VelocityGoalMLPProposalNetwork(_BaseVelocityProposalNetwork):
 
         velocity_vec = velocity_vec / self.velocity_scale
         mlp_input = torch.cat([velocity_vec, goal_vec], dim=1)
-        return self._predict_from_features(mlp_input)
+        return self._predict_delta_distribution_from_features(mlp_input)
 
 
 def build_proposal_network(
