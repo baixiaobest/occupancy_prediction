@@ -514,10 +514,10 @@ def main() -> None:
 
     zero_rgb = np.zeros((init_h, init_w, 3), dtype=np.float32)
     # Occupancy is cell-discrete; nearest interpolation prevents visual blurring.
-    im_past = ax_past.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
-    im_pred = ax_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
-    im_overlay_pred = ax_overlay_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
-    im_overlay_gt = ax_overlay_gt.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest")
+    im_past = ax_past.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest", origin="lower")
+    im_pred = ax_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest", origin="lower")
+    im_overlay_pred = ax_overlay_pred.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest", origin="lower")
+    im_overlay_gt = ax_overlay_gt.imshow(zero_rgb, vmin=0.0, vmax=1.0, interpolation="nearest", origin="lower")
 
     ax_past.set_title("Past + Static Stack")
     ax_pred.set_title("Predicted Horizon Stack (Mode 0=Red, Mode 1=Green)")
