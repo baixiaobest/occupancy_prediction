@@ -2,6 +2,7 @@
 
 from .collector import (
 	CollectSummary,
+	QActionSelectionConfig,
 	RandomPlanCollector,
 	RandomPlanCollectorConfig,
 )
@@ -39,6 +40,16 @@ from .observation_manager import (
 	term_dynamic_local_occupancy_context,
 	term_static_local_occupancy,
 )
+from .q_trainer import (
+	CandidateSamplerFn,
+	CounterfactualRolloutFn,
+	QTrainStepStats,
+	QTrainerConfig,
+	RandomCandidateQTrainer,
+	q_scores_to_probabilities,
+	sample_action_indices_from_q_scores,
+	soft_update_module,
+)
 from .replay_buffer import ReplayBuffer, ReplaySampleBatch, TensorDict
 
 __all__ = [
@@ -52,17 +63,25 @@ __all__ = [
 	"OnlineOccupancyObservationConfig",
 	"ORCASimConfig",
 	"ORCASingleEnv",
+	"QActionSelectionConfig",
 	"RandomPlanCollector",
 	"RandomPlanCollectorConfig",
+	"RandomCandidateQTrainer",
 	"RewardConfig",
 	"RewardBatchContext",
 	"RewardManager",
 	"RewardTermCfg",
 	"RewardTermFn",
+	"CandidateSamplerFn",
+	"CounterfactualRolloutFn",
+	"QTrainStepStats",
+	"QTrainerConfig",
 	"SingleEnvConfig",
 	"ReplayBuffer",
 	"ReplaySampleBatch",
 	"TensorDict",
+	"q_scores_to_probabilities",
+	"sample_action_indices_from_q_scores",
 	"build_observation_manager",
 	"build_online_occupancy_observation_config",
 	"build_online_occupancy_observation_manager",
@@ -70,6 +89,7 @@ __all__ = [
 	"integrate_velocity_plans",
 	"rollout_counterfactual_futures",
 	"sample_random_velocity_plans",
+	"soft_update_module",
 	"term_controlled_current_velocity",
 	"term_controlled_goal_offset",
 	"term_collision_any",
