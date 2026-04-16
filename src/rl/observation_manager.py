@@ -111,6 +111,13 @@ class ObservationTermCfg:
     enabled: bool = True
 
 
+@dataclass
+class ObservationConfig:
+    """Configuration wrapper for observation-manager terms."""
+
+    terms: list[ObservationTermCfg] = field(default_factory=list)
+
+
 class ObservationManager:
     """Aggregates observation terms over a batch of environments."""
 
@@ -287,9 +294,13 @@ def term_dynamic_local_occupancy_context(
     return torch.stack(outputs, dim=0)
 
 
-def build_online_occupancy_observation_manager(
+def build_observation_manager(config: ObservationConfig) -> ObservationManager:
+    return ObservationManager(terms=config.terms)
+
+
+def build_online_occupancy_observation_config(
     config: OnlineOccupancyObservationConfig,
-) -> ObservationManager:
+) -> ObservationConfig:
     if int(config.decoder_context_len) <= 0:
         raise ValueError("decoder_context_len must be > 0")
     if len(config.local_map_shape) != 2 or any(int(v) <= 0 for v in config.local_map_shape):
@@ -306,7 +317,7 @@ def build_online_occupancy_observation_manager(
         "agent_radius": float(config.agent_radius),
         "device": str(config.device),
     }
-    return ObservationManager(
+    return ObservationConfig(
         terms=[
             ObservationTermCfg(
                 name="dynamic_context",
@@ -331,12 +342,21 @@ def build_online_occupancy_observation_manager(
     )
 
 
+def build_online_occupancy_observation_manager(
+    config: OnlineOccupancyObservationConfig,
+) -> ObservationManager:
+    return build_observation_manager(build_online_occupancy_observation_config(config))
+
+
 __all__ = [
     "ObservationBatchContext",
+    "ObservationConfig",
     "ObservationManager",
     "ObservationTermCfg",
     "ObservationTermFn",
     "OnlineOccupancyObservationConfig",
+    "build_observation_manager",
+    "build_online_occupancy_observation_config",
     "build_online_occupancy_observation_manager",
     "term_controlled_current_velocity",
     "term_controlled_goal_offset",

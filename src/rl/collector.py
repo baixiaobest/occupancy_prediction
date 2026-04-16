@@ -8,7 +8,7 @@ import torch
 from src.scene import Scene
 
 from .counterfactual import sample_random_velocity_plans
-from .observation_manager import ObservationBatchContext, ObservationManager
+from .observation_manager import ObservationBatchContext, ObservationManager, build_observation_manager
 from .replay_buffer import ReplayBuffer, TensorDict
 
 
@@ -39,7 +39,7 @@ class RandomPlanCollector:
         *,
         env: object,
         replay_buffer: ReplayBuffer,
-        observation_manager: ObservationManager,
+        observation_manager: ObservationManager | None,
         config: RandomPlanCollectorConfig,
     ) -> None:
         if int(config.horizon) <= 0:
@@ -57,7 +57,7 @@ class RandomPlanCollector:
 
         self.env = env
         self.replay_buffer = replay_buffer
-        self.observation_manager = observation_manager
+        self.observation_manager = self._resolve_observation_manager(observation_manager)
         self.config = config
         self._prepared_obs: TensorDict | None = None
         self._seed = int(config.seed)
@@ -165,6 +165,21 @@ class RandomPlanCollector:
         if not isinstance(scene, Scene):
             raise RuntimeError("collector env must expose env.sim.scene as a Scene")
         return scene
+
+    def _resolve_observation_manager(
+        self,
+        observation_manager: ObservationManager | None,
+    ) -> ObservationManager:
+        if observation_manager is not None:
+            return observation_manager
+
+        env_config = getattr(self.env, "env_config", None)
+        observation_config = getattr(env_config, "observation", None)
+        if observation_config is None:
+            raise ValueError(
+                "observation_manager must be provided when env.env_config.observation is not set"
+            )
+        return build_observation_manager(observation_config)
 
 
 __all__ = [

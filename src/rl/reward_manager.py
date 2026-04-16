@@ -105,6 +105,86 @@ class RewardTermCfg:
     enabled: bool = True
 
 
+def term_progress_to_goal(context: RewardBatchContext, params: dict[str, Any]) -> torch.Tensor:
+    """Positive when controlled agent gets closer to its goal."""
+    del params
+    return context.controlled_prev_goal_distance() - context.controlled_new_goal_distance()
+
+
+def term_collision_any(context: RewardBatchContext, params: dict[str, Any]) -> torch.Tensor:
+    """Binary collision indicator for the controlled agent against any other agent."""
+    collision_distance = float(params.get("collision_distance", 0.4))
+
+    controlled_pos = context.controlled_new_positions()
+    diffs = context.new_positions - controlled_pos[:, None, :]
+    dists = torch.linalg.vector_norm(diffs, dim=2)
+
+    self_mask = torch.zeros(
+        (context.num_envs, context.num_agents),
+        dtype=torch.bool,
+        device=context.new_positions.device,
+    )
+    self_mask[
+        torch.arange(context.num_envs, device=context.new_positions.device),
+        context.controlled_agent_indices,
+    ] = True
+
+    collision = torch.any((dists < collision_distance) & (~self_mask), dim=1)
+    return collision.to(dtype=torch.float32)
+
+
+def term_success(context: RewardBatchContext, params: dict[str, Any]) -> torch.Tensor:
+    """Binary success indicator: controlled agent reached goal tolerance."""
+    del params
+    goal_dist = context.controlled_new_goal_distance()
+    return (goal_dist <= context.goal_tolerances).to(dtype=torch.float32)
+
+
+def term_constant(context: RewardBatchContext, params: dict[str, Any]) -> torch.Tensor:
+    """Constant scalar term per environment (useful for step penalty)."""
+    value = float(params.get("value", 1.0))
+    return torch.full(
+        (context.num_envs,),
+        fill_value=value,
+        dtype=torch.float32,
+        device=context.prev_positions.device,
+    )
+
+
+def _default_reward_terms() -> list[RewardTermCfg]:
+    return [
+        RewardTermCfg(
+            name="progress",
+            fn=term_progress_to_goal,
+            weight=1.0,
+        ),
+        RewardTermCfg(
+            name="step_penalty",
+            fn=term_constant,
+            weight=0.0,
+            params={"value": 1.0},
+        ),
+        RewardTermCfg(
+            name="collision",
+            fn=term_collision_any,
+            weight=-1.0,
+            params={"collision_distance": 0.4},
+        ),
+        RewardTermCfg(
+            name="success",
+            fn=term_success,
+            weight=5.0,
+        ),
+    ]
+
+
+@dataclass
+class RewardConfig:
+    """Configuration wrapper for reward-manager terms."""
+
+    terms: list[RewardTermCfg] = field(default_factory=_default_reward_terms)
+
+
 class RewardManager:
     """Aggregates weighted reward terms over a batch of environments."""
 
@@ -162,57 +242,17 @@ class RewardManager:
         return total_reward, weighted_terms, raw_terms
 
 
-def term_progress_to_goal(context: RewardBatchContext, params: dict[str, Any]) -> torch.Tensor:
-    """Positive when controlled agent gets closer to its goal."""
-    del params
-    return context.controlled_prev_goal_distance() - context.controlled_new_goal_distance()
-
-
-def term_collision_any(context: RewardBatchContext, params: dict[str, Any]) -> torch.Tensor:
-    """Binary collision indicator for the controlled agent against any other agent."""
-    collision_distance = float(params.get("collision_distance", 0.4))
-
-    controlled_pos = context.controlled_new_positions()
-    diffs = context.new_positions - controlled_pos[:, None, :]
-    dists = torch.linalg.vector_norm(diffs, dim=2)
-
-    self_mask = torch.zeros(
-        (context.num_envs, context.num_agents),
-        dtype=torch.bool,
-        device=context.new_positions.device,
-    )
-    self_mask[
-        torch.arange(context.num_envs, device=context.new_positions.device),
-        context.controlled_agent_indices,
-    ] = True
-
-    collision = torch.any((dists < collision_distance) & (~self_mask), dim=1)
-    return collision.to(dtype=torch.float32)
-
-
-def term_success(context: RewardBatchContext, params: dict[str, Any]) -> torch.Tensor:
-    """Binary success indicator: controlled agent reached goal tolerance."""
-    del params
-    goal_dist = context.controlled_new_goal_distance()
-    return (goal_dist <= context.goal_tolerances).to(dtype=torch.float32)
-
-
-def term_constant(context: RewardBatchContext, params: dict[str, Any]) -> torch.Tensor:
-    """Constant scalar term per environment (useful for step penalty)."""
-    value = float(params.get("value", 1.0))
-    return torch.full(
-        (context.num_envs,),
-        fill_value=value,
-        dtype=torch.float32,
-        device=context.prev_positions.device,
-    )
+def build_reward_manager(config: RewardConfig) -> RewardManager:
+    return RewardManager(terms=config.terms)
 
 
 __all__ = [
     "RewardBatchContext",
+    "RewardConfig",
     "RewardTermCfg",
     "RewardManager",
     "RewardTermFn",
+    "build_reward_manager",
     "term_progress_to_goal",
     "term_collision_any",
     "term_success",

@@ -7,14 +7,13 @@ import torch
 
 from src.ORCASim import ORCASim
 from src.scene import Scene
+from src.rl.observation_manager import ObservationConfig
 from src.rl.reward_manager import (
     RewardBatchContext,
+    RewardConfig,
     RewardManager,
     RewardTermCfg,
-    term_collision_any,
-    term_constant,
-    term_progress_to_goal,
-    term_success,
+    build_reward_manager,
 )
 
 
@@ -41,18 +40,6 @@ class ORCASimConfig:
     strict_control_velocity_tolerance: float = 1e-3
     strict_control_assert: bool = False
 
-
-@dataclass
-class RewardConfig:
-    """Reward shaping terms for controlled-agent RL training."""
-
-    progress_weight: float = 1.0
-    collision_penalty: float = 1.0
-    step_penalty: float = 0.0
-    success_bonus: float = 5.0
-    collision_distance: float = 0.4
-
-
 @dataclass
 class SingleEnvConfig:
     """Single-environment wrapper settings."""
@@ -61,37 +48,12 @@ class SingleEnvConfig:
     controlled_agent_index: int = 0
     device: str = "cpu"
     reward: RewardConfig = field(default_factory=RewardConfig)
-    reward_terms: list[RewardTermCfg] | None = None
+    observation: ObservationConfig | None = None
 
 
 def _build_default_reward_manager(reward_cfg: RewardConfig) -> RewardManager:
     """Build default reward manager equivalent to the legacy hardcoded reward."""
-    return RewardManager(
-        terms=[
-            RewardTermCfg(
-                name="progress",
-                fn=term_progress_to_goal,
-                weight=float(reward_cfg.progress_weight),
-            ),
-            RewardTermCfg(
-                name="step_penalty",
-                fn=term_constant,
-                weight=float(reward_cfg.step_penalty),
-                params={"value": 1.0},
-            ),
-            RewardTermCfg(
-                name="collision",
-                fn=term_collision_any,
-                weight=-float(reward_cfg.collision_penalty),
-                params={"collision_distance": float(reward_cfg.collision_distance)},
-            ),
-            RewardTermCfg(
-                name="success",
-                fn=term_success,
-                weight=float(reward_cfg.success_bonus),
-            ),
-        ]
-    )
+    return build_reward_manager(reward_cfg)
 
 
 class ORCASingleEnv:
@@ -162,10 +124,7 @@ class ORCASingleEnv:
         )
 
         if self.reward_manager is None:
-            if self.env_config.reward_terms is not None:
-                self.reward_manager = RewardManager(terms=self.env_config.reward_terms)
-            else:
-                self.reward_manager = _build_default_reward_manager(self.env_config.reward)
+            self.reward_manager = _build_default_reward_manager(self.env_config.reward)
 
         return self._build_obs(self._last_positions, self._last_velocities)
 

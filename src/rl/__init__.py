@@ -11,12 +11,14 @@ from .counterfactual import (
 	rollout_counterfactual_futures,
 	sample_random_velocity_plans,
 )
-from .env_single import ORCASimConfig, ORCASingleEnv, RewardConfig, SingleEnvConfig
+from .env_single import ORCASimConfig, ORCASingleEnv, SingleEnvConfig
 from .reward_manager import (
 	RewardBatchContext,
+	RewardConfig,
 	RewardManager,
 	RewardTermCfg,
 	RewardTermFn,
+	build_reward_manager,
 	term_collision_any,
 	term_constant,
 	term_progress_to_goal,
@@ -24,10 +26,13 @@ from .reward_manager import (
 )
 from .observation_manager import (
 	ObservationBatchContext,
+	ObservationConfig,
 	ObservationManager,
 	ObservationTermCfg,
 	ObservationTermFn,
 	OnlineOccupancyObservationConfig,
+	build_observation_manager,
+	build_online_occupancy_observation_config,
 	build_online_occupancy_observation_manager,
 	term_controlled_current_velocity,
 	term_controlled_goal_offset,
@@ -40,6 +45,7 @@ __all__ = [
 	"CollectSummary",
 	"CounterfactualRolloutBatch",
 	"ObservationBatchContext",
+	"ObservationConfig",
 	"ObservationManager",
 	"ObservationTermCfg",
 	"ObservationTermFn",
@@ -57,7 +63,10 @@ __all__ = [
 	"ReplayBuffer",
 	"ReplaySampleBatch",
 	"TensorDict",
+	"build_observation_manager",
+	"build_online_occupancy_observation_config",
 	"build_online_occupancy_observation_manager",
+	"build_reward_manager",
 	"integrate_velocity_plans",
 	"rollout_counterfactual_futures",
 	"sample_random_velocity_plans",

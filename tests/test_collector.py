@@ -11,8 +11,9 @@ from src.rl.collector import (
     RandomPlanCollectorConfig,
 )
 from src.rl.observation_manager import (
+    build_observation_manager,
+    build_online_occupancy_observation_config,
     OnlineOccupancyObservationConfig,
-    build_online_occupancy_observation_manager,
 )
 from src.rl.replay_buffer import ReplayBuffer
 from src.scene import AgentSpec, ObstacleSpec, Scene
@@ -70,7 +71,7 @@ class _DummyEnv:
 def test_random_plan_collector_adds_replay_transitions() -> None:
     env = _DummyEnv()
     replay_buffer = ReplayBuffer(capacity=16, seed=0)
-    observation_manager = build_online_occupancy_observation_manager(
+    observation_config = build_online_occupancy_observation_config(
         OnlineOccupancyObservationConfig(
             decoder_context_len=4,
             local_map_shape=(12, 10),
@@ -78,6 +79,7 @@ def test_random_plan_collector_adds_replay_transitions() -> None:
             agent_radius=0.2,
         )
     )
+    observation_manager = build_observation_manager(observation_config)
     collector = RandomPlanCollector(
         env=env,
         replay_buffer=replay_buffer,
