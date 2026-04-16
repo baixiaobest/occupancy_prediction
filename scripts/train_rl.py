@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import cProfile
 import copy
 import os
+import pstats
 import random
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 
 import torch
@@ -46,6 +50,89 @@ class EvaluationSummary:
     timeout_rate: float
 
 
+@dataclass
+class ProfileSectionStats:
+    total_seconds: float = 0.0
+    calls: int = 0
+
+
+class RunProfiler:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        top_n: int,
+        output_path: Path | None,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.top_n = int(top_n)
+        self.output_path = output_path
+        self._cpu_profiler = cProfile.Profile() if self.enabled else None
+        self._sections: dict[str, ProfileSectionStats] = {}
+
+    def start(self) -> None:
+        if self._cpu_profiler is not None:
+            self._cpu_profiler.enable()
+
+    def stop(self) -> None:
+        if self._cpu_profiler is not None:
+            self._cpu_profiler.disable()
+
+    @contextmanager
+    def section(self, name: str):
+        if not self.enabled:
+            yield
+            return
+
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - start_time
+            stats = self._sections.setdefault(name, ProfileSectionStats())
+            stats.total_seconds += elapsed
+            stats.calls += 1
+
+    def report(self) -> None:
+        if not self.enabled:
+            return
+
+        self._log_section_summary()
+        self._log_cprofile_summary()
+        self._dump_stats_file()
+
+    def _log_section_summary(self) -> None:
+        if not self._sections:
+            return
+
+        total_profiled = sum(stats.total_seconds for stats in self._sections.values())
+        _log("Profiling summary by phase:")
+        for name, stats in sorted(self._sections.items(), key=lambda item: item[1].total_seconds, reverse=True):
+            avg_ms = 1000.0 * stats.total_seconds / max(stats.calls, 1)
+            share = 100.0 * stats.total_seconds / max(total_profiled, 1e-12)
+            _log(
+                f"  {name}: total={stats.total_seconds:.3f}s | calls={stats.calls} | avg={avg_ms:.2f}ms | share={share:.1f}%"
+            )
+
+    def _log_cprofile_summary(self) -> None:
+        if self._cpu_profiler is None:
+            return
+
+        summary_stream = StringIO()
+        stats = pstats.Stats(self._cpu_profiler, stream=summary_stream).sort_stats("cumulative")
+        stats.print_stats(self.top_n)
+        _log("cProfile cumulative summary:")
+        for line in summary_stream.getvalue().strip().splitlines():
+            _log(line)
+
+    def _dump_stats_file(self) -> None:
+        if self._cpu_profiler is None or self.output_path is None:
+            return
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._cpu_profiler.dump_stats(str(self.output_path))
+        _log(f"Profiler stats saved: {self.output_path}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train RL selection/Q network with ORCA scenes")
     parser.add_argument("--decoder-checkpoint", type=Path, required=True, help="Path to trained VAE checkpoint")
@@ -82,6 +169,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--eval-scene-selection", choices=["random", "cycle", "fixed"], default="cycle")
     parser.add_argument("--eval-seed-offset", type=int, default=100000)
+    parser.add_argument("--profile", action="store_true", help="Enable built-in phase timing and cProfile output")
+    parser.add_argument("--profile-top-n", type=int, default=30, help="Number of cProfile rows to print")
+    parser.add_argument("--profile-output", type=Path, default=None, help="Optional path to save raw cProfile stats")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -257,11 +347,12 @@ def _log(message: str) -> None:
 
 
 class RLTrainingApp:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, profiler: RunProfiler | None = None) -> None:
         self.args = args
         self.device = torch.device(args.device)
         self.output_path = args.output
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.profiler = profiler or RunProfiler(enabled=False, top_n=0, output_path=None)
 
         self.decoder: torch.nn.Module | None = None
         self.history_len: int | None = None
@@ -287,20 +378,32 @@ class RLTrainingApp:
         self.start_time: float | None = None
 
     def run(self) -> None:
-        _seed_everything(int(self.args.seed))
-        self._setup_runtime()
-        self._log_setup()
-        self.start_time = time.time()
-        self._run_warmup()
-        for iteration in range(1, int(self.args.iterations) + 1):
-            self._run_iteration(iteration)
-        self._save_final_checkpoint()
+        self.profiler.start()
+        try:
+            _seed_everything(int(self.args.seed))
+            with self.profiler.section("setup_runtime"):
+                self._setup_runtime()
+            self._log_setup()
+            self.start_time = time.time()
+            with self.profiler.section("warmup"):
+                self._run_warmup()
+            for iteration in range(1, int(self.args.iterations) + 1):
+                self._run_iteration(iteration)
+            with self.profiler.section("save_final_checkpoint"):
+                self._save_final_checkpoint()
+        finally:
+            self.profiler.stop()
+            self.profiler.report()
 
     def _setup_runtime(self) -> None:
-        self._setup_decoder()
-        self._setup_environment()
-        self._setup_q_networks()
-        self._setup_collector_and_trainer()
+        with self.profiler.section("setup_decoder"):
+            self._setup_decoder()
+        with self.profiler.section("setup_environment"):
+            self._setup_environment()
+        with self.profiler.section("setup_q_networks"):
+            self._setup_q_networks()
+        with self.profiler.section("setup_collector_and_trainer"):
+            self._setup_collector_and_trainer()
 
     def _setup_decoder(self) -> None:
         decoder, history_len, decoder_context_len, latent_shape, latent_channels = build_models(
@@ -476,14 +579,16 @@ class RLTrainingApp:
             raise RuntimeError("Training runtime must be initialized before iterations")
 
         self.q_network.eval()
-        collect_summary = self.collector.collect_steps(int(self.args.collect_steps_per_iter))
+        with self.profiler.section("collect_steps"):
+            collect_summary = self.collector.collect_steps(int(self.args.collect_steps_per_iter))
 
         last_stats = None
         if len(self.replay_buffer) >= int(self.args.batch_size):
             self.q_network.train()
-            for _ in range(int(self.args.updates_per_iter)):
-                batch = self.replay_buffer.sample(batch_size=int(self.args.batch_size), device=self.device)
-                last_stats = self.trainer.train_step(batch)
+            with self.profiler.section("train_updates"):
+                for _ in range(int(self.args.updates_per_iter)):
+                    batch = self.replay_buffer.sample(batch_size=int(self.args.batch_size), device=self.device)
+                    last_stats = self.trainer.train_step(batch)
         else:
             self.q_network.train()
 
@@ -491,11 +596,13 @@ class RLTrainingApp:
             self._log_iteration(iteration, collect_summary, last_stats)
 
         if self._should_evaluate(iteration):
-            eval_summary = self._evaluate_policy(iteration)
+            with self.profiler.section("evaluation"):
+                eval_summary = self._evaluate_policy(iteration)
             self._log_evaluation(iteration, eval_summary)
 
         if iteration % int(self.args.save_interval) == 0:
-            self._save_checkpoint(iteration)
+            with self.profiler.section("save_checkpoint"):
+                self._save_checkpoint(iteration)
 
     def _should_evaluate(self, iteration: int) -> bool:
         return (
@@ -638,7 +745,13 @@ class RLTrainingApp:
 
 
 def main() -> None:
-    RLTrainingApp(parse_args()).run()
+    args = parse_args()
+    profiler = RunProfiler(
+        enabled=bool(args.profile),
+        top_n=int(args.profile_top_n),
+        output_path=args.profile_output,
+    )
+    RLTrainingApp(args, profiler=profiler).run()
 
 
 if __name__ == "__main__":

@@ -122,7 +122,11 @@ class Occupancy2d:
 	) -> None:
 		cells_y, cells_x = grid.shape
 		resolution = self.resolution.to(device=grid.device, dtype=torch.float32)
-		grid_min = (grid_center - self.size * 0.5).to(device=grid.device, dtype=torch.float32)
+		size = self.size.to(device=grid.device, dtype=torch.float32)
+		grid_center = grid_center.to(device=grid.device, dtype=torch.float32)
+		center_xy = center_xy.to(device=grid.device, dtype=torch.float32)
+		half_size_xy = half_size_xy.to(device=grid.device, dtype=torch.float32)
+		grid_min = grid_center - size * 0.5
 		grid_max = grid_min + torch.tensor(
 			[cells_x, cells_y], device=grid.device, dtype=torch.float32
 		) * resolution
@@ -162,16 +166,19 @@ class Occupancy2d:
 
 		cells_y, cells_x = grid.shape
 		polygon_np = np.asarray(polygon, dtype=np.float32)
+		resolution = self.resolution.to(device=grid.device, dtype=torch.float32)
+		size = self.size.to(device=grid.device, dtype=torch.float32)
+		grid_center = grid_center.to(device=grid.device, dtype=torch.float32)
 
 		min_x = float(np.min(polygon_np[:, 0]))
 		max_x = float(np.max(polygon_np[:, 0]))
 		min_y = float(np.min(polygon_np[:, 1]))
 		max_y = float(np.max(polygon_np[:, 1]))
 
-		res_x = float(self.resolution[0].item())
-		res_y = float(self.resolution[1].item())
-		grid_min_x = float((grid_center[0] - self.size[0] * 0.5).item())
-		grid_min_y = float((grid_center[1] - self.size[1] * 0.5).item())
+		res_x = float(resolution[0].item())
+		res_y = float(resolution[1].item())
+		grid_min_x = float((grid_center[0] - size[0] * 0.5).item())
+		grid_min_y = float((grid_center[1] - size[1] * 0.5).item())
 
 		min_ix = max(0, int(np.floor((min_x - grid_min_x) / res_x)))
 		max_ix = min(cells_x - 1, int(np.floor((max_x - grid_min_x) / res_x)))
