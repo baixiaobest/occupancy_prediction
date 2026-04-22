@@ -7,10 +7,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-import src.rl.simple_collector as simple_collector_module
+import src.rl.collector.simple_collector as simple_collector_module
 from src.rl import build_simple_state_observation_config
 from src.rl.replay_buffer import ReplayBuffer
-from src.rl.simple_collector import (
+from src.rl.collector.simple_collector import (
     SimpleQActionSelectionConfig,
     SimpleRandomActionCollector,
     SimpleRandomActionCollectorConfig,

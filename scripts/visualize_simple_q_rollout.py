@@ -29,9 +29,9 @@ from src.rl import (
     sample_action_indices_from_q_scores,
     sample_random_velocity_plans,
 )
-from src.rl.observation_manager import ObservationBatchContext
+from src.rl.managers.observation_manager import ObservationBatchContext
 from src.scene import Scene
-from src.simple_q_network import build_simple_q_network
+from src.rl.networks.simple_q_network import build_simple_q_network
 from src.templates import empty_goal_templates
 
 

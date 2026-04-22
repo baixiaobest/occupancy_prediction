@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from src.rl import build_simple_state_observation_config
-from src.rl.observation_manager import (
+from src.rl.managers.observation_manager import (
     ObservationBatchContext,
     ObservationManager,
     ObservationTermCfg,

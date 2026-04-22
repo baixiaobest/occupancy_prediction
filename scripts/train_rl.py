@@ -11,8 +11,8 @@ import torch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from visualize_model import build_models
-from src.rl.training_app import RLTrainingApp
-from src.rl.training_profiler import RunProfiler
+from src.rl.training.training_app import RLTrainingApp
+from src.rl.training.training_profiler import RunProfiler
 
 
 def parse_args() -> argparse.Namespace:

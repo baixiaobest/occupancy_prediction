@@ -2,31 +2,82 @@
 
 This package contains reusable RL building blocks for random-candidate action selection and Q-learning over simulated futures.
 
-## Core responsibilities
+## What changed in the refactor
 
-- Build per-step observations from simulator state.
-- Define reward terms and aggregate reward signals.
-- Sample counterfactual candidate action plans.
-- Collect transitions into replay buffers.
-- Train Q-models from replayed batches.
+The package moved from a mostly flat file layout to a grouped layout by responsibility.
+
+- Networks moved into `networks/`.
+- Collectors moved into `collectors/`.
+- Environment wrappers moved into `envs/`.
+- Observation/reward managers moved into `managers/`.
+- Trainers moved into `q_trainers/`.
+- Training application and profiling moved into `training/`.
+
+## Current package layout
+
+```text
+src/rl/
+	__init__.py
+	README.md
+	counterfactual.py
+	replay_buffer.py
+	collectors/
+		collector_base.py
+		collector.py
+		simple_collector.py
+	envs/
+		env_single.py
+	managers/
+		observation_manager.py
+		reward_manager.py
+	networks/
+		proposal_network.py
+		q_common.py
+		q_network.py
+		simple_q_network.py
+	q_trainers/
+		q_trainer_base.py
+		q_trainer.py
+		simple_q_trainer.py
+	training/
+		training_app.py
+		training_profiler.py
+```
 
 ## Module map
 
-- `env_single.py`: Single-environment wrapper around ORCA simulation and managers.
-- `observation_manager.py`: Observation term system and occupancy-context feature builders.
-- `reward_manager.py`: Reward term system and default reward configuration.
 - `counterfactual.py`: Candidate velocity-plan sampling and future rollout integration.
-- `collector_base.py`: Abstract collector interface.
-- `collector.py`: Main collector for velocity-plan candidate RL.
-- `simple_collector.py`: Collector for simple-state RL variant.
 - `replay_buffer.py`: Replay storage and batch sampling utilities.
-- `q_common.py`: Shared Q-learning math helpers (soft update, TD target, sampling).
-- `q_trainer_base.py`: Shared trainer validation and abstract trainer surface.
-- `q_trainer.py`: Trainer for candidate-based Q-network pipeline.
-- `simple_q_trainer.py`: Trainer for simple-state Q-network pipeline.
-- `training_app.py`: Reusable RL training orchestration (`RLTrainingApp`).
-- `training_profiler.py`: Profiling utility with phase timing + cProfile integration.
-- `__init__.py`: Consolidated exports for package-level imports.
+- `collectors/`: Data collection policy logic and rollout-to-buffer transfer.
+- `envs/`: ORCA single-environment wrappers.
+- `managers/`: Observation terms and reward terms/configuration.
+- `networks/`: Q networks, proposal networks, and shared Q math helpers.
+- `q_trainers/`: Training-step logic and shared trainer base.
+- `training/`: End-to-end training app orchestration and profiling utilities.
+- `__init__.py`: Consolidated package exports used by scripts.
+
+## Import guide
+
+Use package exports for commonly used runtime components:
+
+```python
+from src.rl import ORCASingleEnv, RandomPlanCollector, RandomCandidateQTrainer
+```
+
+Import network builders from `networks` directly:
+
+```python
+from src.rl.networks.q_network import build_q_network
+from src.rl.networks.simple_q_network import build_simple_q_network
+from src.rl.networks.proposal_network import build_proposal_network
+```
+
+Import training app/profiler from `training` directly:
+
+```python
+from src.rl.training.training_app import RLTrainingApp
+from src.rl.training.training_profiler import RunProfiler
+```
 
 ## Typical runtime flow
 
@@ -34,18 +85,13 @@ This package contains reusable RL building blocks for random-candidate action se
 2. Use a collector (`RandomPlanCollector` or `SimpleRandomActionCollector`) to gather transitions.
 3. Push transitions into `ReplayBuffer`.
 4. Run trainer step (`RandomCandidateQTrainer` or `SimpleRandomCandidateQTrainer`) on sampled batches.
-5. Periodically soft-update target networks and log training stats.
+5. Periodically soft-update target networks and log training stats/checkpoints.
 
-## Key extension points
+## Suggested reading order for AI agents
 
-- Add custom observation terms in `observation_manager.py`.
-- Add custom reward terms in `reward_manager.py`.
-- Swap candidate samplers/rollout functions in trainer configs.
-- Replace Q-network implementations while keeping trainer interfaces.
-
-## Suggested entry points for AI agents
-
-1. Start with `__init__.py` for exported API surface.
-2. Read `env_single.py`, `observation_manager.py`, and `reward_manager.py`.
-3. Read `collector.py` and `replay_buffer.py` to follow data collection.
-4. Read `q_trainer.py` (or `simple_q_trainer.py`) for learning updates.
+1. `__init__.py` for public API surface.
+2. `envs/env_single.py`, then `managers/observation_manager.py` and `managers/reward_manager.py`.
+3. `collectors/collector.py` (or `collectors/simple_collector.py`) plus `replay_buffer.py`.
+4. `networks/q_network.py` and `networks/simple_q_network.py`.
+5. `q_trainers/q_trainer.py` (or `q_trainers/simple_q_trainer.py`).
+6. `training/training_app.py` for orchestration.

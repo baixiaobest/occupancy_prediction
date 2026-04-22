@@ -6,9 +6,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-import src.rl.simple_q_trainer as simple_q_trainer_module
+import src.rl.q_trainers.simple_q_trainer as simple_q_trainer_module
 from src.rl.replay_buffer import ReplaySampleBatch
-from src.rl.simple_q_trainer import SimpleQTrainerConfig, SimpleRandomCandidateQTrainer
+from src.rl.q_trainers.simple_q_trainer import SimpleQTrainerConfig, SimpleRandomCandidateQTrainer
 
 
 class _DummyQNetwork(nn.Module):

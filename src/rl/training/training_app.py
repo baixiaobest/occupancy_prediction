@@ -17,29 +17,29 @@ try:
 except ImportError:
     wandb = None
 
-from ..q_network import build_q_network
-from ..scene import Scene
-from ..simple_q_network import build_simple_q_network
-from ..templates import cross_templates, default_templates, empty_goal_templates, l_shape_templates, test_templates
-from .collector import QActionSelectionConfig, RandomPlanCollector, RandomPlanCollectorConfig
-from .counterfactual import rollout_counterfactual_futures, sample_random_velocity_plans
-from .env_single import ORCASimConfig, ORCASingleEnv, SingleEnvConfig
-from .observation_manager import (
+from ..networks.q_network import build_q_network
+from ...scene import Scene
+from ..networks.simple_q_network import build_simple_q_network
+from ...templates import cross_templates, default_templates, empty_goal_templates, l_shape_templates, test_templates
+from ..collectors.collector import QActionSelectionConfig, RandomPlanCollector, RandomPlanCollectorConfig
+from ..counterfactual import rollout_counterfactual_futures, sample_random_velocity_plans
+from ..envs.env_single import ORCASimConfig, ORCASingleEnv, SingleEnvConfig
+from ..managers.observation_manager import (
     ObservationBatchContext,
     OnlineOccupancyObservationConfig,
     build_observation_manager,
     build_online_occupancy_observation_config,
     build_simple_state_observation_config,
 )
-from .q_trainer import QTrainerConfig, RandomCandidateQTrainer
-from .replay_buffer import ReplayBuffer
-from .reward_manager import RewardConfig
-from .simple_collector import (
+from ..q_trainers.q_trainer import QTrainerConfig, RandomCandidateQTrainer
+from ..replay_buffer import ReplayBuffer
+from ..managers.reward_manager import RewardConfig
+from ..collectors.simple_collector import (
     SimpleQActionSelectionConfig,
     SimpleRandomActionCollector,
     SimpleRandomActionCollectorConfig,
 )
-from .simple_q_trainer import SimpleQTrainerConfig, SimpleRandomCandidateQTrainer
+from ..q_trainers.simple_q_trainer import SimpleQTrainerConfig, SimpleRandomCandidateQTrainer
 from .training_profiler import RunProfiler
 
 DecoderBuilder = Callable[[Path, torch.device], tuple[torch.nn.Module, int, int, tuple[int, int, int], int]]

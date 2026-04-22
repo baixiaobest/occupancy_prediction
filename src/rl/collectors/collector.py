@@ -7,10 +7,10 @@ import torch
 import torch.nn as nn
 
 from .collector_base import BaseRandomActionCollector
-from .counterfactual import CounterfactualRolloutBatch, rollout_counterfactual_futures, sample_random_velocity_plans
-from .observation_manager import ObservationBatchContext, ObservationManager, build_observation_manager
-from .q_common import sample_action_indices_from_q_scores
-from .replay_buffer import ReplayBuffer, TensorDict
+from ..counterfactual import CounterfactualRolloutBatch, rollout_counterfactual_futures, sample_random_velocity_plans
+from ..managers.observation_manager import ObservationBatchContext, ObservationManager, build_observation_manager
+from ..networks.q_common import sample_action_indices_from_q_scores
+from ..replay_buffer import ReplayBuffer, TensorDict
 
 
 @dataclass

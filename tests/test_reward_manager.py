@@ -5,7 +5,7 @@ import os
 import pytest
 import torch
 
-from src.rl.reward_manager import RewardBatchContext, RewardConfig, RewardManager, RewardTermCfg, build_reward_manager
+from src.rl.managers.reward_manager import RewardBatchContext, RewardConfig, RewardManager, RewardTermCfg, build_reward_manager
 
 
 def _make_reward_context() -> RewardBatchContext:

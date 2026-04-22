@@ -10,7 +10,7 @@ from src.occupancy_patch import slice_centered_patch
 from src.occupancy2d import Occupancy2d
 from src.scene import Scene
 
-from .replay_buffer import TensorDict
+from ..replay_buffer import TensorDict
 
 
 @dataclass

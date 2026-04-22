@@ -5,7 +5,7 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
-from .network_common import HUMAN_WALKING_SPEED_MPS
+from ...network_common import HUMAN_WALKING_SPEED_MPS
 
 
 def _build_mlp(input_dim: int, hidden_dims: Sequence[int]) -> tuple[nn.Module, int]:

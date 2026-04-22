@@ -1,6 +1,6 @@
 """RL training utilities and building blocks."""
 
-from .collector import (
+from .collectors.collector import (
 	CollectSummary,
 	QActionSelectionConfig,
 	RandomPlanCollector,
@@ -12,8 +12,8 @@ from .counterfactual import (
 	rollout_counterfactual_futures,
 	sample_random_velocity_plans,
 )
-from .env_single import ORCASimConfig, ORCASingleEnv, SingleEnvConfig
-from .reward_manager import (
+from .envs.env_single import ORCASimConfig, ORCASingleEnv, SingleEnvConfig
+from .managers.reward_manager import (
 	RewardBatchContext,
 	RewardConfig,
 	RewardManager,
@@ -25,7 +25,7 @@ from .reward_manager import (
 	term_progress_to_goal,
 	term_success,
 )
-from .observation_manager import (
+from .managers.observation_manager import (
 	ObservationBatchContext,
 	ObservationConfig,
 	ObservationManager,
@@ -41,7 +41,7 @@ from .observation_manager import (
 	term_dynamic_local_occupancy_context,
 	term_static_local_occupancy,
 )
-from .q_trainer import (
+from .q_trainers.q_trainer import (
 	CandidateSamplerFn,
 	CounterfactualRolloutFn,
 	QTrainStepStats,
@@ -52,20 +52,20 @@ from .q_trainer import (
 	soft_update_module,
 )
 from .replay_buffer import ReplayBuffer, ReplaySampleBatch, TensorDict
-from .simple_collector import (
+from .collectors.simple_collector import (
 	SimpleActionSelectionResult,
 	SimpleCollectSummary,
 	SimpleQActionSelectionConfig,
 	SimpleRandomActionCollector,
 	SimpleRandomActionCollectorConfig,
 )
-from .simple_q_trainer import (
+from .q_trainers.simple_q_trainer import (
 	SimpleQTrainerConfig,
 	SimpleQTrainStepStats,
 	SimpleRandomCandidateQTrainer,
 )
-from .training_app import EvaluationSummary, RLTrainingApp
-from .training_profiler import ProfileSectionStats, RunProfiler
+from .training.training_app import EvaluationSummary, RLTrainingApp
+from .training.training_profiler import ProfileSectionStats, RunProfiler
 
 __all__ = [
 	"CollectSummary",

@@ -6,10 +6,10 @@ from typing import Callable, Literal
 import torch
 import torch.nn as nn
 
-from .counterfactual import CounterfactualRolloutBatch, rollout_counterfactual_futures, sample_random_velocity_plans
-from .q_common import q_scores_to_probabilities, sample_action_indices_from_q_scores, soft_update_module
+from ..counterfactual import CounterfactualRolloutBatch, rollout_counterfactual_futures, sample_random_velocity_plans
+from ..networks.q_common import q_scores_to_probabilities, sample_action_indices_from_q_scores, soft_update_module
 from .q_trainer_base import BaseRandomCandidateQTrainer, validate_common_random_candidate_q_config
-from .replay_buffer import ReplaySampleBatch
+from ..replay_buffer import ReplaySampleBatch
 
 
 CandidateSamplerFn = Callable[..., torch.Tensor]

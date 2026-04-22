@@ -7,13 +7,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-from src.rl.collector import (
+from src.rl.collectors.collector import (
     QActionSelectionConfig,
     RandomPlanCollector,
     RandomPlanCollectorConfig,
 )
 from src.rl.counterfactual import CounterfactualRolloutBatch
-from src.rl.observation_manager import (
+from src.rl.managers.observation_manager import (
     build_observation_manager,
     build_online_occupancy_observation_config,
     OnlineOccupancyObservationConfig,

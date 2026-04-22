@@ -6,9 +6,9 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from .counterfactual import sample_random_velocity_plans
+from ..counterfactual import sample_random_velocity_plans
 from .q_trainer_base import BaseRandomCandidateQTrainer, validate_common_random_candidate_q_config
-from .replay_buffer import ReplaySampleBatch
+from ..replay_buffer import ReplaySampleBatch
 
 
 @dataclass

@@ -6,8 +6,8 @@ import torch
 
 from src.scene import Scene
 
-from .observation_manager import ObservationBatchContext, ObservationManager, build_observation_manager
-from .replay_buffer import ReplayBuffer, TensorDict
+from ..managers.observation_manager import ObservationBatchContext, ObservationManager, build_observation_manager
+from ..replay_buffer import ReplayBuffer, TensorDict
 
 
 class BaseRandomActionCollector(ABC):

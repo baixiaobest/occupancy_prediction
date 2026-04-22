@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .q_common import compute_td_target_from_next_q_scores, soft_update_module
-from .replay_buffer import ReplaySampleBatch
+from ..networks.q_common import compute_td_target_from_next_q_scores, soft_update_module
+from ..replay_buffer import ReplaySampleBatch
 
 
 def validate_common_random_candidate_q_config(config: object) -> None:

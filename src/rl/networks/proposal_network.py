@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .network_common import (
+from ...network_common import (
     HUMAN_WALKING_SPEED_MPS,
     _DownsampleBlock2d,
     _downsample_hw,

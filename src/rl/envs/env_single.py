@@ -7,8 +7,8 @@ import torch
 
 from src.ORCASim import ORCASim
 from src.scene import Scene
-from src.rl.observation_manager import ObservationConfig
-from src.rl.reward_manager import (
+from src.rl.managers.observation_manager import ObservationConfig
+from src.rl.managers.reward_manager import (
     RewardBatchContext,
     RewardConfig,
     RewardManager,

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from src.rl.counterfactual import CounterfactualRolloutBatch
-from src.rl.q_trainer import (
+from src.rl.q_trainers.q_trainer import (
     QTrainerConfig,
     RandomCandidateQTrainer,
     q_scores_to_probabilities,
