@@ -6,7 +6,7 @@ from typing import List, Tuple
 
 import numpy as np
 
-from src.scene import ObstacleSpec, PathSpec, RegionPairSpec, RegionSpec, Scene
+from src.scene import AgentSpec, ObstacleSpec, PathSpec, RegionPairSpec, RegionSpec, Scene
 
 
 class SceneTemplate(ABC):
@@ -159,6 +159,58 @@ class SceneTemplate(ABC):
             noise = rng.normal(loc=0.0, scale=noise_std, size=2)
             jittered.append((float(x + noise[0]), float(y + noise[1])))
         return jittered
+
+
+class EmptySingleAgentGoalTemplate(SceneTemplate):
+    """Template that generates obstacle-free scenes with one agent at the origin.
+
+    The agent always starts at `start_position` and each generated scene uses a
+    different goal sampled on a circle with radius drawn from `goal_distance_range`.
+    """
+
+    def __init__(
+        self,
+        goal_distance_range: Tuple[float, float] = (2.0, 6.0),
+        num_levels: int = 32,
+        start_position: Tuple[float, float] = (0.0, 0.0),
+        goal_seed: int | None = 0,
+    ) -> None:
+        if goal_distance_range[0] <= 0.0 or goal_distance_range[1] <= 0.0:
+            raise ValueError("goal_distance_range values must be > 0")
+        super().__init__(num_levels=num_levels)
+        self.goal_distance_range = (float(goal_distance_range[0]), float(goal_distance_range[1]))
+        self.start_position = (float(start_position[0]), float(start_position[1]))
+        self.goal_seed = goal_seed
+
+    def get_name(self) -> str:
+        return "empty_single_agent_goal"
+
+    def generate(self) -> List[Scene]:
+        radii = self._linear_levels(self.goal_distance_range, self.num_levels)
+        rng = np.random.default_rng(self.goal_seed)
+        scenes: List[Scene] = []
+        for radius in radii:
+            angle = float(rng.uniform(-math.pi, math.pi))
+            goal = (
+                float(self.start_position[0] + radius * math.cos(angle)),
+                float(self.start_position[1] + radius * math.sin(angle)),
+            )
+            scenes.append(
+                Scene(
+                    agents=[
+                        AgentSpec(
+                            position=self.start_position,
+                            goal=goal,
+                            path_index=None,
+                        )
+                    ],
+                    obstacles=[],
+                    paths=[],
+                    region_pairs=[],
+                    ego_centers=[self.start_position],
+                )
+            )
+        return scenes
 
 
 class StraightCorridorTemplate(SceneTemplate):

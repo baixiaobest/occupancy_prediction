@@ -6,11 +6,10 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from src.scene import Scene
-
+from .collector_base import BaseRandomActionCollector
 from .counterfactual import CounterfactualRolloutBatch, rollout_counterfactual_futures, sample_random_velocity_plans
 from .observation_manager import ObservationBatchContext, ObservationManager, build_observation_manager
-from .q_trainer import sample_action_indices_from_q_scores
+from .q_common import sample_action_indices_from_q_scores
 from .replay_buffer import ReplayBuffer, TensorDict
 
 
@@ -53,7 +52,7 @@ class ActionSelectionResult:
     candidate_log_probs: torch.Tensor | None
 
 
-class RandomPlanCollector:
+class RandomPlanCollector(BaseRandomActionCollector):
     """Collect single-env rollouts with random candidate velocity plans."""
 
     def __init__(
@@ -98,81 +97,18 @@ class RandomPlanCollector:
             if not (0.0 <= float(config.q_selection.threshold) <= 1.0):
                 raise ValueError("q_selection.threshold must be in [0, 1]")
 
-        self.env = env
-        self.replay_buffer = replay_buffer
-        self.observation_manager = self._resolve_observation_manager(observation_manager)
+        super().__init__(
+            env=env,
+            replay_buffer=replay_buffer,
+            observation_manager=observation_manager,
+            seed=int(config.seed),
+            selection_seed=None if config.q_selection is None else int(config.q_selection.seed),
+        )
         self.config = config
         self.q_network = q_network
         self.decoder = decoder
         self.candidate_sampler = candidate_sampler
         self.counterfactual_rollout_fn = counterfactual_rollout_fn
-        self._prepared_obs: TensorDict | None = None
-        self._seed = int(config.seed)
-        self._rng: torch.Generator | None = None
-        self._rng_device: torch.device | None = None
-        self._selection_rng: torch.Generator | None = None
-        self._selection_rng_device: torch.device | None = None
-
-    def reset_episode(self, seed: int | None = None) -> TensorDict:
-        self.observation_manager.reset()
-        raw_obs = self.env.reset(seed=seed)
-        scene = self._get_scene()
-        self._prepared_obs = self.observation_manager.compute(
-            ObservationBatchContext(raw_obs=raw_obs, scene=scene)
-        )
-        return self._prepared_obs
-
-    def collect_steps(self, num_steps: int, *, reset_seed: int | None = None) -> CollectSummary:
-        steps = int(num_steps)
-        if steps <= 0:
-            raise ValueError("num_steps must be > 0")
-
-        if self._prepared_obs is None:
-            self.reset_episode(seed=reset_seed)
-
-        transitions_added = 0
-        episodes_completed = 0
-        total_reward = 0.0
-
-        for _ in range(steps):
-            if self._prepared_obs is None:
-                raise RuntimeError("Collector observation state is not initialized")
-
-            obs = self._prepared_obs
-            action_selection = self.select_action(obs)
-            next_raw_obs, rewards, dones, _infos = self.env.step(action_selection.selected_plan[0, 0])
-            next_obs = self.prepare_observation(next_raw_obs)
-
-            self.replay_buffer.add_batch(
-                obs=obs,
-                actions=action_selection.selected_plan,
-                rewards=torch.as_tensor(rewards, dtype=torch.float32),
-                next_obs=next_obs,
-                dones=torch.as_tensor(dones),
-                candidate_actions=action_selection.candidate_plans,
-                candidate_log_probs=action_selection.candidate_log_probs,
-            )
-
-            transitions_added += 1
-            total_reward += float(torch.as_tensor(rewards, dtype=torch.float32).sum().item())
-
-            if bool(torch.as_tensor(dones).reshape(-1)[0].item()):
-                episodes_completed += 1
-                self.reset_episode()
-            else:
-                self._prepared_obs = next_obs
-
-        return CollectSummary(
-            transitions_added=transitions_added,
-            episodes_completed=episodes_completed,
-            total_reward=total_reward,
-        )
-
-    def prepare_observation(self, raw_obs: TensorDict) -> TensorDict:
-        self._prepared_obs = self.observation_manager.compute(
-            ObservationBatchContext(raw_obs=raw_obs, scene=self._get_scene())
-        )
-        return self._prepared_obs
 
     def select_action(self, obs: TensorDict) -> ActionSelectionResult:
         rng = self._get_rng(torch.as_tensor(obs["current_velocity"]).device)
@@ -260,22 +196,6 @@ class RandomPlanCollector:
         )
         return selection_indices, torch.log(selection_probs.clamp_min(1e-8))
 
-    def _get_rng(self, device: torch.device) -> torch.Generator:
-        if self._rng is None or self._rng_device != device:
-            self._rng = torch.Generator(device=device)
-            self._rng.manual_seed(self._seed)
-            self._rng_device = device
-        return self._rng
-
-    def _get_selection_rng(self, device: torch.device) -> torch.Generator:
-        if self.config.q_selection is None:
-            raise RuntimeError("selection RNG requested without q_selection config")
-        if self._selection_rng is None or self._selection_rng_device != device:
-            self._selection_rng = torch.Generator(device=device)
-            self._selection_rng.manual_seed(int(self.config.q_selection.seed))
-            self._selection_rng_device = device
-        return self._selection_rng
-
     def _rollout_candidates(
         self,
         obs: TensorDict,
@@ -297,27 +217,27 @@ class RandomPlanCollector:
             threshold=float(self.config.q_selection.threshold),
         )
 
-    def _get_scene(self) -> Scene:
-        sim = getattr(self.env, "sim", None)
-        scene = getattr(sim, "scene", None)
-        if not isinstance(scene, Scene):
-            raise RuntimeError("collector env must expose env.sim.scene as a Scene")
-        return scene
+    def _step_env(self, action_selection: ActionSelectionResult):
+        return self.env.step(action_selection.selected_plan[0, 0])
 
-    def _resolve_observation_manager(
+    def _actions_for_replay(self, action_selection: ActionSelectionResult) -> torch.Tensor:
+        return action_selection.selected_plan
+
+    def _candidate_actions_for_replay(self, action_selection: ActionSelectionResult) -> torch.Tensor:
+        return action_selection.candidate_plans
+
+    def _build_collect_summary(
         self,
-        observation_manager: ObservationManager | None,
-    ) -> ObservationManager:
-        if observation_manager is not None:
-            return observation_manager
-
-        env_config = getattr(self.env, "env_config", None)
-        observation_config = getattr(env_config, "observation", None)
-        if observation_config is None:
-            raise ValueError(
-                "observation_manager must be provided when env.env_config.observation is not set"
-            )
-        return build_observation_manager(observation_config)
+        *,
+        transitions_added: int,
+        episodes_completed: int,
+        total_reward: float,
+    ) -> CollectSummary:
+        return CollectSummary(
+            transitions_added=transitions_added,
+            episodes_completed=episodes_completed,
+            total_reward=total_reward,
+        )
 
 
 __all__ = [

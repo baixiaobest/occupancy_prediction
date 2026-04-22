@@ -5,6 +5,7 @@ import os
 import pytest
 import torch
 
+from src.rl import build_simple_state_observation_config
 from src.rl.observation_manager import (
     ObservationBatchContext,
     ObservationManager,
@@ -102,6 +103,16 @@ def test_observation_manager_raises_on_invalid_term_shape() -> None:
 
     with pytest.raises(ValueError, match=r"must return leading shape \(N_env, \.\.\.\)"):
         manager.compute(_make_observation_context(other_agent_x=0.8))
+
+
+def test_simple_state_observation_config_outputs_goal_and_velocity_only() -> None:
+    manager = ObservationManager(build_simple_state_observation_config().terms)
+
+    obs = manager.compute(_make_observation_context(other_agent_x=0.8, controlled_velocity=(0.3, -0.1), goal_xy=(1.5, 0.2)))
+
+    assert set(obs.keys()) == {"current_velocity", "goal_position"}
+    assert torch.allclose(obs["current_velocity"], torch.tensor([[0.3, -0.1]], dtype=torch.float32))
+    assert torch.allclose(obs["goal_position"], torch.tensor([[1.5, 0.2]], dtype=torch.float32))
 
 
 if __name__ == "__main__":

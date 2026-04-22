@@ -10,7 +10,7 @@ import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from io import StringIO
 from pathlib import Path
 
@@ -25,6 +25,7 @@ except ImportError:
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from visualize_model import build_models
+from src.simple_q_network import build_simple_q_network
 from src.q_network import build_q_network
 from src.rl import (
     QActionSelectionConfig,
@@ -36,13 +37,19 @@ from src.rl import (
     RandomPlanCollectorConfig,
     ReplayBuffer,
     RewardConfig,
+    SimpleQActionSelectionConfig,
+    SimpleQTrainerConfig,
+    SimpleRandomActionCollector,
+    SimpleRandomActionCollectorConfig,
+    SimpleRandomCandidateQTrainer,
     SingleEnvConfig,
+    build_simple_state_observation_config,
     build_online_occupancy_observation_config,
 )
 from src.rl.counterfactual import rollout_counterfactual_futures, sample_random_velocity_plans
 from src.rl.observation_manager import ObservationBatchContext, build_observation_manager, OnlineOccupancyObservationConfig
 from src.scene import Scene
-from src.templates import cross_templates, default_templates, l_shape_templates, test_templates
+from src.templates import cross_templates, default_templates, empty_goal_templates, l_shape_templates, test_templates
 
 
 @dataclass
@@ -141,7 +148,9 @@ class RunProfiler:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train RL selection/Q network with ORCA scenes")
-    parser.add_argument("--decoder-checkpoint", type=Path, required=True, help="Path to trained VAE checkpoint")
+    parser.add_argument("--mode", choices=["simple_state_q", "counterfactual_q"], default="simple_state_q")
+    parser.add_argument("--decoder-checkpoint", type=Path, default=None, help="Path to trained VAE checkpoint")
+    parser.add_argument("--empty-goal-distance-range", type=float, nargs=2, default=[2.0, 6.0])
     parser.add_argument("--template-set", choices=["default", "test", "cross", "l_shape"], default="default")
     parser.add_argument("--scene-selection", choices=["random", "cycle", "fixed"], default="random")
     parser.add_argument("--fixed-scene-index", type=int, default=0)
@@ -161,6 +170,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-tau", type=float, default=0.01)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--simple-q-hidden-dims", type=int, nargs="+", default=[128, 128])
     parser.add_argument("--grad-clip-norm", type=float, default=5.0)
     parser.add_argument("--loss-type", choices=["mse", "smooth_l1"], default="smooth_l1")
     parser.add_argument("--tap-layer", type=int, default=1)
@@ -209,6 +219,22 @@ def _build_scene_pool(template_set: str) -> list[Scene]:
         scenes.extend(template.generate())
     if not scenes:
         raise ValueError(f"No scenes generated for template set {template_set}")
+    return scenes
+
+
+def _build_empty_goal_scene_pool(
+    *,
+    goal_distance_range: tuple[float, float],
+    goal_seed: int | None,
+) -> list[Scene]:
+    scenes: list[Scene] = []
+    for template in empty_goal_templates(
+        goal_distance_range=goal_distance_range,
+        goal_seed=goal_seed,
+    ):
+        scenes.extend(template.generate())
+    if not scenes:
+        raise ValueError("No scenes generated for empty_goal template")
     return scenes
 
 
@@ -393,10 +419,10 @@ class RLTrainingApp:
         self.target_q_network: torch.nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.replay_buffer: ReplayBuffer | None = None
-        self.collector_config: RandomPlanCollectorConfig | None = None
-        self.collector: RandomPlanCollector | None = None
-        self.trainer_config: QTrainerConfig | None = None
-        self.trainer: RandomCandidateQTrainer | None = None
+        self.collector_config: RandomPlanCollectorConfig | SimpleRandomActionCollectorConfig | None = None
+        self.collector: RandomPlanCollector | SimpleRandomActionCollector | None = None
+        self.trainer_config: QTrainerConfig | SimpleQTrainerConfig | None = None
+        self.trainer: RandomCandidateQTrainer | SimpleRandomCandidateQTrainer | None = None
         self.start_time: float | None = None
 
     def _init_wandb(self) -> object | None:
@@ -437,6 +463,12 @@ class RLTrainingApp:
             self.profiler.report()
 
     def _setup_runtime(self) -> None:
+        if self.args.mode == "simple_state_q":
+            with self.profiler.section("setup_environment"):
+                self._setup_simple_environment()
+            with self.profiler.section("setup_q_networks"):
+                self._setup_simple_q_components()
+            return
         with self.profiler.section("setup_decoder"):
             self._setup_decoder()
         with self.profiler.section("setup_environment"):
@@ -447,6 +479,8 @@ class RLTrainingApp:
             self._setup_collector_and_trainer()
 
     def _setup_decoder(self) -> None:
+        if self.args.decoder_checkpoint is None:
+            raise ValueError("--decoder-checkpoint is required when mode='counterfactual_q'")
         decoder, history_len, decoder_context_len, latent_shape, latent_channels = build_models(
             checkpoint_path=self.args.decoder_checkpoint,
             device=self.device,
@@ -473,6 +507,98 @@ class RLTrainingApp:
                 occupancy_resolution=(float(self.args.occupancy_resolution), float(self.args.occupancy_resolution)),
                 device=str(self.device),
             )
+        )
+
+    def _setup_simple_environment(self) -> None:
+        self.observation_config = build_simple_state_observation_config()
+        self.env_config = SingleEnvConfig(
+            max_steps=int(self.args.env_max_steps),
+            controlled_agent_index=int(self.args.controlled_agent_index),
+            device=str(self.device),
+            reward=RewardConfig(),
+            observation=self.observation_config,
+        )
+        self.sim_config = ORCASimConfig(time_step=0.1)
+        goal_distance_range = tuple(float(value) for value in self.args.empty_goal_distance_range)
+        self.scenes = _build_empty_goal_scene_pool(
+            goal_distance_range=(goal_distance_range[0], goal_distance_range[1]),
+            goal_seed=int(self.args.seed),
+        )
+        scene_factory = _make_scene_factory(
+            self.scenes,
+            selection=str(self.args.scene_selection),
+            fixed_scene_index=int(self.args.fixed_scene_index),
+            seed=int(self.args.seed),
+        )
+        self.env = ORCASingleEnv(
+            scene_factory=scene_factory,
+            sim_config=self.sim_config,
+            env_config=self.env_config,
+        )
+
+    def _setup_simple_q_components(self) -> None:
+        if self.env is None or self.sim_config is None:
+            raise RuntimeError("Environment and simulation config must be initialized before simple Q setup")
+
+        self.q_model_config = {
+            "type": "simple_state_q",
+            "hidden_dims": [int(value) for value in self.args.simple_q_hidden_dims],
+        }
+        self.q_network = build_simple_q_network(
+            hidden_dims=self.args.simple_q_hidden_dims,
+            device=self.device,
+        )
+        self.target_q_network = build_simple_q_network(
+            hidden_dims=self.args.simple_q_hidden_dims,
+            device=self.device,
+        )
+        self.target_q_network.load_state_dict(self.q_network.state_dict())
+        self.target_q_network.eval()
+        self.optimizer = torch.optim.AdamW(
+            self.q_network.parameters(),
+            lr=float(self.args.lr),
+            weight_decay=float(self.args.weight_decay),
+        )
+        self.replay_buffer = ReplayBuffer(capacity=int(self.args.replay_capacity), seed=int(self.args.seed))
+        q_selection_config = SimpleQActionSelectionConfig(
+            temperature=float(self.args.selection_temperature),
+            seed=int(self.args.seed),
+        )
+        self.collector_config = SimpleRandomActionCollectorConfig(
+            num_candidates=int(self.args.num_candidates),
+            max_speed=float(self.args.candidate_max_speed),
+            delta_std=float(self.args.candidate_delta_std),
+            dt=float(self.sim_config.time_step),
+            include_current_velocity_candidate=True,
+            action_selection="q_softmax",
+            seed=int(self.args.seed),
+            q_selection=q_selection_config,
+        )
+        self.collector = SimpleRandomActionCollector(
+            env=self.env,
+            replay_buffer=self.replay_buffer,
+            observation_manager=None,
+            config=self.collector_config,
+            q_network=self.q_network,
+        )
+        self.trainer_config = SimpleQTrainerConfig(
+            discount=float(self.args.discount),
+            target_tau=float(self.args.target_tau),
+            selection_temperature=float(self.args.selection_temperature),
+            selection_seed=int(self.args.seed) + 1,
+            num_bootstrap_candidates=int(self.args.num_bootstrap_candidates),
+            max_speed=float(self.args.candidate_max_speed),
+            delta_std=float(self.args.candidate_delta_std),
+            dt=float(self.sim_config.time_step),
+            include_current_velocity_candidate=True,
+            grad_clip_norm=float(self.args.grad_clip_norm) if self.args.grad_clip_norm is not None else None,
+            loss_type=str(self.args.loss_type),
+        )
+        self.trainer = SimpleRandomCandidateQTrainer(
+            q_network=self.q_network,
+            target_q_network=self.target_q_network,
+            optimizer=self.optimizer,
+            config=self.trainer_config,
         )
 
     def _setup_environment(self) -> None:
@@ -598,6 +724,14 @@ class RLTrainingApp:
         )
 
     def _log_setup(self) -> None:
+        if self.args.mode == "simple_state_q":
+            self.log(
+                "RL setup: "
+                f"mode={self.args.mode} | scenes={len(self.scenes)} | "
+                f"goal_distance_range={tuple(float(v) for v in self.args.empty_goal_distance_range)} | "
+                f"q_hidden_dims={list(self.args.simple_q_hidden_dims)} | device={self.device}"
+            )
+            return
         self.log(
             "RL setup: "
             f"{len(self.scenes)} scenes | history_len={self.history_len} | decoder_context_len={self.decoder_context_len} | "
@@ -658,8 +792,8 @@ class RLTrainingApp:
     def _evaluate_policy(self, iteration: int) -> EvaluationSummary:
         if self.env_config is None or self.sim_config is None or self.collector_config is None:
             raise RuntimeError("Environment and collector configs must be initialized before evaluation")
-        if self.q_network is None or self.decoder is None:
-            raise RuntimeError("Q network and decoder must be initialized before evaluation")
+        if self.q_network is None:
+            raise RuntimeError("Q network must be initialized before evaluation")
 
         eval_seed_base = int(self.args.seed) + int(self.args.eval_seed_offset)
         eval_scene_factory = _make_scene_factory(
@@ -675,16 +809,27 @@ class RLTrainingApp:
         )
         eval_collector_config = copy.deepcopy(self.collector_config)
         eval_collector_config.seed = eval_seed_base
-        if eval_collector_config.q_selection is not None:
+        if getattr(eval_collector_config, "q_selection", None) is not None:
             eval_collector_config.q_selection.seed = eval_seed_base + iteration
-        eval_collector = RandomPlanCollector(
-            env=eval_env,
-            replay_buffer=ReplayBuffer(capacity=1, seed=eval_seed_base),
-            observation_manager=None,
-            config=eval_collector_config,
-            q_network=self.q_network,
-            decoder=self.decoder,
-        )
+        if self.args.mode == "simple_state_q":
+            eval_collector = SimpleRandomActionCollector(
+                env=eval_env,
+                replay_buffer=ReplayBuffer(capacity=1, seed=eval_seed_base),
+                observation_manager=None,
+                config=eval_collector_config,
+                q_network=self.q_network,
+            )
+        else:
+            if self.decoder is None:
+                raise RuntimeError("Decoder must be initialized for counterfactual evaluation")
+            eval_collector = RandomPlanCollector(
+                env=eval_env,
+                replay_buffer=ReplayBuffer(capacity=1, seed=eval_seed_base),
+                observation_manager=None,
+                config=eval_collector_config,
+                q_network=self.q_network,
+                decoder=self.decoder,
+            )
 
         was_training = self.q_network.training
         self.q_network.eval()
@@ -701,7 +846,10 @@ class RLTrainingApp:
                 episode_info: dict[str, object] = {}
                 while not episode_done:
                     action_selection = eval_collector.select_action(obs)
-                    next_raw_obs, rewards, dones, infos = eval_env.step(action_selection.selected_plan[0, 0])
+                    if self.args.mode == "simple_state_q":
+                        next_raw_obs, rewards, dones, infos = eval_env.step(action_selection.selected_action[0])
+                    else:
+                        next_raw_obs, rewards, dones, infos = eval_env.step(action_selection.selected_plan[0, 0])
                     total_reward += float(torch.as_tensor(rewards, dtype=torch.float32).sum().item())
                     total_steps += 1
                     episode_info = infos[0]
@@ -801,18 +949,25 @@ class RLTrainingApp:
             raise RuntimeError("Trainer and collector configs must be initialized before checkpointing")
         if self.env_config is None:
             raise RuntimeError("Environment config must be initialized before checkpointing")
-
-        return _build_checkpoint(
-            iteration=iteration,
-            args=self.args,
-            q_network=self.q_network,
-            target_q_network=self.target_q_network,
-            optimizer=self.optimizer,
-            q_model_config=self.q_model_config,
-            trainer_config=self.trainer_config,
-            collector_config=self.collector_config,
-            env_config=self.env_config,
-        )
+        checkpoint = {
+            "iteration": int(iteration),
+            "args": vars(self.args),
+            "q_network": self.q_network.state_dict(),
+            "target_q_network": self.target_q_network.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "q_model_config": self.q_model_config,
+            "trainer_config": asdict(self.trainer_config),
+            "collector_config": asdict(self.collector_config),
+            "env_config": {
+                "max_steps": self.env_config.max_steps,
+                "controlled_agent_index": self.env_config.controlled_agent_index,
+                "device": self.env_config.device,
+            },
+            "mode": self.args.mode,
+        }
+        if self.args.mode == "counterfactual_q" and self.args.decoder_checkpoint is not None:
+            checkpoint["decoder_checkpoint"] = str(self.args.decoder_checkpoint)
+        return checkpoint
 
     def _save_checkpoint(self, iteration: int) -> None:
         checkpoint = self._build_checkpoint(iteration)

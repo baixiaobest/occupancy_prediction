@@ -263,6 +263,14 @@ def term_controlled_current_velocity(
     return context.controlled_velocities()
 
 
+def term_controlled_current_position(
+    context: ObservationBatchContext,
+    params: dict[str, Any],
+) -> torch.Tensor:
+    del params
+    return context.controlled_positions()
+
+
 def term_controlled_goal_offset(
     context: ObservationBatchContext,
     params: dict[str, Any],
@@ -424,6 +432,15 @@ def build_online_occupancy_observation_manager(
     return build_observation_manager(build_online_occupancy_observation_config(config))
 
 
+def build_simple_state_observation_config() -> ObservationConfig:
+    return ObservationConfig(
+        terms=[
+            ObservationTermCfg(name="current_velocity", fn=term_controlled_current_velocity),
+            ObservationTermCfg(name="goal_position", fn=term_controlled_goal_offset),
+        ]
+    )
+
+
 __all__ = [
     "ObservationBatchContext",
     "ObservationConfig",
@@ -432,8 +449,10 @@ __all__ = [
     "ObservationTermFn",
     "OnlineOccupancyObservationConfig",
     "build_observation_manager",
+    "build_simple_state_observation_config",
     "build_online_occupancy_observation_config",
     "build_online_occupancy_observation_manager",
+    "term_controlled_current_position",
     "term_controlled_current_velocity",
     "term_controlled_goal_offset",
     "term_dynamic_local_occupancy_context",

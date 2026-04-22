@@ -33,6 +33,7 @@ from .observation_manager import (
 	ObservationTermFn,
 	OnlineOccupancyObservationConfig,
 	build_observation_manager,
+	build_simple_state_observation_config,
 	build_online_occupancy_observation_config,
 	build_online_occupancy_observation_manager,
 	term_controlled_current_velocity,
@@ -51,6 +52,18 @@ from .q_trainer import (
 	soft_update_module,
 )
 from .replay_buffer import ReplayBuffer, ReplaySampleBatch, TensorDict
+from .simple_collector import (
+	SimpleActionSelectionResult,
+	SimpleCollectSummary,
+	SimpleQActionSelectionConfig,
+	SimpleRandomActionCollector,
+	SimpleRandomActionCollectorConfig,
+)
+from .simple_q_trainer import (
+	SimpleQTrainerConfig,
+	SimpleQTrainStepStats,
+	SimpleRandomCandidateQTrainer,
+)
 
 __all__ = [
 	"CollectSummary",
@@ -76,6 +89,14 @@ __all__ = [
 	"CounterfactualRolloutFn",
 	"QTrainStepStats",
 	"QTrainerConfig",
+	"SimpleActionSelectionResult",
+	"SimpleCollectSummary",
+	"SimpleQActionSelectionConfig",
+	"SimpleQTrainStepStats",
+	"SimpleQTrainerConfig",
+	"SimpleRandomActionCollector",
+	"SimpleRandomActionCollectorConfig",
+	"SimpleRandomCandidateQTrainer",
 	"SingleEnvConfig",
 	"ReplayBuffer",
 	"ReplaySampleBatch",
@@ -83,6 +104,7 @@ __all__ = [
 	"q_scores_to_probabilities",
 	"sample_action_indices_from_q_scores",
 	"build_observation_manager",
+	"build_simple_state_observation_config",
 	"build_online_occupancy_observation_config",
 	"build_online_occupancy_observation_manager",
 	"build_reward_manager",

@@ -3,12 +3,16 @@ from __future__ import annotations
 from typing import List
 
 from src.scene_template import (
+    EmptySingleAgentGoalTemplate,
     SceneTemplate,
     StraightCorridorTemplate,
     LShapeCorridorTemplate,
     TShapeCorridorTemplate,
     CrossShapeCorridorTemplate,
 )
+
+
+EMPTY_GOAL_TEMPLATE_LEVELS = 32
 
 
 def default_templates() -> List[SceneTemplate]:
@@ -154,3 +158,16 @@ def l_shape_templates() -> SceneTemplate:
     )
 
     return [l_shape]
+
+
+def empty_goal_templates(
+    goal_distance_range: tuple[float, float] = (2.0, 6.0),
+    goal_seed: int | None = 0,
+) -> list[SceneTemplate]:
+    return [
+        EmptySingleAgentGoalTemplate(
+            goal_distance_range=goal_distance_range,
+            num_levels=EMPTY_GOAL_TEMPLATE_LEVELS,
+            goal_seed=goal_seed,
+        )
+    ]
