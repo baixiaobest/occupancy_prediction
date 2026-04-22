@@ -24,6 +24,8 @@ This package contains reusable RL building blocks for random-candidate action se
 - `q_trainer_base.py`: Shared trainer validation and abstract trainer surface.
 - `q_trainer.py`: Trainer for candidate-based Q-network pipeline.
 - `simple_q_trainer.py`: Trainer for simple-state Q-network pipeline.
+- `training_app.py`: Reusable RL training orchestration (`RLTrainingApp`).
+- `training_profiler.py`: Profiling utility with phase timing + cProfile integration.
 - `__init__.py`: Consolidated exports for package-level imports.
 
 ## Typical runtime flow

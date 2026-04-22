@@ -64,6 +64,8 @@ from .simple_q_trainer import (
 	SimpleQTrainStepStats,
 	SimpleRandomCandidateQTrainer,
 )
+from .training_app import EvaluationSummary, RLTrainingApp
+from .training_profiler import ProfileSectionStats, RunProfiler
 
 __all__ = [
 	"CollectSummary",
@@ -98,6 +100,10 @@ __all__ = [
 	"SimpleRandomActionCollectorConfig",
 	"SimpleRandomCandidateQTrainer",
 	"SingleEnvConfig",
+	"RLTrainingApp",
+	"EvaluationSummary",
+	"RunProfiler",
+	"ProfileSectionStats",
 	"ReplayBuffer",
 	"ReplaySampleBatch",
 	"TensorDict",
