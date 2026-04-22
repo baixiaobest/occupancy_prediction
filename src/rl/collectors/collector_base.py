@@ -10,7 +10,7 @@ from ..managers.observation_manager import ObservationBatchContext, ObservationM
 from ..replay_buffer import ReplayBuffer, TensorDict
 
 
-class BaseRandomActionCollector(ABC):
+class BaseActionCollector(ABC):
     def __init__(
         self,
         *,
@@ -152,3 +152,7 @@ class BaseRandomActionCollector(ABC):
         total_reward: float,
     ):
         raise NotImplementedError
+
+
+# Backward-compatible alias while migrating call sites.
+BaseRandomActionCollector = BaseActionCollector

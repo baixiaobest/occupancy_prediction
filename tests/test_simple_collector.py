@@ -7,10 +7,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-import src.rl.collector.simple_collector as simple_collector_module
+import src.rl.collectors.simple_collector as simple_collector_module
 from src.rl import build_simple_state_observation_config
 from src.rl.replay_buffer import ReplayBuffer
-from src.rl.collector.simple_collector import (
+from src.rl.collectors.simple_collector import (
+    SimpleActionCollector,
+    SimpleActionCollectorConfig,
     SimpleQActionSelectionConfig,
     SimpleRandomActionCollector,
     SimpleRandomActionCollectorConfig,
@@ -75,6 +77,28 @@ class _ActionXQNetwork(nn.Module):
     ) -> torch.Tensor:
         del current_velocity, goal_position
         return torch.as_tensor(action, dtype=torch.float32)[:, 0]
+
+
+class _DeterministicProposalNetwork(nn.Module):
+    def sample_actions(
+        self,
+        *,
+        current_velocity: torch.Tensor,
+        goal_relative_position: torch.Tensor | None = None,
+        goal_position: torch.Tensor | None = None,
+        num_candidates: int,
+        include_current_velocity_candidate: bool = True,
+        generator: torch.Generator | None = None,
+        max_speed: float | None = None,
+    ) -> torch.Tensor:
+        del goal_relative_position, goal_position, generator, max_speed
+        batch_size = int(current_velocity.shape[0])
+        actions = torch.zeros((batch_size, int(num_candidates), 2), dtype=torch.float32, device=current_velocity.device)
+        for candidate_idx in range(int(num_candidates)):
+            actions[:, candidate_idx, 0] = float(candidate_idx)
+        if include_current_velocity_candidate:
+            actions[:, 0, :] = current_velocity
+        return actions
 
 
 def _dummy_candidate_sampler(
@@ -168,6 +192,30 @@ def test_simple_random_action_collector_q_softmax_uses_q_scores(monkeypatch: pyt
     candidate_probs = torch.exp(item["candidate_log_probs"])
     assert candidate_probs.argmax().item() == 2
     assert candidate_probs[2].item() > 0.999
+
+
+def test_simple_action_collector_uses_proposal_network_samples() -> None:
+    env = _DummyEnv()
+    replay_buffer = ReplayBuffer(capacity=8, seed=0)
+    collector = SimpleActionCollector(
+        env=env,
+        replay_buffer=replay_buffer,
+        observation_manager=None,
+        config=SimpleActionCollectorConfig(
+            num_candidates=3,
+            action_selection="first",
+            seed=11,
+        ),
+        proposal_network=_DeterministicProposalNetwork(),
+    )
+
+    summary = collector.collect_steps(1)
+
+    assert summary.transitions_added == 1
+    assert len(replay_buffer) == 1
+    item = replay_buffer._items[0]
+    assert tuple(item["candidate_actions"].shape) == (3, 2)
+    assert torch.allclose(item["actions"], item["candidate_actions"][0])
 
 
 if __name__ == "__main__":

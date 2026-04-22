@@ -53,11 +53,17 @@ from .q_trainers.q_trainer import (
 )
 from .replay_buffer import ReplayBuffer, ReplaySampleBatch, TensorDict
 from .collectors.simple_collector import (
+	SimpleActionCollector,
+	SimpleActionCollectorConfig,
 	SimpleActionSelectionResult,
 	SimpleCollectSummary,
 	SimpleQActionSelectionConfig,
 	SimpleRandomActionCollector,
 	SimpleRandomActionCollectorConfig,
+)
+from .networks.simple_proposal_network import (
+	SimpleVelocityProposalNetwork,
+	build_simple_proposal_network,
 )
 from .q_trainers.simple_q_trainer import (
 	SimpleQTrainerConfig,
@@ -91,9 +97,12 @@ __all__ = [
 	"CounterfactualRolloutFn",
 	"QTrainStepStats",
 	"QTrainerConfig",
+	"SimpleActionCollector",
+	"SimpleActionCollectorConfig",
 	"SimpleActionSelectionResult",
 	"SimpleCollectSummary",
 	"SimpleQActionSelectionConfig",
+	"SimpleVelocityProposalNetwork",
 	"SimpleQTrainStepStats",
 	"SimpleQTrainerConfig",
 	"SimpleRandomActionCollector",
@@ -109,6 +118,7 @@ __all__ = [
 	"TensorDict",
 	"q_scores_to_probabilities",
 	"sample_action_indices_from_q_scores",
+	"build_simple_proposal_network",
 	"build_observation_manager",
 	"build_simple_state_observation_config",
 	"build_online_occupancy_observation_config",

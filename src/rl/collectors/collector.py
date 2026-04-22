@@ -6,7 +6,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from .collector_base import BaseRandomActionCollector
+from .collector_base import BaseActionCollector
 from ..counterfactual import CounterfactualRolloutBatch, rollout_counterfactual_futures, sample_random_velocity_plans
 from ..managers.observation_manager import ObservationBatchContext, ObservationManager, build_observation_manager
 from ..networks.q_common import sample_action_indices_from_q_scores
@@ -52,7 +52,7 @@ class ActionSelectionResult:
     candidate_log_probs: torch.Tensor | None
 
 
-class RandomPlanCollector(BaseRandomActionCollector):
+class RandomPlanCollector(BaseActionCollector):
     """Collect single-env rollouts with random candidate velocity plans."""
 
     def __init__(
