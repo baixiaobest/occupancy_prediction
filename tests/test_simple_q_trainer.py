@@ -8,7 +8,11 @@ import torch.nn as nn
 
 import src.rl.q_trainers.simple_q_trainer as simple_q_trainer_module
 from src.rl.replay_buffer import ReplaySampleBatch
-from src.rl.q_trainers.simple_q_trainer import SimpleQTrainerConfig, SimpleRandomCandidateQTrainer
+from src.rl.q_trainers.simple_q_trainer import (
+    SimpleActionCandidateQTrainer,
+    SimpleQTrainerConfig,
+    SimpleRandomCandidateQTrainer,
+)
 
 
 class _DummyQNetwork(nn.Module):
@@ -27,6 +31,30 @@ class _DummyQNetwork(nn.Module):
         goal_x = torch.as_tensor(goal_position, dtype=torch.float32)[:, 0]
         velocity_x = torch.as_tensor(current_velocity, dtype=torch.float32)[:, 0]
         return self.scale * (action_x + goal_x + velocity_x)
+
+
+class _DeterministicProposalNetwork(nn.Module):
+    def sample_actions(
+        self,
+        *,
+        current_velocity: torch.Tensor,
+        goal_relative_position: torch.Tensor | None = None,
+        goal_position: torch.Tensor | None = None,
+        num_candidates: int,
+        include_current_velocity_candidate: bool = True,
+        generator: torch.Generator | None = None,
+        max_speed: float | None = None,
+    ) -> torch.Tensor:
+        del goal_relative_position, goal_position, generator, max_speed
+        velocity = torch.as_tensor(current_velocity, dtype=torch.float32)
+        batch_size = int(velocity.shape[0])
+        candidates = int(num_candidates)
+        actions = velocity[:, None, :].expand(-1, candidates, -1).clone()
+        for candidate_idx in range(candidates):
+            actions[:, candidate_idx, 0] += float(candidate_idx)
+        if include_current_velocity_candidate:
+            actions[:, 0, :] = velocity
+        return actions
 
 
 def _dummy_candidate_sampler(
@@ -135,6 +163,37 @@ def test_simple_random_candidate_q_trainer_rejects_missing_goal_position() -> No
 
     with pytest.raises(ValueError, match=r"missing required keys"):
         trainer.train_step(invalid_batch)
+
+
+def test_simple_action_candidate_q_trainer_uses_proposal_network_samples() -> None:
+    q_network = _DummyQNetwork(scale=0.0)
+    target_q_network = _DummyQNetwork(scale=1.0)
+    optimizer = torch.optim.SGD(q_network.parameters(), lr=0.1)
+    proposal_network = _DeterministicProposalNetwork()
+    trainer = SimpleActionCandidateQTrainer(
+        q_network=q_network,
+        target_q_network=target_q_network,
+        proposal_network=proposal_network,
+        optimizer=optimizer,
+        config=SimpleQTrainerConfig(
+            discount=0.5,
+            target_tau=0.25,
+            selection_temperature=0.01,
+            selection_seed=0,
+            num_bootstrap_candidates=2,
+            max_speed=2.0,
+            delta_std=0.0,
+            dt=0.1,
+            loss_type="mse",
+        ),
+    )
+
+    stats = trainer.train_step(_make_batch())
+
+    assert stats.loss > 0.0
+    assert stats.target_mean == pytest.approx(0.85)
+    assert stats.next_q_mean == pytest.approx(1.9)
+    assert q_network.scale.item() != pytest.approx(0.0)
 
 
 if __name__ == "__main__":

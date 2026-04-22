@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Literal
 
@@ -7,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from ..counterfactual import sample_random_velocity_plans
-from .q_trainer_base import BaseRandomCandidateQTrainer, validate_common_random_candidate_q_config
+from .q_trainer_base import BaseQTrainer, validate_common_random_candidate_q_config
 from ..replay_buffer import ReplaySampleBatch
 
 
@@ -37,7 +38,7 @@ class SimpleQTrainStepStats:
     done_fraction: float
 
 
-class SimpleRandomCandidateQTrainer(BaseRandomCandidateQTrainer):
+class _BaseSimpleCandidateQTrainer(BaseQTrainer):
     def __init__(
         self,
         *,
@@ -62,15 +63,10 @@ class SimpleRandomCandidateQTrainer(BaseRandomCandidateQTrainer):
         )
 
     def _compute_td_target(self, batch: ReplaySampleBatch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        next_candidate_actions = sample_random_velocity_plans(
-            current_velocity=batch.next_obs["current_velocity"],
-            num_candidates=int(self.config.num_bootstrap_candidates),
-            horizon=1,
-            max_speed=float(self.config.max_speed),
-            delta_std=float(self.config.delta_std),
-            dt=float(self.config.dt),
-            include_current_velocity_candidate=bool(self.config.include_current_velocity_candidate),
-        )[:, :, 0, :]
+        next_candidate_actions = self._sample_next_candidate_actions(batch)
+        if next_candidate_actions.ndim != 3 or next_candidate_actions.shape[-1] != 2:
+            raise ValueError("Bootstrap candidate actions must have shape (B, K, 2)")
+
         batch_size, num_candidates = next_candidate_actions.shape[:2]
         current_velocity = batch.next_obs["current_velocity"][:, None, :].expand(-1, num_candidates, -1).reshape(batch_size * num_candidates, -1)
         goal_position = batch.next_obs["goal_position"][:, None, :].expand(-1, num_candidates, -1).reshape(batch_size * num_candidates, -1)
@@ -89,6 +85,10 @@ class SimpleRandomCandidateQTrainer(BaseRandomCandidateQTrainer):
                 self.target_q_network.train()
 
         return self._build_td_target_from_next_q_scores(batch, next_q_scores)
+
+    @abstractmethod
+    def _sample_next_candidate_actions(self, batch: ReplaySampleBatch) -> torch.Tensor:
+        raise NotImplementedError
 
     @staticmethod
     def _validate_batch(batch: ReplaySampleBatch) -> None:
@@ -124,7 +124,73 @@ class SimpleRandomCandidateQTrainer(BaseRandomCandidateQTrainer):
         )
 
 
+class SimpleRandomCandidateQTrainer(_BaseSimpleCandidateQTrainer):
+    def __init__(
+        self,
+        *,
+        q_network: nn.Module,
+        target_q_network: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        config: SimpleQTrainerConfig,
+    ) -> None:
+        super().__init__(
+            q_network=q_network,
+            target_q_network=target_q_network,
+            optimizer=optimizer,
+            config=config,
+        )
+
+    def _sample_next_candidate_actions(self, batch: ReplaySampleBatch) -> torch.Tensor:
+        return sample_random_velocity_plans(
+            current_velocity=batch.next_obs["current_velocity"],
+            num_candidates=int(self.config.num_bootstrap_candidates),
+            horizon=1,
+            max_speed=float(self.config.max_speed),
+            delta_std=float(self.config.delta_std),
+            dt=float(self.config.dt),
+            include_current_velocity_candidate=bool(self.config.include_current_velocity_candidate),
+        )[:, :, 0, :]
+
+
+class SimpleActionCandidateQTrainer(_BaseSimpleCandidateQTrainer):
+    def __init__(
+        self,
+        *,
+        q_network: nn.Module,
+        target_q_network: nn.Module,
+        proposal_network: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        config: SimpleQTrainerConfig,
+    ) -> None:
+        super().__init__(
+            q_network=q_network,
+            target_q_network=target_q_network,
+            optimizer=optimizer,
+            config=config,
+        )
+        self.proposal_network = proposal_network
+
+    def _sample_next_candidate_actions(self, batch: ReplaySampleBatch) -> torch.Tensor:
+        current_velocity = torch.as_tensor(batch.next_obs["current_velocity"])
+        was_training = self.proposal_network.training
+        self.proposal_network.eval()
+        try:
+            with torch.no_grad():
+                return self.proposal_network.sample_actions(
+                    current_velocity=current_velocity,
+                    goal_position=batch.next_obs["goal_position"],
+                    num_candidates=int(self.config.num_bootstrap_candidates),
+                    include_current_velocity_candidate=bool(self.config.include_current_velocity_candidate),
+                    generator=self._get_selection_rng(current_velocity.device),
+                    max_speed=float(self.config.max_speed),
+                )
+        finally:
+            if was_training:
+                self.proposal_network.train()
+
+
 __all__ = [
+    "SimpleActionCandidateQTrainer",
     "SimpleQTrainerConfig",
     "SimpleQTrainStepStats",
     "SimpleRandomCandidateQTrainer",

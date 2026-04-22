@@ -66,6 +66,7 @@ from .networks.simple_proposal_network import (
 	build_simple_proposal_network,
 )
 from .q_trainers.simple_q_trainer import (
+	SimpleActionCandidateQTrainer,
 	SimpleQTrainerConfig,
 	SimpleQTrainStepStats,
 	SimpleRandomCandidateQTrainer,
@@ -105,6 +106,7 @@ __all__ = [
 	"SimpleVelocityProposalNetwork",
 	"SimpleQTrainStepStats",
 	"SimpleQTrainerConfig",
+	"SimpleActionCandidateQTrainer",
 	"SimpleRandomActionCollector",
 	"SimpleRandomActionCollectorConfig",
 	"SimpleRandomCandidateQTrainer",

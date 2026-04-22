@@ -41,7 +41,7 @@ def validate_common_random_candidate_q_config(config: object) -> None:
         raise ValueError("loss_type must be 'mse' or 'smooth_l1'")
 
 
-class BaseRandomCandidateQTrainer(ABC):
+class BaseQTrainer(ABC):
     def __init__(
         self,
         *,
@@ -132,3 +132,7 @@ class BaseRandomCandidateQTrainer(ABC):
         done_fraction: float,
     ):
         raise NotImplementedError
+
+
+# Backward compatibility alias for older imports.
+BaseRandomCandidateQTrainer = BaseQTrainer
