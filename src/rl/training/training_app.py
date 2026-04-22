@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import math
 import random
 import sys
 import time
@@ -22,7 +21,6 @@ from ..networks.q_network import build_q_network
 from ...scene import Scene
 from ..networks.simple_q_network import build_simple_q_network
 from ..networks.simple_proposal_network import build_simple_proposal_network
-from ..networks.q_common import soft_update_module
 from ...templates import cross_templates, default_templates, empty_goal_templates, l_shape_templates, test_templates
 from ..collectors.collector import QActionSelectionConfig, RandomPlanCollector, RandomPlanCollectorConfig
 from ..counterfactual import rollout_counterfactual_futures, sample_random_velocity_plans
@@ -57,14 +55,6 @@ class EvaluationSummary:
     success_rate: float
     collision_rate: float
     timeout_rate: float
-
-
-@dataclass
-class ProposalTrainSummary:
-    total_loss: float
-    proposal_loss: float
-    entropy_loss: float
-    weight_entropy: float
 
 
 def _log(message: str) -> None:
@@ -236,9 +226,7 @@ class RLTrainingApp:
         self.q_network: torch.nn.Module | None = None
         self.target_q_network: torch.nn.Module | None = None
         self.simple_proposal_network: torch.nn.Module | None = None
-        self.target_simple_proposal_network: torch.nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
-        self.proposal_optimizer: torch.optim.Optimizer | None = None
         self.replay_buffer: ReplayBuffer | None = None
         self.collector_config: RandomPlanCollectorConfig | SimpleActionCollectorConfig | None = None
         self.collector: RandomPlanCollector | SimpleActionCollector | None = None
@@ -287,18 +275,6 @@ class RLTrainingApp:
     def _setup_runtime(self) -> None:
         if int(self.args.target_update_interval) <= 0:
             raise ValueError("--target-update-interval must be > 0")
-        if int(self.args.policy_delay) <= 0:
-            raise ValueError("--policy-delay must be > 0")
-        if float(self.args.proposal_weight_temperature) <= 0.0:
-            raise ValueError("--proposal-weight-temperature must be > 0")
-        if float(self.args.proposal_entropy_weight) < 0.0:
-            raise ValueError("--proposal-entropy-weight must be >= 0")
-        if float(self.args.proposal_weight_decay) < 0.0:
-            raise ValueError("--proposal-weight-decay must be >= 0")
-        if self.args.proposal_lr is not None and float(self.args.proposal_lr) <= 0.0:
-            raise ValueError("--proposal-lr must be > 0 when provided")
-        if self.args.proposal_grad_clip_norm is not None and float(self.args.proposal_grad_clip_norm) <= 0.0:
-            raise ValueError("--proposal-grad-clip-norm must be > 0 when provided")
         if self.args.mode == "simple_state_q":
             with self.profiler.section("setup_environment"):
                 self._setup_simple_environment()
@@ -406,20 +382,6 @@ class RLTrainingApp:
             min_variance=float(self.args.simple_proposal_min_variance),
             device=self.device,
         )
-        self.target_simple_proposal_network = build_simple_proposal_network(
-            horizon=1,
-            hidden_dims=self.args.simple_proposal_hidden_dims,
-            min_variance=float(self.args.simple_proposal_min_variance),
-            device=self.device,
-        )
-        self.target_simple_proposal_network.load_state_dict(self.simple_proposal_network.state_dict())
-        self.target_simple_proposal_network.eval()
-        proposal_lr = float(self.args.lr if self.args.proposal_lr is None else self.args.proposal_lr)
-        self.proposal_optimizer = torch.optim.AdamW(
-            self.simple_proposal_network.parameters(),
-            lr=proposal_lr,
-            weight_decay=float(self.args.proposal_weight_decay),
-        )
         self.replay_buffer = ReplayBuffer(capacity=int(self.args.replay_capacity), seed=int(self.args.seed))
         q_selection_config = SimpleQActionSelectionConfig(
             temperature=float(self.args.selection_temperature),
@@ -457,7 +419,7 @@ class RLTrainingApp:
         self.trainer = SimpleActionCandidateQTrainer(
             q_network=self.q_network,
             target_q_network=self.target_q_network,
-            proposal_network=self.target_simple_proposal_network,
+            proposal_network=self.simple_proposal_network,
             optimizer=self.optimizer,
             config=self.trainer_config,
         )
@@ -592,7 +554,6 @@ class RLTrainingApp:
                 f"goal_distance_range={tuple(float(v) for v in self.args.empty_goal_distance_range)} | "
                 f"q_hidden_dims={list(self.args.simple_q_hidden_dims)} | "
                 f"proposal_hidden_dims={list(self.args.simple_proposal_hidden_dims)} | "
-                f"policy_delay={int(self.args.policy_delay)} | "
                 f"target_update_interval={int(self.args.target_update_interval)} | device={self.device}"
             )
             return
@@ -622,7 +583,6 @@ class RLTrainingApp:
             collect_summary = self.collector.collect_steps(int(self.args.collect_steps_per_iter))
 
         last_stats = None
-        proposal_stats = None
         if len(self.replay_buffer) >= int(self.args.batch_size):
             self.q_network.train()
             with self.profiler.section("train_updates"):
@@ -633,16 +593,11 @@ class RLTrainingApp:
                     if self._q_updates_since_target >= int(self.args.target_update_interval):
                         self.trainer.update_target_network()
                         self._q_updates_since_target = 0
-
-            if iteration % int(self.args.policy_delay) == 0:
-                with self.profiler.section("proposal_updates"):
-                    batch = self.replay_buffer.sample(batch_size=int(self.args.batch_size), device=self.device)
-                    proposal_stats = self._train_simple_proposal_step(batch)
         else:
             self.q_network.train()
 
         if iteration == 1 or iteration % int(self.args.log_interval) == 0:
-            self._log_iteration(iteration, collect_summary, last_stats, proposal_stats)
+            self._log_iteration(iteration, collect_summary, last_stats)
 
         eval_summary = None
         if self._should_evaluate(iteration):
@@ -654,82 +609,7 @@ class RLTrainingApp:
             with self.profiler.section("save_checkpoint"):
                 self._save_checkpoint(iteration)
 
-        self._log_wandb_iteration(iteration, collect_summary, last_stats, proposal_stats, eval_summary)
-
-    def _train_simple_proposal_step(self, batch) -> ProposalTrainSummary:
-        if self.simple_proposal_network is None or self.target_simple_proposal_network is None:
-            raise RuntimeError("Simple proposal networks must be initialized before proposal training")
-        if self.target_q_network is None or self.proposal_optimizer is None:
-            raise RuntimeError("Target Q network and proposal optimizer must be initialized before proposal training")
-        if batch.candidate_actions is None:
-            raise ValueError("Proposal update requires replay batches with candidate_actions")
-
-        candidate_actions = torch.as_tensor(batch.candidate_actions, dtype=torch.float32)
-        if candidate_actions.ndim != 3 or candidate_actions.shape[-1] != 2:
-            raise ValueError("batch.candidate_actions must have shape (B, K, 2)")
-
-        current_velocity = torch.as_tensor(batch.obs["current_velocity"], dtype=torch.float32)
-        goal_position = torch.as_tensor(batch.obs["goal_position"], dtype=torch.float32)
-        batch_size, num_candidates = candidate_actions.shape[:2]
-
-        with torch.no_grad():
-            velocity_flat = current_velocity[:, None, :].expand(-1, num_candidates, -1).reshape(batch_size * num_candidates, -1)
-            goal_flat = goal_position[:, None, :].expand(-1, num_candidates, -1).reshape(batch_size * num_candidates, -1)
-            actions_flat = candidate_actions.reshape(batch_size * num_candidates, -1)
-
-            was_target_q_training = self.target_q_network.training
-            self.target_q_network.eval()
-            try:
-                q_scores = self.target_q_network(
-                    current_velocity=velocity_flat,
-                    goal_position=goal_flat,
-                    action=actions_flat,
-                ).reshape(batch_size, num_candidates)
-            finally:
-                if was_target_q_training:
-                    self.target_q_network.train()
-
-            weights = torch.softmax(q_scores / float(self.args.proposal_weight_temperature), dim=1)
-
-        self.simple_proposal_network.train()
-        delta_mean, delta_variance = self.simple_proposal_network(
-            current_velocity=current_velocity,
-            goal_position=goal_position,
-        )
-        action_mean = current_velocity + delta_mean[:, 0, :]
-        action_variance = delta_variance[:, 0, :].clamp_min(1e-8)
-
-        centered = candidate_actions - action_mean[:, None, :]
-        log_norm = torch.log(action_variance[:, None, :] * (2.0 * math.pi))
-        log_prob = -0.5 * (log_norm + centered.pow(2) / action_variance[:, None, :]).sum(dim=-1)
-        proposal_loss = -(weights * log_prob).sum(dim=1).mean()
-
-        entropy = 0.5 * torch.log(action_variance * (2.0 * math.pi * math.e)).sum(dim=1)
-        entropy_loss = -entropy.mean()
-        total_loss = proposal_loss + float(self.args.proposal_entropy_weight) * entropy_loss
-
-        self.proposal_optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        if self.args.proposal_grad_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.simple_proposal_network.parameters(),
-                max_norm=float(self.args.proposal_grad_clip_norm),
-            )
-        self.proposal_optimizer.step()
-
-        soft_update_module(
-            self.simple_proposal_network,
-            self.target_simple_proposal_network,
-            tau=float(self.args.target_tau),
-        )
-
-        weight_entropy = -torch.sum(weights * torch.log(weights.clamp_min(1e-8)), dim=1).mean()
-        return ProposalTrainSummary(
-            total_loss=float(total_loss.detach().item()),
-            proposal_loss=float(proposal_loss.detach().item()),
-            entropy_loss=float(entropy_loss.detach().item()),
-            weight_entropy=float(weight_entropy.detach().item()),
-        )
+        self._log_wandb_iteration(iteration, collect_summary, last_stats, eval_summary)
 
     def _should_evaluate(self, iteration: int) -> bool:
         return (
@@ -834,14 +714,7 @@ class RLTrainingApp:
             f"success={summary.success_rate:.3f} | collision={summary.collision_rate:.3f} | timeout={summary.timeout_rate:.3f}"
         )
 
-    def _log_wandb_iteration(
-        self,
-        iteration: int,
-        collect_summary,
-        last_stats,
-        proposal_stats: ProposalTrainSummary | None,
-        eval_summary: EvaluationSummary | None,
-    ) -> None:
+    def _log_wandb_iteration(self, iteration: int, collect_summary, last_stats, eval_summary: EvaluationSummary | None) -> None:
         if self.wandb_run is None or self.replay_buffer is None or self.start_time is None:
             return
 
@@ -865,15 +738,6 @@ class RLTrainingApp:
                     "train/done_fraction": float(last_stats.done_fraction),
                 }
             )
-        if proposal_stats is not None:
-            metrics.update(
-                {
-                    "proposal/total_loss": float(proposal_stats.total_loss),
-                    "proposal/loss": float(proposal_stats.proposal_loss),
-                    "proposal/entropy_loss": float(proposal_stats.entropy_loss),
-                    "proposal/weight_entropy": float(proposal_stats.weight_entropy),
-                }
-            )
         if eval_summary is not None:
             metrics.update(
                 {
@@ -889,13 +753,7 @@ class RLTrainingApp:
 
         self.wandb_run.log(metrics, step=int(iteration), commit=True)
 
-    def _log_iteration(
-        self,
-        iteration: int,
-        collect_summary,
-        last_stats,
-        proposal_stats: ProposalTrainSummary | None,
-    ) -> None:
+    def _log_iteration(self, iteration: int, collect_summary, last_stats) -> None:
         if self.replay_buffer is None or self.start_time is None:
             raise RuntimeError("Replay buffer and timer must be initialized before logging")
 
@@ -913,17 +771,7 @@ class RLTrainingApp:
             f"collect_reward={collect_summary.total_reward:.3f} | collect_episodes={collect_summary.episodes_completed} | "
             f"loss={last_stats.loss:.5f} | q={last_stats.q_pred_mean:.3f} | target={last_stats.target_mean:.3f} | "
             f"next_q={last_stats.next_q_mean:.3f} | sel_entropy={last_stats.selection_entropy_mean:.3f} | "
-            f"done_frac={last_stats.done_fraction:.3f}"
-            + (
-                ""
-                if proposal_stats is None
-                else (
-                    f" | prop_loss={proposal_stats.proposal_loss:.5f}"
-                    f" | prop_entropy_loss={proposal_stats.entropy_loss:.5f}"
-                    f" | prop_w_entropy={proposal_stats.weight_entropy:.3f}"
-                )
-            )
-            + f" | elapsed={elapsed:.1f}s"
+            f"done_frac={last_stats.done_fraction:.3f} | elapsed={elapsed:.1f}s"
         )
 
     def _build_checkpoint(self, iteration: int) -> dict[str, object]:
@@ -951,10 +799,6 @@ class RLTrainingApp:
         }
         if self.args.mode == "simple_state_q" and self.simple_proposal_network is not None:
             checkpoint["proposal_network"] = self.simple_proposal_network.state_dict()
-            if self.target_simple_proposal_network is not None:
-                checkpoint["target_proposal_network"] = self.target_simple_proposal_network.state_dict()
-            if self.proposal_optimizer is not None:
-                checkpoint["proposal_optimizer"] = self.proposal_optimizer.state_dict()
         if self.args.mode == "counterfactual_q" and self.args.decoder_checkpoint is not None:
             checkpoint["decoder_checkpoint"] = str(self.args.decoder_checkpoint)
         return checkpoint
