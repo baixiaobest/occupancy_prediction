@@ -43,7 +43,9 @@ class ORCASB3RewardConfig:
     step_penalty: float = 0.0
     collision_penalty: float = -1.0
     success_reward: float = 5.0
-    collision_distance: float = 0.4
+    collision_distance: float = 0.2
+    success_speed_threshold: float = 0.1
+    action_change_penalty_weight: float = 0.001
 
 
 @dataclass
@@ -52,6 +54,7 @@ class ORCASB3EnvConfig:
 
     max_steps: int = 200
     controlled_agent_index: int = 0
+    controlled_agent_max_speed: float = 2.0
     sim: ORCASB3SimConfig = field(default_factory=ORCASB3SimConfig)
     reward: ORCASB3RewardConfig = field(default_factory=ORCASB3RewardConfig)
 
@@ -59,8 +62,8 @@ class ORCASB3EnvConfig:
 class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
     """Minimal Gymnasium environment around ORCASim for PPO.
 
-    Observation: [relative_goal_x, relative_goal_y, vel_x, vel_y]
-    Action: commanded preferred velocity [vx, vy] for the controlled agent
+    Observation: [relative_goal_x, relative_goal_y, vel_x, vel_y, last_cmd_vx, last_cmd_vy]
+    Action: normalized command [ax, ay] in [-1, 1], scaled to m/s in step()
     """
 
     metadata = {"render_modes": []}
@@ -74,18 +77,20 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         super().__init__()
         self.scene_factory = scene_factory
         self.config = config if config is not None else ORCASB3EnvConfig()
+        self._controlled_agent_max_speed = float(self.config.controlled_agent_max_speed)
+        if self._controlled_agent_max_speed <= 0.0:
+            raise ValueError("controlled_agent_max_speed must be positive")
 
-        max_speed = float(self.config.sim.max_speed)
         self.action_space = spaces.Box(
-            low=np.array([-max_speed, -max_speed], dtype=np.float32),
-            high=np.array([max_speed, max_speed], dtype=np.float32),
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
             shape=(2,),
             dtype=np.float32,
         )
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(4,),
+            shape=(6,),
             dtype=np.float32,
         )
 
@@ -93,6 +98,7 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         self._goals: np.ndarray | None = None
         self._last_positions: np.ndarray | None = None
         self._last_velocities: np.ndarray | None = None
+        self._last_commanded_velocity: np.ndarray | None = None
         self._step_count: int = 0
 
     def reset(
@@ -142,6 +148,7 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         self._goals = np.asarray([agent.goal for agent in self.sim.scene.agents], dtype=np.float32)
         self._last_positions = positions
         self._last_velocities = velocities
+        self._last_commanded_velocity = None
 
         obs = self._build_obs(positions, velocities)
         info = {
@@ -159,10 +166,11 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
             raise ValueError(f"Expected action shape (2,), got {action.shape}")
 
         action = np.clip(action, self.action_space.low, self.action_space.high)
+        commanded_velocity = action * self._controlled_agent_max_speed
         controlled_idx = int(self.config.controlled_agent_index)
 
         new_positions, new_velocities = self.sim.step(
-            controlled_pref_velocities={controlled_idx: action},
+            controlled_pref_velocities={controlled_idx: commanded_velocity},
             return_velocities=True,
         )
         new_positions = np.asarray(new_positions, dtype=np.float32)
@@ -171,10 +179,21 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         reward, terminated, info = self._compute_reward_terminated(
             prev_positions=self._last_positions,
             new_positions=new_positions,
+            new_velocities=new_velocities,
         )
+
+        action_change = 0.0
+        if self._last_commanded_velocity is not None:
+            action_change = float(np.linalg.norm(commanded_velocity - self._last_commanded_velocity))
+        action_change_penalty = -float(self.config.reward.action_change_penalty_weight) * action_change
+        reward += action_change_penalty
+
+        info["action_change"] = float(action_change)
+        info["reward_terms"]["action_change"] = float(action_change_penalty)
 
         self._last_positions = new_positions
         self._last_velocities = new_velocities
+        self._last_commanded_velocity = commanded_velocity.copy()
         self._step_count += 1
 
         truncated = self._step_count >= int(self.config.max_steps)
@@ -204,9 +223,20 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         controlled_idx = int(self.config.controlled_agent_index)
         goal_offset = self._goals[controlled_idx] - positions[controlled_idx]
         current_velocity = velocities[controlled_idx]
+        if self._last_commanded_velocity is None:
+            last_commanded_velocity = np.zeros(2, dtype=np.float32)
+        else:
+            last_commanded_velocity = self._last_commanded_velocity
 
         obs = np.array(
-            [goal_offset[0], goal_offset[1], current_velocity[0], current_velocity[1]],
+            [
+                goal_offset[0],
+                goal_offset[1],
+                current_velocity[0],
+                current_velocity[1],
+                last_commanded_velocity[0],
+                last_commanded_velocity[1],
+            ],
             dtype=np.float32,
         )
         return obs
@@ -216,6 +246,7 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         *,
         prev_positions: np.ndarray,
         new_positions: np.ndarray,
+        new_velocities: np.ndarray,
     ) -> tuple[float, bool, dict[str, Any]]:
         if self.sim is None:
             raise RuntimeError("Simulator is not initialized")
@@ -234,7 +265,10 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         self_mask[controlled_idx] = True
         collision = bool(np.any((dists < float(reward_cfg.collision_distance)) & (~self_mask)))
 
-        success = bool(new_goal_distance <= float(self.sim.goal_tolerance))
+        controlled_speed = float(np.linalg.norm(new_velocities[controlled_idx]))
+        within_goal = bool(new_goal_distance <= float(self.sim.goal_tolerance))
+        stationary = bool(controlled_speed <= float(reward_cfg.success_speed_threshold))
+        success = bool(within_goal and stationary)
 
         reward = 0.0
         reward += float(reward_cfg.progress_weight) * float(progress)
@@ -249,6 +283,10 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
             "collision": collision,
             "timeout": False,
             "goal_distance": float(new_goal_distance),
+            "controlled_speed": float(controlled_speed),
+            "within_goal": bool(within_goal),
+            "stationary": bool(stationary),
+            "success_speed_threshold": float(reward_cfg.success_speed_threshold),
             "progress": float(progress),
             "reward_terms": {
                 "progress": float(reward_cfg.progress_weight) * float(progress),

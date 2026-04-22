@@ -44,6 +44,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-selection", choices=["random", "cycle", "fixed"], default="random")
     parser.add_argument("--fixed-scene-index", type=int, default=0)
     parser.add_argument("--empty-goal-distance-range", type=float, nargs=2, default=[2.0, 6.0])
+    parser.add_argument("--empty-goal-other-agents-range", type=int, nargs=2, default=[0, 0])
+    parser.add_argument("--empty-goal-other-spawn-radius-range", type=float, nargs=2, default=[1.5, 6.0])
+    parser.add_argument("--empty-goal-other-goal-distance-range", type=float, nargs=2, default=[2.0, 6.0])
+    parser.add_argument("--empty-goal-other-min-start-separation", type=float, default=0.8)
 
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--controlled-agent-index", type=int, default=0)
@@ -107,9 +111,20 @@ def _build_scene_pool(
     template_set: str,
     goal_distance_range: tuple[float, float],
     seed: int,
+    empty_goal_other_agents_range: tuple[int, int],
+    empty_goal_other_spawn_radius_range: tuple[float, float],
+    empty_goal_other_goal_distance_range: tuple[float, float],
+    empty_goal_other_min_start_separation: float,
 ) -> list[Scene]:
     if template_set == "empty_goal":
-        templates = empty_goal_templates(goal_distance_range=goal_distance_range, goal_seed=seed)
+        templates = empty_goal_templates(
+            goal_distance_range=goal_distance_range,
+            goal_seed=seed,
+            num_other_agents_range=empty_goal_other_agents_range,
+            other_agent_spawn_radius_range=empty_goal_other_spawn_radius_range,
+            other_agent_goal_distance_range=empty_goal_other_goal_distance_range,
+            other_agent_min_start_separation=float(empty_goal_other_min_start_separation),
+        )
     else:
         templates = _select_templates(template_set)
 
@@ -152,11 +167,32 @@ def main() -> None:
     args = parse_args()
     _seed_everything(int(args.seed))
 
+    other_agents_range = (
+        int(args.empty_goal_other_agents_range[0]),
+        int(args.empty_goal_other_agents_range[1]),
+    )
+    if other_agents_range[0] < 0 or other_agents_range[1] < 0:
+        raise ValueError("--empty-goal-other-agents-range values must be >= 0")
+    if float(args.empty_goal_other_min_start_separation) < 0.0:
+        raise ValueError("--empty-goal-other-min-start-separation must be >= 0")
+
     goal_distance_range = (float(args.empty_goal_distance_range[0]), float(args.empty_goal_distance_range[1]))
+    other_spawn_radius_range = (
+        float(args.empty_goal_other_spawn_radius_range[0]),
+        float(args.empty_goal_other_spawn_radius_range[1]),
+    )
+    other_goal_distance_range = (
+        float(args.empty_goal_other_goal_distance_range[0]),
+        float(args.empty_goal_other_goal_distance_range[1]),
+    )
     scenes = _build_scene_pool(
         template_set=str(args.template_set),
         goal_distance_range=goal_distance_range,
         seed=int(args.seed),
+        empty_goal_other_agents_range=other_agents_range,
+        empty_goal_other_spawn_radius_range=other_spawn_radius_range,
+        empty_goal_other_goal_distance_range=other_goal_distance_range,
+        empty_goal_other_min_start_separation=float(args.empty_goal_other_min_start_separation),
     )
     scene_factory = _make_scene_factory(
         scenes,
@@ -188,7 +224,8 @@ def main() -> None:
     policy_kwargs = {
         "actor_hidden_dims": [int(v) for v in args.actor_hidden_dims],
         "critic_hidden_dims": [int(v) for v in args.critic_hidden_dims],
-        "activation_fn": torch.nn.Tanh,
+        "actor_activation_fn": torch.nn.Tanh,
+        "critic_activation_fn": torch.nn.Tanh,
     }
 
     model = PPO(

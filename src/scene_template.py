@@ -174,13 +174,89 @@ class EmptySingleAgentGoalTemplate(SceneTemplate):
         num_levels: int = 32,
         start_position: Tuple[float, float] = (0.0, 0.0),
         goal_seed: int | None = 0,
+        num_other_agents: Tuple[int, int] | int = (0, 0),
+        other_agent_spawn_radius_range: Tuple[float, float] = (1.5, 6.0),
+        other_agent_goal_distance_range: Tuple[float, float] = (2.0, 6.0),
+        other_agent_min_start_separation: float = 0.8,
     ) -> None:
         if goal_distance_range[0] <= 0.0 or goal_distance_range[1] <= 0.0:
             raise ValueError("goal_distance_range values must be > 0")
+        if isinstance(num_other_agents, int):
+            num_other_agents = (int(num_other_agents), int(num_other_agents))
+        if len(num_other_agents) != 2:
+            raise ValueError("num_other_agents must be an int or a pair (min, max)")
+        min_other_agents = int(num_other_agents[0])
+        max_other_agents = int(num_other_agents[1])
+        if min_other_agents < 0 or max_other_agents < 0:
+            raise ValueError("num_other_agents range values must be >= 0")
+        if other_agent_spawn_radius_range[0] < 0.0 or other_agent_spawn_radius_range[1] <= 0.0:
+            raise ValueError("other_agent_spawn_radius_range must be >= 0 with positive max")
+        if other_agent_goal_distance_range[0] <= 0.0 or other_agent_goal_distance_range[1] <= 0.0:
+            raise ValueError("other_agent_goal_distance_range values must be > 0")
+        if other_agent_min_start_separation < 0.0:
+            raise ValueError("other_agent_min_start_separation must be >= 0")
         super().__init__(num_levels=num_levels)
         self.goal_distance_range = (float(goal_distance_range[0]), float(goal_distance_range[1]))
         self.start_position = (float(start_position[0]), float(start_position[1]))
         self.goal_seed = goal_seed
+        self.num_other_agents = (min(min_other_agents, max_other_agents), max(min_other_agents, max_other_agents))
+        self.other_agent_spawn_radius_range = (
+            float(other_agent_spawn_radius_range[0]),
+            float(other_agent_spawn_radius_range[1]),
+        )
+        self.other_agent_goal_distance_range = (
+            float(other_agent_goal_distance_range[0]),
+            float(other_agent_goal_distance_range[1]),
+        )
+        self.other_agent_min_start_separation = float(other_agent_min_start_separation)
+
+    def _sample_num_other_agents(self, rng: np.random.Generator) -> int:
+        min_count, max_count = self.num_other_agents
+        return int(rng.integers(min_count, max_count + 1))
+
+    @staticmethod
+    def _sample_point_on_annulus(
+        center: np.ndarray,
+        radius_range: Tuple[float, float],
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        min_radius = min(float(radius_range[0]), float(radius_range[1]))
+        max_radius = max(float(radius_range[0]), float(radius_range[1]))
+        radius = float(rng.uniform(min_radius, max_radius))
+        angle = float(rng.uniform(-math.pi, math.pi))
+        return np.array(
+            [
+                float(center[0] + radius * math.cos(angle)),
+                float(center[1] + radius * math.sin(angle)),
+            ],
+            dtype=np.float32,
+        )
+
+    def _sample_non_overlapping_other_start(
+        self,
+        *,
+        ego_start: np.ndarray,
+        existing_starts: list[np.ndarray],
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        max_attempts = 128
+        for _ in range(max_attempts):
+            candidate = self._sample_point_on_annulus(
+                center=ego_start,
+                radius_range=self.other_agent_spawn_radius_range,
+                rng=rng,
+            )
+            if all(
+                float(np.linalg.norm(candidate - start)) >= self.other_agent_min_start_separation
+                for start in existing_starts
+            ):
+                return candidate
+
+        raise ValueError(
+            "Could not sample non-overlapping other-agent starts. "
+            "Reduce num_other_agents or other_agent_min_start_separation, "
+            "or increase other_agent_spawn_radius_range."
+        )
 
     def get_name(self) -> str:
         return "empty_single_agent_goal"
@@ -189,21 +265,47 @@ class EmptySingleAgentGoalTemplate(SceneTemplate):
         radii = self._linear_levels(self.goal_distance_range, self.num_levels)
         rng = np.random.default_rng(self.goal_seed)
         scenes: List[Scene] = []
+        ego_start = np.array(self.start_position, dtype=np.float32)
         for radius in radii:
             angle = float(rng.uniform(-math.pi, math.pi))
             goal = (
                 float(self.start_position[0] + radius * math.cos(angle)),
                 float(self.start_position[1] + radius * math.sin(angle)),
             )
+
+            agents: List[AgentSpec] = [
+                AgentSpec(
+                    position=self.start_position,
+                    goal=goal,
+                    path_index=None,
+                )
+            ]
+            existing_starts: list[np.ndarray] = [ego_start.copy()]
+
+            num_other_agents = self._sample_num_other_agents(rng)
+            for _ in range(num_other_agents):
+                other_start = self._sample_non_overlapping_other_start(
+                    ego_start=ego_start,
+                    existing_starts=existing_starts,
+                    rng=rng,
+                )
+                existing_starts.append(other_start)
+                other_goal = self._sample_point_on_annulus(
+                    center=other_start,
+                    radius_range=self.other_agent_goal_distance_range,
+                    rng=rng,
+                )
+                agents.append(
+                    AgentSpec(
+                        position=(float(other_start[0]), float(other_start[1])),
+                        goal=(float(other_goal[0]), float(other_goal[1])),
+                        path_index=None,
+                    )
+                )
+
             scenes.append(
                 Scene(
-                    agents=[
-                        AgentSpec(
-                            position=self.start_position,
-                            goal=goal,
-                            path_index=None,
-                        )
-                    ],
+                    agents=agents,
                     obstacles=[],
                     paths=[],
                     region_pairs=[],

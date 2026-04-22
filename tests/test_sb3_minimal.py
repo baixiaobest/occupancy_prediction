@@ -12,7 +12,7 @@ pytest.importorskip("gymnasium")
 
 from src.scene import Scene
 from src.templates import empty_goal_templates
-from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig
+from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
 
 
 def _single_empty_goal_scene() -> Scene:
@@ -32,19 +32,45 @@ def test_sb3_env_reset_and_step_shapes() -> None:
     env = ORCASB3Env(scene_factory=scene_factory, config=ORCASB3EnvConfig(max_steps=8))
 
     obs, info = env.reset(seed=0)
-    assert obs.shape == (4,)
+    assert obs.shape == (6,)
     assert obs.dtype == np.float32
     assert "goal_distance" in info
+    assert np.allclose(obs[4:], np.zeros(2, dtype=np.float32))
 
     action = np.array([0.5, 0.0], dtype=np.float32)
     next_obs, reward, terminated, truncated, step_info = env.step(action)
 
-    assert next_obs.shape == (4,)
+    assert next_obs.shape == (6,)
+    assert np.allclose(next_obs[4:], np.array([1.0, 0.0], dtype=np.float32), atol=1e-6)
     assert isinstance(reward, float)
     assert isinstance(terminated, bool)
     assert isinstance(truncated, bool)
     assert "reward_terms" in step_info
 
+
+def test_sb3_env_action_change_penalty_term() -> None:
+    base_scene = _single_empty_goal_scene()
+
+    def scene_factory() -> Scene:
+        return copy.deepcopy(base_scene)
+
+    env = ORCASB3Env(
+        scene_factory=scene_factory,
+        config=ORCASB3EnvConfig(
+            max_steps=8,
+            sim=ORCASB3SimConfig(pref_velocity_noise_std=0.0),
+            reward=ORCASB3RewardConfig(action_change_penalty_weight=0.5),
+        ),
+    )
+
+    env.reset(seed=0)
+    _, _, _, _, info_step1 = env.step(np.array([0.5, 0.0], dtype=np.float32))
+    _, _, _, _, info_step2 = env.step(np.array([-0.5, 0.0], dtype=np.float32))
+
+    assert float(info_step1["action_change"]) == 0.0
+    assert float(info_step1["reward_terms"]["action_change"]) == 0.0
+    assert float(info_step2["action_change"]) > 0.0
+    assert float(info_step2["reward_terms"]["action_change"]) < 0.0
 
 def test_sb3_ppo_wiring_runs_short_rollout() -> None:
     sb3 = pytest.importorskip("stable_baselines3")

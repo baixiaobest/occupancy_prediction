@@ -163,11 +163,19 @@ def l_shape_templates() -> SceneTemplate:
 def empty_goal_templates(
     goal_distance_range: tuple[float, float] = (2.0, 6.0),
     goal_seed: int | None = 0,
+    num_other_agents_range: tuple[int, int] = (0, 0),
+    other_agent_spawn_radius_range: tuple[float, float] = (1.5, 6.0),
+    other_agent_goal_distance_range: tuple[float, float] = (2.0, 6.0),
+    other_agent_min_start_separation: float = 0.8,
 ) -> list[SceneTemplate]:
     return [
         EmptySingleAgentGoalTemplate(
             goal_distance_range=goal_distance_range,
             num_levels=EMPTY_GOAL_TEMPLATE_LEVELS,
             goal_seed=goal_seed,
+            num_other_agents=num_other_agents_range,
+            other_agent_spawn_radius_range=other_agent_spawn_radius_range,
+            other_agent_goal_distance_range=other_agent_goal_distance_range,
+            other_agent_min_start_separation=other_agent_min_start_separation,
         )
     ]

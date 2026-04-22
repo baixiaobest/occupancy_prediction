@@ -43,6 +43,7 @@ class StepRecord:
     ego_position: np.ndarray
     current_velocity: np.ndarray
     goal_position: np.ndarray
+    all_positions: np.ndarray
     commanded_velocity: np.ndarray
     value: float
     log_prob: float
@@ -58,6 +59,7 @@ class EpisodeRecord:
     scene: Scene
     steps: list[StepRecord]
     executed_positions: np.ndarray
+    controlled_agent_index: int = 0
     scenario_index: int = 0
     scene_index: int = 0
     variant_index: int = 0
@@ -115,9 +117,20 @@ def _build_scene_pool(
     template_set: str,
     goal_distance_range: tuple[float, float],
     goal_seed: int,
+    empty_goal_other_agents_range: tuple[int, int],
+    empty_goal_other_spawn_radius_range: tuple[float, float],
+    empty_goal_other_goal_distance_range: tuple[float, float],
+    empty_goal_other_min_start_separation: float,
 ) -> list[Scene]:
     if template_set == "empty_goal":
-        templates = empty_goal_templates(goal_distance_range=goal_distance_range, goal_seed=goal_seed)
+        templates = empty_goal_templates(
+            goal_distance_range=goal_distance_range,
+            goal_seed=goal_seed,
+            num_other_agents_range=empty_goal_other_agents_range,
+            other_agent_spawn_radius_range=empty_goal_other_spawn_radius_range,
+            other_agent_goal_distance_range=empty_goal_other_goal_distance_range,
+            other_agent_min_start_separation=float(empty_goal_other_min_start_separation),
+        )
     else:
         templates = _select_templates(template_set)
 
@@ -241,30 +254,33 @@ def _run_selected_episode(
         if env._last_positions is None or env._goals is None or env._last_velocities is None:
             raise RuntimeError("Environment state unexpectedly missing during rollout")
 
+        all_positions = env._last_positions.copy()
         current_pos = env._last_positions[controlled_idx].copy()
         current_vel = env._last_velocities[controlled_idx].copy()
         goal_pos = env._goals[controlled_idx].copy()
 
         obs_tensor, _ = model.policy.obs_to_tensor(obs)
 
-        commanded_velocity, _ = model.predict(obs, deterministic=bool(deterministic))
-        commanded_velocity = np.asarray(commanded_velocity, dtype=np.float32).reshape(2)
+        action_output, _ = model.predict(obs, deterministic=bool(deterministic))
+        action_output = np.asarray(action_output, dtype=np.float32).reshape(2)
 
-        commanded_velocity_tensor = torch.as_tensor(
-            commanded_velocity,
+        action_output_tensor = torch.as_tensor(
+            action_output,
             dtype=torch.float32,
             device=model.device,
         ).unsqueeze(0)
         with torch.no_grad():
-            values, log_prob, entropy = model.policy.evaluate_actions(obs_tensor, commanded_velocity_tensor)
+            values, log_prob, entropy = model.policy.evaluate_actions(obs_tensor, action_output_tensor)
 
-        next_obs, reward, terminated, truncated, info = env.step(commanded_velocity)
+        next_obs, reward, terminated, truncated, info = env.step(action_output)
+        commanded_velocity = np.asarray(next_obs[-2:], dtype=np.float32).reshape(2)
 
         steps.append(
             StepRecord(
                 ego_position=current_pos,
                 current_velocity=current_vel,
                 goal_position=goal_pos,
+                all_positions=all_positions,
                 commanded_velocity=commanded_velocity.copy(),
                 value=float(values[0].item()),
                 log_prob=float(log_prob[0].item()),
@@ -288,6 +304,7 @@ def _run_selected_episode(
         scene=copy.deepcopy(scene),
         steps=steps,
         executed_positions=np.stack(executed_positions, axis=0),
+        controlled_agent_index=controlled_idx,
         scenario_index=int(selection.scenario_index),
         scene_index=int(selection.scene_index),
         variant_index=int(selection.variant_index),
@@ -309,6 +326,10 @@ def _compute_plot_limits(record: EpisodeRecord, dt: float) -> tuple[float, float
         ys.append(float(point[1]))
 
     for step in record.steps:
+        for point in step.all_positions:
+            xs.append(float(point[0]))
+            ys.append(float(point[1]))
+
         current = step.ego_position
         goal = step.goal_position
         xs.extend([float(current[0]), float(goal[0])])
@@ -342,6 +363,7 @@ def _render(
 ) -> None:
     ax.clear()
     min_x, max_x, min_y, max_y = limits
+    velocity_draw_scale = 0.5
 
     step = record.steps[step_idx]
     current = step.ego_position
@@ -358,15 +380,31 @@ def _render(
         )
         ax.add_patch(polygon)
 
-    history = record.executed_positions[: step_idx + 2]
+    history = record.executed_positions[: step_idx + 1]
     ax.plot(history[:, 0], history[:, 1], color="tab:blue", linewidth=2.4, label="executed trajectory", zorder=4)
-    ax.scatter(history[-1, 0], history[-1, 1], color="tab:blue", s=40, zorder=5)
+
+    controlled_idx = int(record.controlled_agent_index)
+    if step.all_positions.shape[0] > 1:
+        other_mask = np.arange(step.all_positions.shape[0]) != controlled_idx
+        other_positions = step.all_positions[other_mask]
+        if other_positions.size > 0:
+            ax.scatter(
+                other_positions[:, 0],
+                other_positions[:, 1],
+                color="tab:gray",
+                s=28,
+                alpha=0.85,
+                label="other agents",
+                zorder=4,
+            )
+
+    ax.scatter(current[0], current[1], color="tab:blue", s=40, zorder=5)
 
     ax.quiver(
         current[0],
         current[1],
-        step.current_velocity[0],
-        step.current_velocity[1],
+        velocity_draw_scale * step.current_velocity[0],
+        velocity_draw_scale * step.current_velocity[1],
         color="tab:green",
         angles="xy",
         scale_units="xy",
@@ -378,8 +416,8 @@ def _render(
     ax.quiver(
         current[0],
         current[1],
-        step.commanded_velocity[0],
-        step.commanded_velocity[1],
+        velocity_draw_scale * step.commanded_velocity[0],
+        velocity_draw_scale * step.commanded_velocity[1],
         color="tab:red",
         angles="xy",
         scale_units="xy",
@@ -419,6 +457,7 @@ def _render(
 
     legend_handles = [
         Line2D([0], [0], color="tab:blue", lw=2.4, label="executed trajectory"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:gray", markersize=7, label="other agents"),
         Line2D([0], [0], color="tab:green", lw=2.0, label="current velocity"),
         Line2D([0], [0], color="tab:red", lw=2.0, label="commanded velocity"),
         Line2D([0], [0], marker="*", color="w", markerfacecolor="gold", markeredgecolor="black", markersize=12, label="goal"),
@@ -442,6 +481,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--goal-distance-range", type=float, nargs=2, default=[2.0, 6.0])
     parser.add_argument("--goal-seed", type=int, default=42)
+    parser.add_argument("--empty-goal-other-agents-range", type=int, nargs=2, default=[0, 0])
+    parser.add_argument("--empty-goal-other-spawn-radius-range", type=float, nargs=2, default=[1.5, 6.0])
+    parser.add_argument("--empty-goal-other-goal-distance-range", type=float, nargs=2, default=[2.0, 6.0])
+    parser.add_argument("--empty-goal-other-min-start-separation", type=float, default=0.8)
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--scenario-variants-per-scene", type=int, default=4)
@@ -470,14 +513,34 @@ def main() -> None:
         raise ValueError("--scenario-variants-per-scene must be > 0")
     if int(args.env_max_steps) <= 0:
         raise ValueError("--env-max-steps must be > 0")
+    other_agents_range = (
+        int(args.empty_goal_other_agents_range[0]),
+        int(args.empty_goal_other_agents_range[1]),
+    )
+    if other_agents_range[0] < 0 or other_agents_range[1] < 0:
+        raise ValueError("--empty-goal-other-agents-range values must be >= 0")
+    if float(args.empty_goal_other_min_start_separation) < 0.0:
+        raise ValueError("--empty-goal-other-min-start-separation must be >= 0")
 
     model = _load_ppo_model(args.checkpoint, device=str(args.device))
 
     goal_range = (float(args.goal_distance_range[0]), float(args.goal_distance_range[1]))
+    other_spawn_radius_range = (
+        float(args.empty_goal_other_spawn_radius_range[0]),
+        float(args.empty_goal_other_spawn_radius_range[1]),
+    )
+    other_goal_distance_range = (
+        float(args.empty_goal_other_goal_distance_range[0]),
+        float(args.empty_goal_other_goal_distance_range[1]),
+    )
     scenes = _build_scene_pool(
         template_set=str(args.template_set),
         goal_distance_range=goal_range,
         goal_seed=int(args.goal_seed),
+        empty_goal_other_agents_range=other_agents_range,
+        empty_goal_other_spawn_radius_range=other_spawn_radius_range,
+        empty_goal_other_goal_distance_range=other_goal_distance_range,
+        empty_goal_other_min_start_separation=float(args.empty_goal_other_min_start_separation),
     )
 
     env_config = ORCASB3EnvConfig(
