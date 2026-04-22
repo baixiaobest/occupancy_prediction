@@ -69,7 +69,6 @@ class BaseQTrainer(ABC):
         if self.config.grad_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=float(self.config.grad_clip_norm))
         self.optimizer.step()
-        soft_update_module(self.q_network, self.target_q_network, tau=float(self.config.target_tau))
 
         return self._build_train_step_stats(
             loss=float(loss.detach().item()),
@@ -80,6 +79,9 @@ class BaseQTrainer(ABC):
             reward_mean=float(batch.rewards.detach().mean().item()),
             done_fraction=float(batch.dones.detach().float().mean().item()),
         )
+
+    def update_target_network(self) -> None:
+        soft_update_module(self.q_network, self.target_q_network, tau=float(self.config.target_tau))
 
     def _compute_loss(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if self.config.loss_type == "mse":

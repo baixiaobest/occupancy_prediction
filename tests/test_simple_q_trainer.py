@@ -138,6 +138,8 @@ def test_simple_random_candidate_q_trainer_updates_q_and_target_networks(
     assert stats.next_q_mean == pytest.approx(1.9)
     assert stats.selection_entropy_mean < 1e-3
     assert q_network.scale.item() != pytest.approx(0.0)
+    assert target_q_network.scale.item() == pytest.approx(1.0)
+    trainer.update_target_network()
     assert target_q_network.scale.item() == pytest.approx(0.75 + 0.25 * q_network.scale.item(), rel=1e-5)
 
 
