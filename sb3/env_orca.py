@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import gymnasium as gym
 import numpy as np
+import torch
 from gymnasium import spaces
 
 from src.ORCASim import ORCASim
+from src.occupancy2d import Occupancy2d
+from src.occupancy_patch import slice_centered_patch
+from src.rollout_helpers import _build_scene_static_map, _compute_scene_canvas
 from src.scene import Scene
 
 
@@ -49,6 +54,17 @@ class ORCASB3RewardConfig:
 
 
 @dataclass
+class ORCASB3OccupancyConfig:
+    """Occupancy observation settings for SB3 policy inputs."""
+
+    resolution: float = 0.1
+    patch_length: float = 12.8
+    patch_width: float = 12.8
+    dynamic_context_len: int = 1
+    agent_radius: float = 0.3
+
+
+@dataclass
 class ORCASB3EnvConfig:
     """Environment settings for the SB3 Gym wrapper."""
 
@@ -57,12 +73,19 @@ class ORCASB3EnvConfig:
     controlled_agent_max_speed: float = 2.0
     sim: ORCASB3SimConfig = field(default_factory=ORCASB3SimConfig)
     reward: ORCASB3RewardConfig = field(default_factory=ORCASB3RewardConfig)
+    occupancy: ORCASB3OccupancyConfig = field(default_factory=ORCASB3OccupancyConfig)
 
 
-class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
+class ORCASB3Env(gym.Env[dict[str, np.ndarray], np.ndarray]):
     """Minimal Gymnasium environment around ORCASim for PPO.
 
-    Observation: [relative_goal_x, relative_goal_y, vel_x, vel_y, last_cmd_vx, last_cmd_vy]
+    Observation keys:
+    - dynamic_context: (1, T_ctx, H, W) dynamic local occupancy context.
+    - static_map: (1, H, W) static local occupancy map.
+    - goal_position: (2,) relative goal offset.
+    - current_velocity: (2,) current controlled-agent velocity.
+    - last_commanded_velocity: (2,) previous action mapped to velocity.
+
     Action: normalized command [ax, ay] in [-1, 1], scaled to m/s in step()
     """
 
@@ -80,6 +103,27 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         self._controlled_agent_max_speed = float(self.config.controlled_agent_max_speed)
         if self._controlled_agent_max_speed <= 0.0:
             raise ValueError("controlled_agent_max_speed must be positive")
+        if float(self.config.occupancy.resolution) <= 0.0:
+            raise ValueError("occupancy.resolution must be positive")
+        if float(self.config.occupancy.patch_length) <= 0.0:
+            raise ValueError("occupancy.patch_length must be positive")
+        if float(self.config.occupancy.patch_width) <= 0.0:
+            raise ValueError("occupancy.patch_width must be positive")
+        if int(self.config.occupancy.dynamic_context_len) <= 0:
+            raise ValueError("occupancy.dynamic_context_len must be > 0")
+        if float(self.config.occupancy.agent_radius) < 0.0:
+            raise ValueError("occupancy.agent_radius must be >= 0")
+
+        occ_cfg = self.config.occupancy
+        self._occupancy_resolution = float(occ_cfg.resolution)
+        self._occupancy_resolution_xy = (self._occupancy_resolution, self._occupancy_resolution)
+        self._local_map_shape = (
+            int(np.floor(float(occ_cfg.patch_width) / self._occupancy_resolution)),
+            int(np.floor(float(occ_cfg.patch_length) / self._occupancy_resolution)),
+        )
+        if self._local_map_shape[0] <= 0 or self._local_map_shape[1] <= 0:
+            raise ValueError("occupancy patch size/resolution yields non-positive local map shape")
+        self._dynamic_context_len = int(occ_cfg.dynamic_context_len)
 
         self.action_space = spaces.Box(
             low=np.array([-1.0, -1.0], dtype=np.float32),
@@ -87,11 +131,39 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
             shape=(2,),
             dtype=np.float32,
         )
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(6,),
-            dtype=np.float32,
+        self.observation_space = spaces.Dict(
+            {
+                "dynamic_context": spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(1, self._dynamic_context_len, self._local_map_shape[0], self._local_map_shape[1]),
+                    dtype=np.float32,
+                ),
+                "static_map": spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(1, self._local_map_shape[0], self._local_map_shape[1]),
+                    dtype=np.float32,
+                ),
+                "goal_position": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(2,),
+                    dtype=np.float32,
+                ),
+                "current_velocity": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(2,),
+                    dtype=np.float32,
+                ),
+                "last_commanded_velocity": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(2,),
+                    dtype=np.float32,
+                ),
+            }
         )
 
         self.sim: ORCASim | None = None
@@ -99,6 +171,12 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         self._last_positions: np.ndarray | None = None
         self._last_velocities: np.ndarray | None = None
         self._last_commanded_velocity: np.ndarray | None = None
+        self._scene_static_map: torch.Tensor | None = None
+        self._scene_origin: tuple[float, float] | None = None
+        self._scene_center: np.ndarray | None = None
+        self._scene_canvas_shape: tuple[int, int] | None = None
+        self._dynamic_renderer: Occupancy2d | None = None
+        self._dynamic_context_history: deque[torch.Tensor] = deque(maxlen=self._dynamic_context_len + 1)
         self._step_count: int = 0
 
     def reset(
@@ -106,7 +184,7 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         *,
         seed: int | None = None,
         options: dict[str, Any] | None = None,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         del options
         super().reset(seed=seed)
 
@@ -149,6 +227,7 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         self._last_positions = positions
         self._last_velocities = velocities
         self._last_commanded_velocity = None
+        self._initialize_occupancy(scene=self.sim.scene, positions=positions)
 
         obs = self._build_obs(positions, velocities)
         info = {
@@ -157,7 +236,7 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         }
         return obs, info
 
-    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+    def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         if self.sim is None or self._last_positions is None or self._last_velocities is None:
             raise RuntimeError("Environment is not initialized. Call reset() first.")
 
@@ -216,9 +295,44 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         diff = self._goals[controlled_idx] - positions[controlled_idx]
         return float(np.linalg.norm(diff))
 
-    def _build_obs(self, positions: np.ndarray, velocities: np.ndarray) -> np.ndarray:
+    def _initialize_occupancy(self, *, scene: Scene, positions: np.ndarray) -> None:
         if self._goals is None:
             raise RuntimeError("Goals are not initialized")
+
+        traj_seed = np.stack([positions, self._goals], axis=0)
+        scene_origin, scene_size, scene_canvas_shape, scene_center = _compute_scene_canvas(
+            traj=traj_seed,
+            obstacles=scene.obstacles,
+            resolution=self._occupancy_resolution,
+            occupancy_length=float(self.config.occupancy.patch_length),
+            occupancy_width=float(self.config.occupancy.patch_width),
+        )
+        self._scene_origin = (float(scene_origin[0]), float(scene_origin[1]))
+        self._scene_center = np.asarray(scene_center, dtype=np.float32)
+        self._scene_canvas_shape = (int(scene_canvas_shape[0]), int(scene_canvas_shape[1]))
+        self._scene_static_map = _build_scene_static_map(
+            obstacles=scene.obstacles,
+            resolution=self._occupancy_resolution,
+            agent_radius=float(self.config.occupancy.agent_radius),
+            scene_size=scene_size,
+            scene_center=self._scene_center,
+        ).to(dtype=torch.float32)
+        self._dynamic_renderer = Occupancy2d(
+            resolution=self._occupancy_resolution_xy,
+            size=scene_size,
+            trajectory=None,
+            static_obstacles=None,
+            agent_radius=float(self.config.occupancy.agent_radius),
+        )
+        self._dynamic_context_history.clear()
+
+    def _build_obs(self, positions: np.ndarray, velocities: np.ndarray) -> dict[str, np.ndarray]:
+        if self._goals is None:
+            raise RuntimeError("Goals are not initialized")
+        if self._scene_static_map is None or self._scene_origin is None:
+            raise RuntimeError("Occupancy state is not initialized")
+        if self._scene_center is None or self._scene_canvas_shape is None or self._dynamic_renderer is None:
+            raise RuntimeError("Dynamic occupancy state is not initialized")
 
         controlled_idx = int(self.config.controlled_agent_index)
         goal_offset = self._goals[controlled_idx] - positions[controlled_idx]
@@ -228,17 +342,53 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
         else:
             last_commanded_velocity = self._last_commanded_velocity
 
-        obs = np.array(
-            [
-                goal_offset[0],
-                goal_offset[1],
-                current_velocity[0],
-                current_velocity[1],
-                last_commanded_velocity[0],
-                last_commanded_velocity[1],
-            ],
-            dtype=np.float32,
+        center_xy = torch.as_tensor(positions[controlled_idx], dtype=torch.float32)
+        static_local = slice_centered_patch(
+            self._scene_static_map,
+            center_xy,
+            self._scene_origin,
+            self._occupancy_resolution_xy,
+            self._local_map_shape,
+            binary=False,
+            prefer_view=True,
         )
+
+        num_agents = int(positions.shape[0])
+        other_indices = [idx for idx in range(num_agents) if idx != controlled_idx]
+        if other_indices:
+            other_positions = positions[other_indices].astype(np.float32, copy=False)[None, :, :]
+            self._dynamic_renderer.update_inputs(trajectory=other_positions, static_obstacles=[])
+            dynamic_global = self._dynamic_renderer.generate(center_offset=tuple(self._scene_center.tolist()))[0]
+            dynamic_global = dynamic_global.to(dtype=torch.float32)
+        else:
+            dynamic_global = torch.zeros(self._scene_canvas_shape, dtype=torch.float32)
+
+        dynamic_local = slice_centered_patch(
+            dynamic_global,
+            center_xy,
+            self._scene_origin,
+            self._occupancy_resolution_xy,
+            self._local_map_shape,
+            binary=False,
+            prefer_view=True,
+        )
+
+        self._dynamic_context_history.append(dynamic_local)
+        context_frames = list(self._dynamic_context_history)[:-1]
+        if not context_frames:
+            context_frames = [dynamic_local]
+        context_frames = context_frames[-self._dynamic_context_len :]
+        while len(context_frames) < self._dynamic_context_len:
+            context_frames.insert(0, context_frames[0])
+        dynamic_context = torch.stack(context_frames, dim=0).unsqueeze(0)
+
+        obs = {
+            "dynamic_context": dynamic_context.cpu().numpy().astype(np.float32, copy=False),
+            "static_map": static_local.unsqueeze(0).cpu().numpy().astype(np.float32, copy=False),
+            "goal_position": np.asarray(goal_offset, dtype=np.float32),
+            "current_velocity": np.asarray(current_velocity, dtype=np.float32),
+            "last_commanded_velocity": np.asarray(last_commanded_velocity, dtype=np.float32),
+        }
         return obs
 
     def _compute_reward_terminated(
@@ -302,6 +452,7 @@ class ORCASB3Env(gym.Env[np.ndarray, np.ndarray]):
 __all__ = [
     "ORCASB3Env",
     "ORCASB3EnvConfig",
+    "ORCASB3OccupancyConfig",
     "ORCASB3RewardConfig",
     "ORCASB3SimConfig",
 ]

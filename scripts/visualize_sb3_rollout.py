@@ -28,7 +28,6 @@ from src.templates import (
     test_templates,
 )
 from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
-from sb3.policy import MinimalActorCriticPolicy
 
 try:
     from stable_baselines3 import PPO
@@ -225,7 +224,6 @@ def _load_ppo_model(checkpoint_path: Path, device: str) -> PPO:
     model = PPO.load(
         str(resolved),
         device=device,
-        custom_objects={"policy_class": MinimalActorCriticPolicy},
     )
     model.policy.set_training_mode(False)
     return model
@@ -273,7 +271,7 @@ def _run_selected_episode(
             values, log_prob, entropy = model.policy.evaluate_actions(obs_tensor, action_output_tensor)
 
         next_obs, reward, terminated, truncated, info = env.step(action_output)
-        commanded_velocity = np.asarray(next_obs[-2:], dtype=np.float32).reshape(2)
+        commanded_velocity = np.asarray(next_obs["last_commanded_velocity"], dtype=np.float32).reshape(2)
 
         steps.append(
             StepRecord(

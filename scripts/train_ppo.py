@@ -23,7 +23,7 @@ from src.templates import (
 )
 
 from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
-from sb3.policy import MinimalActorCriticPolicy
+from sb3.policy import OccupancyActorCriticPolicy
 
 try:
     from stable_baselines3 import PPO
@@ -34,7 +34,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a minimal ORCA SB3 PPO policy")
+    parser = argparse.ArgumentParser(description="Train an occupancy-aware ORCA SB3 PPO policy")
 
     parser.add_argument(
         "--template-set",
@@ -226,10 +226,11 @@ def main() -> None:
         "critic_hidden_dims": [int(v) for v in args.critic_hidden_dims],
         "actor_activation_fn": torch.nn.Tanh,
         "critic_activation_fn": torch.nn.Tanh,
+        "map_conv_channels": [16, 32, 64, 64],
     }
 
     model = PPO(
-        policy=MinimalActorCriticPolicy,
+        policy=OccupancyActorCriticPolicy,
         env=env,
         learning_rate=float(args.learning_rate),
         n_steps=int(args.n_steps),

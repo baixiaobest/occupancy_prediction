@@ -32,16 +32,27 @@ def test_sb3_env_reset_and_step_shapes() -> None:
     env = ORCASB3Env(scene_factory=scene_factory, config=ORCASB3EnvConfig(max_steps=8))
 
     obs, info = env.reset(seed=0)
-    assert obs.shape == (6,)
-    assert obs.dtype == np.float32
+    assert isinstance(obs, dict)
+    assert set(obs.keys()) == {
+        "dynamic_context",
+        "static_map",
+        "goal_position",
+        "current_velocity",
+        "last_commanded_velocity",
+    }
+    assert obs["dynamic_context"].dtype == np.float32
+    assert obs["static_map"].dtype == np.float32
+    assert obs["goal_position"].shape == (2,)
+    assert obs["current_velocity"].shape == (2,)
+    assert obs["last_commanded_velocity"].shape == (2,)
     assert "goal_distance" in info
-    assert np.allclose(obs[4:], np.zeros(2, dtype=np.float32))
+    assert np.allclose(obs["last_commanded_velocity"], np.zeros(2, dtype=np.float32))
 
     action = np.array([0.5, 0.0], dtype=np.float32)
     next_obs, reward, terminated, truncated, step_info = env.step(action)
 
-    assert next_obs.shape == (6,)
-    assert np.allclose(next_obs[4:], np.array([1.0, 0.0], dtype=np.float32), atol=1e-6)
+    assert isinstance(next_obs, dict)
+    assert np.allclose(next_obs["last_commanded_velocity"], np.array([1.0, 0.0], dtype=np.float32), atol=1e-6)
     assert isinstance(reward, float)
     assert isinstance(terminated, bool)
     assert isinstance(truncated, bool)
@@ -76,7 +87,7 @@ def test_sb3_ppo_wiring_runs_short_rollout() -> None:
     sb3 = pytest.importorskip("stable_baselines3")
     ppo_cls = sb3.PPO
 
-    from sb3.policy import MinimalActorCriticPolicy
+    from sb3.policy import OccupancyActorCriticPolicy
 
     base_scene = _single_empty_goal_scene()
 
@@ -86,7 +97,7 @@ def test_sb3_ppo_wiring_runs_short_rollout() -> None:
     env = ORCASB3Env(scene_factory=scene_factory, config=ORCASB3EnvConfig(max_steps=16))
 
     model = ppo_cls(
-        policy=MinimalActorCriticPolicy,
+        policy=OccupancyActorCriticPolicy,
         env=env,
         n_steps=8,
         batch_size=4,
