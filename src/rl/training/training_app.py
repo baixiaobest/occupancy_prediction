@@ -41,7 +41,7 @@ from ..collectors.simple_collector import (
     SimpleQActionSelectionConfig,
 )
 from ..q_trainers.simple_q_trainer import SimpleActionCandidateQTrainer, SimpleQTrainerConfig
-from .training_profiler import RunProfiler
+from ...training_profiler import RunProfiler
 
 DecoderBuilder = Callable[[Path, torch.device], tuple[torch.nn.Module, int, int, tuple[int, int, int], int]]
 

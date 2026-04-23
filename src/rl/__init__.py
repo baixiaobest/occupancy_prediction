@@ -72,7 +72,7 @@ from .q_trainers.simple_q_trainer import (
 	SimpleRandomCandidateQTrainer,
 )
 from .training.training_app import EvaluationSummary, RLTrainingApp
-from .training.training_profiler import ProfileSectionStats, RunProfiler
+from ..training_profiler import ProfileSectionStats, RunProfiler
 
 __all__ = [
 	"CollectSummary",

@@ -27,6 +27,7 @@ from src.templates import (
 
 from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
 from sb3.policy import OccupancyActorCriticPolicy
+from src.training_profiler import RunProfiler
 
 try:
     from stable_baselines3 import PPO
@@ -94,7 +95,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-group", type=str, default=None)
     parser.add_argument("--wandb-job-type", type=str, default="train_ppo")
     parser.add_argument("--wandb-tags", type=str, nargs="*", default=None)
-    parser.add_argument("--wandb-upload-model-interval", type=int, default=100000)
+    parser.add_argument("--wandb-upload-model-interval", type=int, default=10000)
+
+    parser.add_argument("--profile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--profile-top-n", type=int, default=40)
+    parser.add_argument("--profile-output", type=Path, default=Path("profiles/train_ppo.prof"))
 
     return parser.parse_args()
 
@@ -192,19 +197,20 @@ def _wandb_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
 def _init_wandb(args: argparse.Namespace):
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    removed_paths: list[tuple[int, str]] = []
-    for idx in range(len(sys.path) - 1, -1, -1):
-        if os.path.abspath(sys.path[idx]) == repo_root:
-            removed_paths.append((idx, sys.path.pop(idx)))
+    original_sys_path = list(sys.path)
+    sys.path = [path for path in sys.path if os.path.abspath(path) != repo_root]
 
+    sys.modules.pop("wandb", None)
     try:
-        sys.modules.pop("wandb", None)
         wandb = importlib.import_module("wandb")
     except ImportError as exc:
+        sys.path = original_sys_path
         raise ImportError("wandb is required for --wandb. Install with: pip install wandb") from exc
-    finally:
-        for idx, path in sorted(removed_paths, key=lambda item: item[0]):
-            sys.path.insert(idx, path)
+    except Exception:
+        sys.path = original_sys_path
+        raise
+
+    sys.path = original_sys_path
 
     if not hasattr(wandb, "init"):
         raise ImportError(
@@ -300,10 +306,18 @@ class _RewardBreakdownLoggingCallback(BaseCallback):
 
 def main() -> None:
     args = parse_args()
-    _seed_everything(int(args.seed))
 
+    profiler = RunProfiler(
+        enabled=bool(args.profile),
+        top_n=int(args.profile_top_n),
+        output_path=args.profile_output if bool(args.profile) else None,
+        log_fn=lambda message: print(message, flush=True),
+    )
+    profiler.start()
     wandb_module = None
     wandb_run = None
+
+    _seed_everything(int(args.seed))
 
     tensorboard_log_path = args.tensorboard_log
     if bool(args.wandb) and tensorboard_log_path is None:
@@ -327,6 +341,7 @@ def main() -> None:
         float(args.empty_goal_other_goal_distance_range[0]),
         float(args.empty_goal_other_goal_distance_range[1]),
     )
+
     scenes = _build_scene_pool(
         template_set=str(args.template_set),
         goal_distance_range=goal_distance_range,
@@ -336,6 +351,7 @@ def main() -> None:
         empty_goal_other_goal_distance_range=other_goal_distance_range,
         empty_goal_other_min_start_separation=float(args.empty_goal_other_min_start_separation),
     )
+
     scene_factory = _make_scene_factory(
         scenes,
         selection=str(args.scene_selection),
@@ -391,9 +407,9 @@ def main() -> None:
         policy_kwargs=policy_kwargs,
     )
 
-    try:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
 
+    try:
         if bool(args.wandb):
             wandb_module, wandb_run = _init_wandb(args)
 
@@ -419,11 +435,12 @@ def main() -> None:
         else:
             learn_callback = CallbackList(callback_list)
 
-        model.learn(
-            total_timesteps=int(args.total_timesteps),
-            progress_bar=bool(args.progress_bar),
-            callback=learn_callback,
-        )
+        with profiler.section("learn"):
+            model.learn(
+                total_timesteps=int(args.total_timesteps),
+                progress_bar=bool(args.progress_bar),
+                callback=learn_callback,
+            )
 
         model.save(str(args.output))
         print(f"Saved PPO model to {args.output}")
@@ -433,6 +450,8 @@ def main() -> None:
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+        profiler.stop()
+        profiler.report()
 
 
 if __name__ == "__main__":
