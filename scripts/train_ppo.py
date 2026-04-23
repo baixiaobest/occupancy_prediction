@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import datetime as dt
+import importlib
 import os
 import random
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -27,6 +30,7 @@ from sb3.policy import OccupancyActorCriticPolicy
 
 try:
     from stable_baselines3 import PPO
+    from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 except ImportError as exc:  # pragma: no cover - runtime dependency
     raise ImportError(
         "stable_baselines3 is required. Install with: pip install stable-baselines3[extra]"
@@ -35,6 +39,8 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train an occupancy-aware ORCA SB3 PPO policy")
+
+    default_wandb_name = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     parser.add_argument(
         "--template-set",
@@ -80,6 +86,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-bar", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tensorboard-log", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/sb3_ppo_orca"))
+
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--wandb-project", type=str, default="occupancy-prediction-rl")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-name", type=str, default=default_wandb_name)
+    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument("--wandb-job-type", type=str, default="train_ppo")
+    parser.add_argument("--wandb-tags", type=str, nargs="*", default=None)
+    parser.add_argument("--wandb-upload-model-interval", type=int, default=100000)
 
     return parser.parse_args()
 
@@ -163,9 +178,136 @@ def _make_scene_factory(
     return factory
 
 
+def _wandb_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    config: dict[str, Any] = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            config[key] = str(value)
+        elif isinstance(value, tuple):
+            config[key] = list(value)
+        else:
+            config[key] = value
+    return config
+
+
+def _init_wandb(args: argparse.Namespace):
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    removed_paths: list[tuple[int, str]] = []
+    for idx in range(len(sys.path) - 1, -1, -1):
+        if os.path.abspath(sys.path[idx]) == repo_root:
+            removed_paths.append((idx, sys.path.pop(idx)))
+
+    try:
+        sys.modules.pop("wandb", None)
+        wandb = importlib.import_module("wandb")
+    except ImportError as exc:
+        raise ImportError("wandb is required for --wandb. Install with: pip install wandb") from exc
+    finally:
+        for idx, path in sorted(removed_paths, key=lambda item: item[0]):
+            sys.path.insert(idx, path)
+
+    if not hasattr(wandb, "init"):
+        raise ImportError(
+            "Imported 'wandb' does not expose init(). "
+            "A local workspace module may be shadowing the pip package."
+        )
+
+    run = wandb.init(
+        project=str(args.wandb_project),
+        entity=None if args.wandb_entity is None else str(args.wandb_entity),
+        name=str(args.wandb_name),
+        group=None if args.wandb_group is None else str(args.wandb_group),
+        job_type=str(args.wandb_job_type),
+        tags=None if args.wandb_tags is None else [str(tag) for tag in args.wandb_tags],
+        config=_wandb_config_from_args(args),
+        sync_tensorboard=True,
+    )
+    return wandb, run
+
+
+def _resolved_model_file_path(path: Path) -> Path:
+    return path if path.suffix == ".zip" else Path(f"{path}.zip")
+
+
+class _WandbModelUploadCallback(BaseCallback):
+    def __init__(self, *, wandb_module: Any, output_path: Path, interval_steps: int) -> None:
+        super().__init__(verbose=0)
+        interval = int(interval_steps)
+        if interval <= 0:
+            raise ValueError("wandb model upload interval must be > 0")
+        self.wandb_module = wandb_module
+        self.output_path = Path(output_path)
+        self.interval_steps = interval
+        self.next_upload_step = interval
+
+    def _save_and_upload(self) -> None:
+        checkpoint_base = self.output_path.with_name(f"{self.output_path.name}_step_{self.num_timesteps}")
+        self.model.save(str(checkpoint_base))
+        checkpoint_file = _resolved_model_file_path(checkpoint_base)
+        self.wandb_module.save(str(checkpoint_file))
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps >= self.next_upload_step:
+            self._save_and_upload()
+            while self.num_timesteps >= self.next_upload_step:
+                self.next_upload_step += self.interval_steps
+        return True
+
+
+class _RewardBreakdownLoggingCallback(BaseCallback):
+    """Aggregate reward term breakdown over rollout and log once per rollout."""
+
+    def __init__(self) -> None:
+        super().__init__(verbose=0)
+        self._term_sums: dict[str, float] = {}
+        self._num_samples: int = 0
+
+    def _on_rollout_start(self) -> None:
+        self._term_sums.clear()
+        self._num_samples = 0
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos")
+        if not isinstance(infos, (list, tuple)):
+            return True
+
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            reward_terms = info.get("reward_terms")
+            if not isinstance(reward_terms, dict):
+                continue
+
+            self._num_samples += 1
+            for key, value in reward_terms.items():
+                try:
+                    term_value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                self._term_sums[key] = self._term_sums.get(key, 0.0) + term_value
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if self._num_samples <= 0 or not self._term_sums:
+            return
+
+        inv_n = 1.0 / float(self._num_samples)
+        for key, summed in self._term_sums.items():
+            metric_key = f"reward_terms/{key}"
+            mean_value = float(summed) * inv_n
+            self.logger.record(metric_key, mean_value)
+
+
 def main() -> None:
     args = parse_args()
     _seed_everything(int(args.seed))
+
+    wandb_module = None
+    wandb_run = None
+
+    tensorboard_log_path = args.tensorboard_log
+    if bool(args.wandb) and tensorboard_log_path is None:
+        tensorboard_log_path = Path("runs/sb3_ppo")
 
     other_agents_range = (
         int(args.empty_goal_other_agents_range[0]),
@@ -226,7 +368,7 @@ def main() -> None:
         "critic_hidden_dims": [int(v) for v in args.critic_hidden_dims],
         "actor_activation_fn": torch.nn.Tanh,
         "critic_activation_fn": torch.nn.Tanh,
-        "map_conv_channels": [16, 32, 64, 64],
+        "map_conv_channels": [8, 8, 16, 16, 32, 32],
     }
 
     model = PPO(
@@ -245,18 +387,52 @@ def main() -> None:
         verbose=1,
         seed=int(args.seed),
         device=str(args.device),
-        tensorboard_log=None if args.tensorboard_log is None else str(args.tensorboard_log),
+        tensorboard_log=None if tensorboard_log_path is None else str(tensorboard_log_path),
         policy_kwargs=policy_kwargs,
     )
 
-    model.learn(
-        total_timesteps=int(args.total_timesteps),
-        progress_bar=bool(args.progress_bar),
-    )
+    try:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    model.save(str(args.output))
-    print(f"Saved PPO model to {args.output}")
+        if bool(args.wandb):
+            wandb_module, wandb_run = _init_wandb(args)
+
+        callback_list: list[BaseCallback] = [
+            _RewardBreakdownLoggingCallback()
+        ]
+
+        upload_interval = int(args.wandb_upload_model_interval)
+        if wandb_module is not None and upload_interval > 0:
+            callback_list.append(
+                _WandbModelUploadCallback(
+                    wandb_module=wandb_module,
+                    output_path=args.output,
+                    interval_steps=upload_interval,
+                )
+            )
+
+        learn_callback: BaseCallback | None
+        if not callback_list:
+            learn_callback = None
+        elif len(callback_list) == 1:
+            learn_callback = callback_list[0]
+        else:
+            learn_callback = CallbackList(callback_list)
+
+        model.learn(
+            total_timesteps=int(args.total_timesteps),
+            progress_bar=bool(args.progress_bar),
+            callback=learn_callback,
+        )
+
+        model.save(str(args.output))
+        print(f"Saved PPO model to {args.output}")
+
+        if wandb_module is not None:
+            wandb_module.save(str(_resolved_model_file_path(args.output)))
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 if __name__ == "__main__":

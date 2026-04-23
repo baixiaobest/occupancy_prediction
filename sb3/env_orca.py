@@ -261,10 +261,7 @@ class ORCASB3Env(gym.Env[dict[str, np.ndarray], np.ndarray]):
             new_velocities=new_velocities,
         )
 
-        action_change = 0.0
-        if self._last_commanded_velocity is not None:
-            action_change = float(np.linalg.norm(commanded_velocity - self._last_commanded_velocity))
-        action_change_penalty = -float(self.config.reward.action_change_penalty_weight) * action_change
+        action_change, action_change_penalty = self._compute_action_change_penalty(commanded_velocity)
         reward += action_change_penalty
 
         info["action_change"] = float(action_change)
@@ -401,32 +398,20 @@ class ORCASB3Env(gym.Env[dict[str, np.ndarray], np.ndarray]):
         if self.sim is None:
             raise RuntimeError("Simulator is not initialized")
 
-        reward_cfg = self.config.reward
-        controlled_idx = int(self.config.controlled_agent_index)
+        prev_goal_distance, new_goal_distance, progress = self._compute_progress(prev_positions, new_positions)
+        collision = self._compute_collision(new_positions)
+        controlled_speed, within_goal, stationary, success = self._compute_success_state(
+            new_goal_distance=new_goal_distance,
+            new_velocities=new_velocities,
+        )
 
-        prev_goal_distance = self._goal_distance(prev_positions)
-        new_goal_distance = self._goal_distance(new_positions)
-        progress = prev_goal_distance - new_goal_distance
-
-        controlled_pos = new_positions[controlled_idx]
-        diffs = new_positions - controlled_pos[None, :]
-        dists = np.linalg.norm(diffs, axis=1)
-        self_mask = np.zeros_like(dists, dtype=bool)
-        self_mask[controlled_idx] = True
-        collision = bool(np.any((dists < float(reward_cfg.collision_distance)) & (~self_mask)))
-
-        controlled_speed = float(np.linalg.norm(new_velocities[controlled_idx]))
-        within_goal = bool(new_goal_distance <= float(self.sim.goal_tolerance))
-        stationary = bool(controlled_speed <= float(reward_cfg.success_speed_threshold))
-        success = bool(within_goal and stationary)
-
-        reward = 0.0
-        reward += float(reward_cfg.progress_weight) * float(progress)
-        reward += float(reward_cfg.step_penalty)
-        if collision:
-            reward += float(reward_cfg.collision_penalty)
-        if success:
-            reward += float(reward_cfg.success_reward)
+        reward_terms = {
+            "progress": self._compute_progress_reward(progress),
+            "step_penalty": self._compute_step_penalty_reward(),
+            "collision": self._compute_collision_reward(collision),
+            "success": self._compute_success_reward(success),
+        }
+        reward = float(sum(reward_terms.values()))
 
         info = {
             "success": success,
@@ -436,17 +421,62 @@ class ORCASB3Env(gym.Env[dict[str, np.ndarray], np.ndarray]):
             "controlled_speed": float(controlled_speed),
             "within_goal": bool(within_goal),
             "stationary": bool(stationary),
-            "success_speed_threshold": float(reward_cfg.success_speed_threshold),
+            "success_speed_threshold": float(self.config.reward.success_speed_threshold),
             "progress": float(progress),
-            "reward_terms": {
-                "progress": float(reward_cfg.progress_weight) * float(progress),
-                "step_penalty": float(reward_cfg.step_penalty),
-                "collision": float(reward_cfg.collision_penalty) if collision else 0.0,
-                "success": float(reward_cfg.success_reward) if success else 0.0,
-            },
+            "reward_terms": reward_terms,
         }
         terminated = success
         return float(reward), bool(terminated), info
+
+    def _compute_progress(self, prev_positions: np.ndarray, new_positions: np.ndarray) -> tuple[float, float, float]:
+        prev_goal_distance = self._goal_distance(prev_positions)
+        new_goal_distance = self._goal_distance(new_positions)
+        progress = float(prev_goal_distance - new_goal_distance)
+        return float(prev_goal_distance), float(new_goal_distance), float(progress)
+
+    def _compute_collision(self, new_positions: np.ndarray) -> bool:
+        controlled_idx = int(self.config.controlled_agent_index)
+        controlled_pos = new_positions[controlled_idx]
+        diffs = new_positions - controlled_pos[None, :]
+        dists = np.linalg.norm(diffs, axis=1)
+        self_mask = np.zeros_like(dists, dtype=bool)
+        self_mask[controlled_idx] = True
+        return bool(np.any((dists < float(self.config.reward.collision_distance)) & (~self_mask)))
+
+    def _compute_success_state(
+        self,
+        *,
+        new_goal_distance: float,
+        new_velocities: np.ndarray,
+    ) -> tuple[float, bool, bool, bool]:
+        if self.sim is None:
+            raise RuntimeError("Simulator is not initialized")
+
+        controlled_idx = int(self.config.controlled_agent_index)
+        controlled_speed = float(np.linalg.norm(new_velocities[controlled_idx]))
+        within_goal = bool(new_goal_distance <= float(self.sim.goal_tolerance))
+        stationary = bool(controlled_speed <= float(self.config.reward.success_speed_threshold))
+        success = bool(within_goal and stationary)
+        return float(controlled_speed), bool(within_goal), bool(stationary), bool(success)
+
+    def _compute_progress_reward(self, progress: float) -> float:
+        return float(self.config.reward.progress_weight) * float(progress)
+
+    def _compute_step_penalty_reward(self) -> float:
+        return float(self.config.reward.step_penalty)
+
+    def _compute_collision_reward(self, collision: bool) -> float:
+        return float(self.config.reward.collision_penalty) if collision else 0.0
+
+    def _compute_success_reward(self, success: bool) -> float:
+        return float(self.config.reward.success_reward) if success else 0.0
+
+    def _compute_action_change_penalty(self, commanded_velocity: np.ndarray) -> tuple[float, float]:
+        action_change = 0.0
+        if self._last_commanded_velocity is not None:
+            action_change = float(np.linalg.norm(commanded_velocity - self._last_commanded_velocity))
+        penalty = -float(self.config.reward.action_change_penalty_weight) * float(action_change)
+        return float(action_change), float(penalty)
 
 
 __all__ = [
