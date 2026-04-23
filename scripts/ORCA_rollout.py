@@ -25,7 +25,7 @@ from src.rollout_visualization import (
     prepare_animation_grids,
     prepare_past_future_dynamic_grids,
 )
-from src.templates import cross_templates, default_templates, test_templates, l_shape_templates
+from src.templates import cross_templates, default_templates, test_templates, l_shape_templates, empty_goal_preset_templates
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -33,9 +33,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--template-set",
         type=str,
-        choices=["default", "test", "cross", "l_shape"],
+        choices=["default", "test", "cross", "l_shape", "empty_goal"],
         default="default",
-        help="Template function to use: default_templates, test_templates, or cross_templates.",
+        help="Template function to use: default_templates, test_templates, cross_templates, or empty_goal.",
     )
     parser.add_argument(
         "--animate",
@@ -88,6 +88,8 @@ def _select_templates(template_set: str):
         return cross_templates(), "cross"
     if template_set == "l_shape":
         return l_shape_templates(), "l_shape"
+    if template_set == "empty_goal":
+        return empty_goal_preset_templates(), "empty_goal"
     raise ValueError(f"Unknown template set: {template_set}")
 
 
@@ -106,7 +108,7 @@ def main() -> None:
     # ORCASim configuration constants
     time_step = 0.1
     num_steps = 200
-    neighbor_dist = 1.0
+    neighbor_dist = 3.0
     max_neighbors = 5
     time_horizon = 3.0
     time_horizon_obst = 5.0

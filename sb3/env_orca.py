@@ -16,7 +16,7 @@ class ORCASB3SimConfig:
     """Configuration forwarded to ORCASim for SB3 training."""
 
     time_step: float = 0.1
-    neighbor_dist: float = 1.0
+    neighbor_dist: float = 3.0
     max_neighbors: int = 5
     time_horizon: float = 3.0
     time_horizon_obst: float = 5.0
@@ -45,7 +45,7 @@ class ORCASB3RewardConfig:
     success_reward: float = 5.0
     collision_distance: float = 0.2
     success_speed_threshold: float = 0.1
-    action_change_penalty_weight: float = 0.001
+    action_change_penalty_weight: float = 0.005
 
 
 @dataclass

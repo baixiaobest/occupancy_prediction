@@ -11,10 +11,6 @@ from src.scene_template import (
     CrossShapeCorridorTemplate,
 )
 
-
-EMPTY_GOAL_TEMPLATE_LEVELS = 32
-
-
 def default_templates() -> List[SceneTemplate]:
     """Return premade scene templates used for rollouts.
 
@@ -167,15 +163,27 @@ def empty_goal_templates(
     other_agent_spawn_radius_range: tuple[float, float] = (1.5, 6.0),
     other_agent_goal_distance_range: tuple[float, float] = (2.0, 6.0),
     other_agent_min_start_separation: float = 0.8,
+    num_levels: int = 32,
 ) -> list[SceneTemplate]:
     return [
         EmptySingleAgentGoalTemplate(
             goal_distance_range=goal_distance_range,
-            num_levels=EMPTY_GOAL_TEMPLATE_LEVELS,
             goal_seed=goal_seed,
             num_other_agents=num_other_agents_range,
             other_agent_spawn_radius_range=other_agent_spawn_radius_range,
             other_agent_goal_distance_range=other_agent_goal_distance_range,
             other_agent_min_start_separation=other_agent_min_start_separation,
+            num_levels=num_levels,
         )
     ]
+
+def empty_goal_preset_templates() -> list[SceneTemplate]:
+    return empty_goal_templates(
+        goal_distance_range=(2.0, 8.0),
+        goal_seed=42,
+        num_other_agents_range=(2, 10),
+        other_agent_spawn_radius_range=(2.0, 6.0),
+        other_agent_goal_distance_range=(5.0, 15.0),
+        other_agent_min_start_separation=1.0,
+        num_levels=20,
+    )
