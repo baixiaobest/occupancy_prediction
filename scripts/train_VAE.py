@@ -22,9 +22,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.VAE_prediction import VAEPredictionDecoder, VAEPredictionEncoder
 from src.VAE_prediction import (
-    DEFAULT_DOWNSAMPLE_STRIDES,
     DEFAULT_UPSAMPLE_CHANNELS,
-    DEFAULT_UPSAMPLE_STRIDES,
     build_prediction_vae_models,
 )
 from src.Dataset import build_datasets
@@ -122,11 +120,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-kl", type=float, default=1.0, help="Target KL value used in quadratic KL objective")
     parser.add_argument("--latent-channel", type=int, default=128)
     parser.add_argument(
-        "--channels",
+        "--encoder-channels",
         type=int,
         nargs="+",
         default=[32, 64, 128, 128, 128, 128],
-        help="Encoder channel widths. Must have len(downsample_strides)+1 entries.",
+        help="Encoder channel widths. Number of downsample stages is len(encoder_channels)-1 with fixed stride=2.",
     )
     parser.add_argument("--decoder-base-channels", type=int, default=8)
     parser.add_argument(
@@ -134,7 +132,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         default=[32, 64, 128, 128, 128, 128],
-        help="Decoder context downsample channel widths. Must have len(DEFAULT_DOWNSAMPLE_STRIDES)+1 entries.",
+        help="Decoder context downsample widths. Must match encoder_channels length (fixed stride=2 per stage).",
+    )
+    parser.add_argument(
+        "--upsample-channels",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_UPSAMPLE_CHANNELS),
+        help="Decoder upsample widths. Number of upsample stages is len(upsample_channels)-1 with fixed stride=2.",
     )
     parser.add_argument(
         "--decoder-context-latent-channel",
@@ -152,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--encoder-velocity-condition-channels",
         type=int,
-        default=4,
+        default=2,
         help="Velocity conditioning channel count C1 fused in encoder",
     )
     parser.add_argument(
@@ -235,9 +240,9 @@ class VAETrainer:
             self.args.epochs if self.args.curriculum_epochs <= 0 else self.args.curriculum_epochs
         )
 
-        self.downsample_strides = list(DEFAULT_DOWNSAMPLE_STRIDES)
-        self.upsample_strides = list(DEFAULT_UPSAMPLE_STRIDES)
-        self.upsample_channels = list(DEFAULT_UPSAMPLE_CHANNELS)
+        self.downsample_strides = [(2, 2)] * (len(self.args.encoder_channels) - 1)
+        self.upsample_channels = [int(c) for c in self.args.upsample_channels]
+        self.upsample_strides = [(2, 2)] * (len(self.upsample_channels) - 1)
 
         self.train_loader: DataLoader
         self.val_loader: DataLoader
@@ -344,15 +349,17 @@ class VAETrainer:
         )
 
     def _build_models_and_optimizer(self) -> None:
-        if len(self.args.channels) != len(self.downsample_strides) + 1:
-            raise ValueError("channels must have len(DEFAULT_DOWNSAMPLE_STRIDES)+1 entries")
+        if len(self.args.encoder_channels) < 2:
+            raise ValueError("encoder_channels must include at least 2 entries")
         if (
             self.args.decoder_downsample_channels is not None
-            and len(self.args.decoder_downsample_channels) != len(self.downsample_strides) + 1
+            and len(self.args.decoder_downsample_channels) != len(self.args.encoder_channels)
         ):
             raise ValueError(
-                "decoder_downsample_channels must have len(DEFAULT_DOWNSAMPLE_STRIDES)+1 entries"
+                "decoder_downsample_channels must have the same length as encoder_channels"
             )
+        if len(self.upsample_channels) < 2:
+            raise ValueError("upsample_channels must include at least 2 entries")
 
         self.decoder_context_latent_channel = (
             self.args.decoder_context_latent_channel
@@ -364,7 +371,7 @@ class VAETrainer:
             input_shape=self.input_shape,
             output_shape=self.output_shape,
             latent_channel=self.args.latent_channel,
-            channels=self.args.channels,
+            channels=self.args.encoder_channels,
             decoder_downsample_channels=self.args.decoder_downsample_channels,
             decoder_context_latent_channel=self.decoder_context_latent_channel,
             static_stem_channels=self.args.static_stem_channels,
@@ -415,7 +422,7 @@ class VAETrainer:
                 "target_kl": self.args.target_kl,
                 "curriculum_epochs": self.curriculum_epochs,
                 "latent_channel": self.args.latent_channel,
-                "channels": list(self.args.channels),
+                "channels": list(self.args.encoder_channels),
                 "decoder_base_channels": self.args.decoder_base_channels,
                 "decoder_downsample_channels": (
                     list(self.args.decoder_downsample_channels)

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 
 import numpy as np
+import torch
 
 # Ensure project root is on sys.path so `from src...` works when running this script.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -70,6 +72,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Save each scene immediately as its own .pt file.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Global seed for numpy/random/torch and ORCASim region-pair spawning. "
+            "Template noise seeds remain unchanged."
+        ),
+    )
     return parser
 
 
@@ -104,6 +115,15 @@ def main() -> None:
         os.makedirs(data_dir, exist_ok=True)
 
     animate = bool(args.animate)
+
+    if args.seed is not None:
+        seed = int(args.seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"using global seed: {seed}")
 
     # ORCASim configuration constants
     time_step = 0.1
@@ -151,6 +171,7 @@ def main() -> None:
 
         for local_idx, scene in enumerate(scenes):
             scene_index = global_scene_index
+            region_pair_seed = scene_index if args.seed is None else int(args.seed) + scene_index
             orca_sim = ORCASim(
                 scene=scene,
                 time_step=time_step,
@@ -163,7 +184,7 @@ def main() -> None:
                 goal_tolerance=goal_tolerance,
                 path_goal_switch_tolerance=path_goal_switch_tolerance,
                 path_segment_remaining_switch_ratio=path_segment_remaining_switch_ratio,
-                region_pair_seed=scene_index,
+                region_pair_seed=region_pair_seed,
                 pref_velocity_noise_std=pref_velocity_noise_std,
                 pref_velocity_noise_interval=pref_velocity_noise_interval,
                 pref_velocity_noise_seed=pref_velocity_noise_seed + scene_index,

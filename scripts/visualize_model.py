@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict
 import os
+import pickle
 import sys
-from pathlib import Path
+from pathlib import Path, PosixPath
 from typing import Sequence
 
 import matplotlib.pyplot as plt
@@ -20,6 +21,59 @@ from src.VAE_prediction import (
     build_prediction_vae_models,
 )
 from src.rollout_data import RollOutData, SceneRollOutData
+
+
+def _torch_load_compatible(
+    file_path: Path,
+    map_location: str | torch.device,
+    *,
+    mmap: bool = False,
+) -> object:
+    """Load torch checkpoint across PyTorch versions.
+
+    PyTorch 2.6 changed torch.load default to weights_only=True. We attempt a
+    safe load first (allowlisting PosixPath metadata), then fall back to full
+    pickle load only when needed.
+    """
+
+    def _load(*, weights_only: bool | None, use_mmap: bool) -> object:
+        kwargs: dict[str, object] = {"map_location": map_location}
+        if use_mmap:
+            kwargs["mmap"] = True
+        if weights_only is not None:
+            kwargs["weights_only"] = weights_only
+        return torch.load(file_path, **kwargs)
+
+    def _load_with_optional_mmap(*, weights_only: bool | None) -> object:
+        try:
+            return _load(weights_only=weights_only, use_mmap=mmap)
+        except TypeError:
+            return _load(weights_only=weights_only, use_mmap=False)
+
+    # 1) Preferred path: safe weights-only load with PosixPath allowlisted.
+    safe_globals = getattr(torch.serialization, "safe_globals", None)
+    try:
+        if safe_globals is None:
+            return _load_with_optional_mmap(weights_only=True)
+        with safe_globals([PosixPath]):
+            return _load_with_optional_mmap(weights_only=True)
+    except TypeError:
+        # Older PyTorch without weights_only support.
+        return _load_with_optional_mmap(weights_only=None)
+    except pickle.UnpicklingError as exc:
+        if "Weights only load failed" not in str(exc):
+            raise
+
+    # 2) Trusted fallback: full pickle load.
+    print(
+        "Warning: checkpoint/data requires full pickle load "
+        "(weights_only=False). Only continue if the file is trusted."
+    )
+    try:
+        return _load_with_optional_mmap(weights_only=False)
+    except TypeError:
+        # Very old versions may not accept weights_only even when False.
+        return _load_with_optional_mmap(weights_only=None)
 
 def _coerce_stride_list(raw: object) -> list[tuple[int, int]]:
     if raw is None:
@@ -62,10 +116,7 @@ def load_scene_origins(
     uses a fixed anchor center to slice a local window, so it is not a moving frame.
     """
     try:
-        try:
-            payload = torch.load(pt_path, map_location="cpu", mmap=True)
-        except TypeError:
-            payload = torch.load(pt_path, map_location="cpu")
+        payload = _torch_load_compatible(pt_path, map_location="cpu", mmap=True)
     except AttributeError as exc:
         raise ValueError(
             f"Failed to load {pt_path}: legacy rollout format is no longer supported. "
@@ -249,7 +300,7 @@ def build_models(
     device: torch.device,
 ) -> tuple[VAEPredictionDecoder, int, int, tuple[int, int, int], int]:
     """Construct decoder from checkpoint config and load checkpoint weights."""
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt = _torch_load_compatible(checkpoint_path, map_location=device)
     if not isinstance(ckpt, dict):
         raise ValueError("Checkpoint must be a dict with model config and state dicts")
     model_cfg = ckpt.get("model_config")

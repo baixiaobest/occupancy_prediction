@@ -118,9 +118,7 @@ def test_templates():
         num_levels=3,
     )
 
-    # return [straight_template, l_template, t_template, cross_template]
-    return [t_template]
-
+    return [straight_template, l_template, t_template, cross_template]
 
 def cross_templates() -> SceneTemplate:
     cross = CrossShapeCorridorTemplate(
