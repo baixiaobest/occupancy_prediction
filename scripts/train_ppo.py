@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import gymnasium as gym
 import numpy as np
 import torch
 
@@ -26,6 +27,7 @@ from src.templates import (
 )
 
 from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
+from sb3.minimal_policy import MinimalActorCriticPolicy
 from sb3.policy import OccupancyActorCriticPolicy
 from src.training_profiler import RunProfiler
 
@@ -69,6 +71,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--actor-hidden-dims", type=int, nargs="+", default=[64, 64])
     parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=[64, 64])
+    parser.add_argument("--policy", choices=["occupancy", "minimal"], default="occupancy")
 
     parser.add_argument("--total-timesteps", type=int, default=300000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -235,6 +238,25 @@ def _resolved_model_file_path(path: Path) -> Path:
     return path if path.suffix == ".zip" else Path(f"{path}.zip")
 
 
+class _MinimalObsWrapper(gym.ObservationWrapper):
+    """Project dict observation to a compact 6D vector for minimal policy training."""
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(6,),
+            dtype=np.float32,
+        )
+
+    def observation(self, observation: dict[str, np.ndarray]) -> np.ndarray:
+        goal = np.asarray(observation["goal_position"], dtype=np.float32).reshape(2)
+        current_velocity = np.asarray(observation["current_velocity"], dtype=np.float32).reshape(2)
+        last_commanded_velocity = np.asarray(observation["last_commanded_velocity"], dtype=np.float32).reshape(2)
+        return np.concatenate([goal, current_velocity, last_commanded_velocity], axis=0).astype(np.float32, copy=False)
+
+
 class _WandbModelUploadCallback(BaseCallback):
     def __init__(self, *, wandb_module: Any, output_path: Path, interval_steps: int) -> None:
         super().__init__(verbose=0)
@@ -379,16 +401,22 @@ def main() -> None:
 
     env = ORCASB3Env(scene_factory=scene_factory, config=env_cfg)
 
-    policy_kwargs = {
+    policy_name = str(args.policy)
+    policy_kwargs: dict[str, Any] = {
         "actor_hidden_dims": [int(v) for v in args.actor_hidden_dims],
         "critic_hidden_dims": [int(v) for v in args.critic_hidden_dims],
         "actor_activation_fn": torch.nn.Tanh,
         "critic_activation_fn": torch.nn.Tanh,
-        "map_conv_channels": [8, 8, 16, 16, 32, 32],
     }
+    if policy_name == "minimal":
+        env = _MinimalObsWrapper(env)
+        policy_cls: type = MinimalActorCriticPolicy
+    else:
+        policy_cls = OccupancyActorCriticPolicy
+        policy_kwargs["map_conv_channels"] = [8, 8, 16, 16, 32, 32]
 
     model = PPO(
-        policy=OccupancyActorCriticPolicy,
+        policy=policy_cls,
         env=env,
         learning_rate=float(args.learning_rate),
         n_steps=int(args.n_steps),
