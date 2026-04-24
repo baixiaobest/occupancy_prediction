@@ -72,6 +72,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--actor-hidden-dims", type=int, nargs="+", default=[64, 64])
     parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=[64, 64])
     parser.add_argument("--policy", choices=["occupancy", "minimal"], default="occupancy")
+    parser.add_argument("--map-extractor-type", choices=["conv", "vae_tap"], default="conv")
+    parser.add_argument("--vae-checkpoint", type=Path, default=None)
+    parser.add_argument("--vae-tap-layer", type=int, default=1)
 
     parser.add_argument("--total-timesteps", type=int, default=300000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -238,6 +241,27 @@ def _resolved_model_file_path(path: Path) -> Path:
     return path if path.suffix == ".zip" else Path(f"{path}.zip")
 
 
+def _load_decoder_context_len_from_checkpoint(checkpoint_path: Path) -> int:
+    try:
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError("VAE checkpoint must be a dict")
+    model_cfg = payload.get("model_config")
+    if not isinstance(model_cfg, dict):
+        raise ValueError("VAE checkpoint must contain dict key 'model_config'")
+
+    if "decoder_context_len" not in model_cfg:
+        raise ValueError(
+            "VAE checkpoint model_config must contain key 'decoder_context_len'"
+        )
+
+    context_len = int(model_cfg["decoder_context_len"])
+
+    return context_len
+
+
 class _MinimalObsWrapper(gym.ObservationWrapper):
     """Project dict observation to a compact 6D vector for minimal policy training."""
 
@@ -399,9 +423,14 @@ def main() -> None:
         reward=reward_cfg,
     )
 
+    policy_name = str(args.policy)
+    if policy_name == "occupancy" and str(args.map_extractor_type) == "vae_tap":
+        if args.vae_checkpoint is None:
+            raise ValueError("--vae-checkpoint is required when --map-extractor-type vae_tap")
+        env_cfg.occupancy.dynamic_context_len = _load_decoder_context_len_from_checkpoint(args.vae_checkpoint)
+
     env = ORCASB3Env(scene_factory=scene_factory, config=env_cfg)
 
-    policy_name = str(args.policy)
     policy_kwargs: dict[str, Any] = {
         "actor_hidden_dims": [int(v) for v in args.actor_hidden_dims],
         "critic_hidden_dims": [int(v) for v in args.critic_hidden_dims],
@@ -413,7 +442,17 @@ def main() -> None:
         policy_cls: type = MinimalActorCriticPolicy
     else:
         policy_cls = OccupancyActorCriticPolicy
-        policy_kwargs["map_conv_channels"] = [8, 8, 16, 16, 32, 32]
+        map_extractor_type = str(args.map_extractor_type)
+        policy_kwargs["map_extractor_type"] = map_extractor_type
+        if map_extractor_type == "vae_tap":
+            if args.vae_checkpoint is None:
+                raise ValueError("--vae-checkpoint is required when --map-extractor-type vae_tap")
+            policy_kwargs["vae_checkpoint"] = str(args.vae_checkpoint)
+            policy_kwargs["vae_tap_layer"] = (
+                None if args.vae_tap_layer is None else int(args.vae_tap_layer)
+            )
+        else:
+            policy_kwargs["map_conv_channels"] = [8, 8, 16, 16, 32, 32]
 
     model = PPO(
         policy=policy_cls,

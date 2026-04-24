@@ -362,7 +362,7 @@ class VAEPredictionDecoder(nn.Module):
 
     def _validate_tap_layer(self, tap_layer: int) -> int:
         tap_layer_idx = int(tap_layer)
-        if tap_layer_idx < 1 or tap_layer_idx > len(self.upsample_blocks):
+        if tap_layer_idx < 0 or tap_layer_idx > len(self.upsample_blocks)-1:
             raise ValueError(
                 f"tap_layer must be in [1, {len(self.upsample_blocks)}], got {tap_layer_idx}"
             )
@@ -376,6 +376,7 @@ class VAEPredictionDecoder(nn.Module):
         current_velocity: torch.Tensor | None = None,
         current_position_offset: torch.Tensor | None = None,
         tap_layer: int | None = None,
+        tap_only: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         static_x = self._validate_decoder_inputs(z, dynamic_context, static_x)
         tap_layer_idx: int | None = None
@@ -418,10 +419,13 @@ class VAEPredictionDecoder(nn.Module):
 
         h = self.input_proj(_pack_video_time_to_channel(merged))
         tapped_feature: torch.Tensor | None = None
-        for layer_idx, up_block in enumerate(self.upsample_blocks, start=1):
-            h = up_block(h)
+        for layer_idx, up_block in enumerate(self.upsample_blocks):
             if tap_layer_idx is not None and layer_idx == tap_layer_idx:
                 tapped_feature = h
+                if tap_only:
+                    return tapped_feature
+            h = up_block(h)
+            
         h = _unpack_channel_to_video(self.to_output(h), self.output_shape[1])
 
         h = _resize_video_spatial(h, (self.output_shape[2], self.output_shape[3]))
