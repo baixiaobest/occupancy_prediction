@@ -51,16 +51,13 @@ def _unpack_channel_to_video(x: torch.Tensor, time_steps: int) -> torch.Tensor:
     return x.view(b, c_per_t, time_steps, h, w).contiguous()
 
 
-def _resize_video_spatial(x: torch.Tensor, out_hw: tuple[int, int]) -> torch.Tensor:
+def _check_size(x: torch.Tensor, out_hw: tuple[int, int]) -> torch.Tensor:
     b, c, t, h, w = x.shape
-    y = F.interpolate(
-        x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w),
-        size=out_hw,
-        mode="bilinear",
-        align_corners=False,
-    )
-    _, c_out, h_out, w_out = y.shape
-    return y.view(b, t, c_out, h_out, w_out).permute(0, 2, 1, 3, 4).contiguous()
+    out_h, out_w = int(out_hw[0]), int(out_hw[1])
+    if h == out_h and w == out_w:
+        return x
+
+    raise ValueError(f"Expected input with spatial size ({out_h}, {out_w}), got ({h}, {w})")
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -80,13 +77,13 @@ class _DownsampleBlock2d(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        # self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        # self.bn2 = nn.BatchNorm2d(out_channels)
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.act(self.bn1(self.conv1(x)))
-        out = self.act(self.bn2(self.conv2(out)))
+        # out = self.act(self.bn2(self.conv2(out)))
         return out
 
 
@@ -104,13 +101,13 @@ class _UpsampleBlock2d(nn.Module):
             bias=False,
         )
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        # self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        # self.bn2 = nn.BatchNorm2d(out_channels)
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.act(self.bn1(self.conv1(x)))
-        out = self.act(self.bn2(self.conv2(out)))
+        # out = self.act(self.bn2(self.conv2(out)))
         return out
 
 
@@ -119,7 +116,7 @@ __all__ = [
     "_to_stride2",
     "_pack_video_time_to_channel",
     "_unpack_channel_to_video",
-    "_resize_video_spatial",
+    "_check_size",
     "_downsample_hw",
     "_DownsampleBlock2d",
     "_UpsampleBlock2d",

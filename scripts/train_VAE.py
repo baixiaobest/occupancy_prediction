@@ -336,7 +336,8 @@ class VAETrainer:
         _, enc_t, h, w = sample_x_encoder_dynamic.shape
         _, dec_ctx_t, _, _ = sample_x_decoder_dynamic.shape
         self.input_shape = (1, enc_t, h, w)
-        self.output_shape = (1, sample_y.shape[1], h, w)
+        # Decoder predicts one future frame per autoregressive step.
+        self.output_shape = (1, 1, h, w)
         self.decoder_context_frames = dec_ctx_t
 
         self.log(
@@ -465,14 +466,13 @@ class VAETrainer:
         batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run one autoregressive decoder step and return per-sample losses + next context."""
-        logits_full = self.decoder(
+        logits_step = self.decoder(
             z_step,
             context_step,
             static_step,
             step_velocity,
             step_position_offset,
         )
-        logits_step = logits_full[:, :, :1]
 
         if self.args.recon_loss_type == "focal":
             step_recon_cells = weighted_focal_recon_loss(

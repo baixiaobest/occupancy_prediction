@@ -11,7 +11,7 @@ from .network_common import (
     _DownsampleBlock2d,
     _UpsampleBlock2d,
     _pack_video_time_to_channel,
-    _resize_video_spatial,
+    _check_size,
     _to_stride2,
     _unpack_channel_to_video,
 )
@@ -283,12 +283,7 @@ class VAEPredictionDecoder(nn.Module):
         else:
             self.position_mlp = None
         context_down_blocks: list[nn.Module] = []
-        in_ch = (
-            self.downsample_channels[0]
-            + self.static_stem_channels
-            + self.velocity_condition_channels
-            + self.position_condition_channels
-        )
+        in_ch = self.downsample_channels[0] + self.static_stem_channels
         for out_ch, stride in zip(self.downsample_channels[1:], context_stride_list):
             context_down_blocks.append(_DownsampleBlock2d(in_ch, out_ch, stride=stride))
             in_ch = out_ch
@@ -299,7 +294,12 @@ class VAEPredictionDecoder(nn.Module):
             kernel_size=1,
         )
 
-        merged_channels = self.latent_channels + self.context_latent_channels
+        merged_channels = (
+            self.latent_channels
+            + self.context_latent_channels
+            + self.velocity_condition_channels
+            + self.position_condition_channels
+        )
         self.input_proj = nn.Conv2d(merged_channels, upsample_channels[0], kernel_size=1)
 
         self.upsample_blocks = nn.ModuleList(
@@ -392,30 +392,30 @@ class VAEPredictionDecoder(nn.Module):
         velocity_vec = velocity_vec / float(HUMAN_WALKING_SPEED_MPS)
         cond_parts = [cond_dyn, cond_static]
 
-        if self.velocity_condition_channels > 0:
-            velocity_embed = self.velocity_mlp(velocity_vec)
-            velocity_map = velocity_embed.view(velocity_embed.shape[0], velocity_embed.shape[1], 1, 1)
-            velocity_map = velocity_map.expand(-1, -1, cond_dyn.shape[2], cond_dyn.shape[3])
-            cond_parts.append(velocity_map)
-
         if current_position_offset is None:
             position_vec = torch.zeros((dynamic_context.shape[0], 2), dtype=torch.float32, device=dynamic_context.device)
         else:
             position_vec = torch.as_tensor(current_position_offset, dtype=torch.float32, device=dynamic_context.device)
 
-        if self.position_condition_channels > 0:
-            position_embed = self.position_mlp(position_vec)
-            position_map = position_embed.view(position_embed.shape[0], position_embed.shape[1], 1, 1)
-            position_map = position_map.expand(-1, -1, cond_dyn.shape[2], cond_dyn.shape[3])
-            cond_parts.append(position_map)
-
         cond = torch.cat(cond_parts, dim=1)
         for down_block in self.context_down_blocks:
             cond = down_block(cond)
         cond = self.context_to_latent(cond).unsqueeze(2)
-        cond = _resize_video_spatial(cond, (z.shape[3], z.shape[4]))
+        cond = _check_size(cond, (z.shape[3], z.shape[4]))
 
-        merged = torch.cat([z, cond], dim=1)
+        merged_parts = [z, cond]
+        if self.velocity_condition_channels > 0:
+            velocity_embed = self.velocity_mlp(velocity_vec)
+            velocity_map = velocity_embed.view(velocity_embed.shape[0], velocity_embed.shape[1], 1, 1)
+            velocity_map = velocity_map.expand(-1, -1, z.shape[3], z.shape[4]).unsqueeze(2)
+            merged_parts.append(velocity_map)
+        if self.position_condition_channels > 0:
+            position_embed = self.position_mlp(position_vec)
+            position_map = position_embed.view(position_embed.shape[0], position_embed.shape[1], 1, 1)
+            position_map = position_map.expand(-1, -1, z.shape[3], z.shape[4]).unsqueeze(2)
+            merged_parts.append(position_map)
+
+        merged = torch.cat(merged_parts, dim=1)
 
         h = self.input_proj(_pack_video_time_to_channel(merged))
         tapped_feature: torch.Tensor | None = None
@@ -428,7 +428,7 @@ class VAEPredictionDecoder(nn.Module):
             
         h = _unpack_channel_to_video(self.to_output(h), self.output_shape[1])
 
-        h = _resize_video_spatial(h, (self.output_shape[2], self.output_shape[3]))
+        h = _check_size(h, (self.output_shape[2], self.output_shape[3]))
         if tap_layer_idx is not None:
             if tapped_feature is None:
                 raise RuntimeError("tap feature was not captured; check tap_layer value")
