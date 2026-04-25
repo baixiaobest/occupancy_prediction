@@ -31,10 +31,13 @@ from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCA
 
 try:
     from stable_baselines3 import PPO
+    from stable_baselines3.common.save_util import load_from_zip_file
 except ImportError as exc:  # pragma: no cover - runtime dependency
     raise ImportError(
         "stable_baselines3 is required. Install with: pip install stable-baselines3[extra]"
     ) from exc
+
+from sb3.utils import load_decoder_context_len_from_checkpoint
 
 
 @dataclass
@@ -219,11 +222,42 @@ def _build_env_for_scene(*, scene: Scene, config: ORCASB3EnvConfig) -> ORCASB3En
     )
 
 
-def _load_ppo_model(checkpoint_path: Path, device: str) -> PPO:
+def _build_custom_objects_for_vae_override(
+    *,
+    resolved_checkpoint_path: Path,
+    vae_checkpoint_override: Path | None,
+) -> dict[str, Any] | None:
+    if vae_checkpoint_override is None:
+        return None
+
+    override_path = vae_checkpoint_override.expanduser().resolve()
+
+    data, _, _ = load_from_zip_file(str(resolved_checkpoint_path), device="cpu")
+
+    raw_policy_kwargs = data.get("policy_kwargs")
+
+    policy_kwargs = dict(raw_policy_kwargs)
+
+    policy_kwargs["vae_checkpoint"] = str(override_path)
+    print(f"Overriding VAE checkpoint path from model metadata: {override_path}")
+    return {"policy_kwargs": policy_kwargs}
+
+
+def _load_ppo_model(
+    checkpoint_path: Path,
+    device: str,
+    *,
+    vae_checkpoint_override: Path | None = None,
+) -> PPO:
     resolved = _resolve_checkpoint_path(checkpoint_path)
+    custom_objects = _build_custom_objects_for_vae_override(
+        resolved_checkpoint_path=resolved,
+        vae_checkpoint_override=vae_checkpoint_override,
+    )
     model = PPO.load(
         str(resolved),
         device=device,
+        custom_objects=custom_objects,
     )
     model.policy.set_training_mode(False)
     return model
@@ -500,6 +534,15 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--vae-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional override for checkpoint-embedded vae_checkpoint path when using "
+            "map_extractor_type=vae_tap."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -520,7 +563,11 @@ def main() -> None:
     if float(args.empty_goal_other_min_start_separation) < 0.0:
         raise ValueError("--empty-goal-other-min-start-separation must be >= 0")
 
-    model = _load_ppo_model(args.checkpoint, device=str(args.device))
+    model = _load_ppo_model(
+        args.checkpoint,
+        device=str(args.device),
+        vae_checkpoint_override=args.vae_checkpoint,
+    )
 
     goal_range = (float(args.goal_distance_range[0]), float(args.goal_distance_range[1]))
     other_spawn_radius_range = (
@@ -556,6 +603,10 @@ def main() -> None:
             collision_distance=float(args.collision_distance),
         ),
     )
+
+    if args.vae_checkpoint is not None:
+        context_len = load_decoder_context_len_from_checkpoint(args.vae_checkpoint)
+        env_config.occupancy.dynamic_context_len = context_len
 
     variants_per_scene = int(args.scenario_variants_per_scene)
     total_setups = len(scenes) * variants_per_scene

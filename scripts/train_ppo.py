@@ -29,6 +29,7 @@ from src.templates import (
 from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
 from sb3.minimal_policy import MinimalActorCriticPolicy
 from sb3.policy import OccupancyActorCriticPolicy
+from sb3.utils import load_decoder_context_len_from_checkpoint
 from src.training_profiler import RunProfiler
 
 try:
@@ -241,27 +242,6 @@ def _resolved_model_file_path(path: Path) -> Path:
     return path if path.suffix == ".zip" else Path(f"{path}.zip")
 
 
-def _load_decoder_context_len_from_checkpoint(checkpoint_path: Path) -> int:
-    try:
-        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(checkpoint_path, map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError("VAE checkpoint must be a dict")
-    model_cfg = payload.get("model_config")
-    if not isinstance(model_cfg, dict):
-        raise ValueError("VAE checkpoint must contain dict key 'model_config'")
-
-    if "decoder_context_len" not in model_cfg:
-        raise ValueError(
-            "VAE checkpoint model_config must contain key 'decoder_context_len'"
-        )
-
-    context_len = int(model_cfg["decoder_context_len"])
-
-    return context_len
-
-
 class _MinimalObsWrapper(gym.ObservationWrapper):
     """Project dict observation to a compact 6D vector for minimal policy training."""
 
@@ -427,7 +407,7 @@ def main() -> None:
     if policy_name == "occupancy" and str(args.map_extractor_type) == "vae_tap":
         if args.vae_checkpoint is None:
             raise ValueError("--vae-checkpoint is required when --map-extractor-type vae_tap")
-        env_cfg.occupancy.dynamic_context_len = _load_decoder_context_len_from_checkpoint(args.vae_checkpoint)
+        env_cfg.occupancy.dynamic_context_len = load_decoder_context_len_from_checkpoint(args.vae_checkpoint)
 
     env = ORCASB3Env(scene_factory=scene_factory, config=env_cfg)
 
