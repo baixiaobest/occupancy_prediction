@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import datetime as dt
 import importlib
 import os
@@ -10,7 +9,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import gymnasium as gym
 import numpy as np
 import torch
 
@@ -26,10 +24,11 @@ from src.templates import (
     test_templates,
 )
 
-from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
+from sb3.env_orca import ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
 from sb3.minimal_policy import MinimalActorCriticPolicy
 from sb3.policy import OccupancyActorCriticPolicy
 from sb3.utils import load_decoder_context_len_from_checkpoint
+from sb3.vec_env_orca import build_orca_vec_env
 from src.training_profiler import RunProfiler
 
 try:
@@ -94,6 +93,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-bar", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tensorboard-log", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/sb3_ppo_orca"))
+    parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument("--vec-env", choices=["dummy", "subproc"], default="dummy")
 
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--wandb-project", type=str, default="occupancy-prediction-rl")
@@ -164,32 +165,6 @@ def _build_scene_pool(
     return scenes
 
 
-def _make_scene_factory(
-    scenes: list[Scene],
-    *,
-    selection: str,
-    fixed_scene_index: int,
-    seed: int,
-):
-    rng = random.Random(int(seed))
-    scene_count = len(scenes)
-    fixed_idx = int(fixed_scene_index) % scene_count
-    next_idx = 0
-
-    def factory() -> Scene:
-        nonlocal next_idx
-        if selection == "fixed":
-            scene = scenes[fixed_idx]
-        elif selection == "cycle":
-            scene = scenes[next_idx % scene_count]
-            next_idx += 1
-        else:
-            scene = scenes[rng.randrange(scene_count)]
-        return copy.deepcopy(scene)
-
-    return factory
-
-
 def _wandb_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     config: dict[str, Any] = {}
     for key, value in vars(args).items():
@@ -240,25 +215,6 @@ def _init_wandb(args: argparse.Namespace):
 
 def _resolved_model_file_path(path: Path) -> Path:
     return path if path.suffix == ".zip" else Path(f"{path}.zip")
-
-
-class _MinimalObsWrapper(gym.ObservationWrapper):
-    """Project dict observation to a compact 6D vector for minimal policy training."""
-
-    def __init__(self, env: gym.Env):
-        super().__init__(env)
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(6,),
-            dtype=np.float32,
-        )
-
-    def observation(self, observation: dict[str, np.ndarray]) -> np.ndarray:
-        goal = np.asarray(observation["goal_position"], dtype=np.float32).reshape(2)
-        current_velocity = np.asarray(observation["current_velocity"], dtype=np.float32).reshape(2)
-        last_commanded_velocity = np.asarray(observation["last_commanded_velocity"], dtype=np.float32).reshape(2)
-        return np.concatenate([goal, current_velocity, last_commanded_velocity], axis=0).astype(np.float32, copy=False)
 
 
 class _WandbModelUploadCallback(BaseCallback):
@@ -378,13 +334,6 @@ def main() -> None:
         empty_goal_other_min_start_separation=float(args.empty_goal_other_min_start_separation),
     )
 
-    scene_factory = _make_scene_factory(
-        scenes,
-        selection=str(args.scene_selection),
-        fixed_scene_index=int(args.fixed_scene_index),
-        seed=int(args.seed),
-    )
-
     sim_cfg = ORCASB3SimConfig(
         max_speed=float(args.max_speed),
         goal_tolerance=float(args.goal_tolerance),
@@ -409,7 +358,17 @@ def main() -> None:
             raise ValueError("--vae-checkpoint is required when --map-extractor-type vae_tap")
         env_cfg.occupancy.dynamic_context_len = load_decoder_context_len_from_checkpoint(args.vae_checkpoint)
 
-    env = ORCASB3Env(scene_factory=scene_factory, config=env_cfg)
+    env = build_orca_vec_env(
+        scenes=scenes,
+        selection=str(args.scene_selection),
+        fixed_scene_index=int(args.fixed_scene_index),
+        seed=int(args.seed),
+        num_envs=int(args.num_envs),
+        env_config=env_cfg,
+        backend=str(args.vec_env),
+        minimal_observation=(policy_name == "minimal"),
+        start_method=None,
+    )
 
     policy_kwargs: dict[str, Any] = {
         "actor_hidden_dims": [int(v) for v in args.actor_hidden_dims],
@@ -418,7 +377,6 @@ def main() -> None:
         "critic_activation_fn": torch.nn.Tanh,
     }
     if policy_name == "minimal":
-        env = _MinimalObsWrapper(env)
         policy_cls: type = MinimalActorCriticPolicy
     else:
         policy_cls = OccupancyActorCriticPolicy
@@ -495,6 +453,7 @@ def main() -> None:
         if wandb_module is not None:
             wandb_module.save(str(_resolved_model_file_path(args.output)))
     finally:
+        env.close()
         if wandb_run is not None:
             wandb_run.finish()
         profiler.stop()

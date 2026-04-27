@@ -19,6 +19,7 @@ except ImportError:
 
 from ..networks.q_network import build_q_network
 from ...scene import Scene
+from ...scene_sampling import make_scene_factory
 from ..networks.simple_q_network import build_simple_q_network
 from ..networks.simple_proposal_network import build_simple_proposal_network
 from ...templates import cross_templates, default_templates, empty_goal_templates, l_shape_templates, test_templates
@@ -104,34 +105,6 @@ def _build_empty_goal_scene_pool(
     if not scenes:
         raise ValueError("No scenes generated for empty_goal template")
     return scenes
-
-
-def _make_scene_factory(
-    scenes: list[Scene],
-    *,
-    selection: str,
-    fixed_scene_index: int,
-    seed: int,
-):
-    rng = random.Random(int(seed))
-    scene_count = len(scenes)
-    if scene_count == 0:
-        raise ValueError("scenes must not be empty")
-    fixed_idx = int(fixed_scene_index) % scene_count
-    next_idx = 0
-
-    def factory() -> Scene:
-        nonlocal next_idx
-        if selection == "fixed":
-            scene = scenes[fixed_idx]
-        elif selection == "cycle":
-            scene = scenes[next_idx % scene_count]
-            next_idx += 1
-        else:
-            scene = scenes[rng.randrange(scene_count)]
-        return copy.deepcopy(scene)
-
-    return factory
 
 
 def _seed_everything(seed: int) -> None:
@@ -339,7 +312,7 @@ class RLTrainingApp:
             goal_distance_range=(goal_distance_range[0], goal_distance_range[1]),
             goal_seed=int(self.args.seed),
         )
-        scene_factory = _make_scene_factory(
+        scene_factory = make_scene_factory(
             self.scenes,
             selection=str(self.args.scene_selection),
             fixed_scene_index=int(self.args.fixed_scene_index),
@@ -434,7 +407,7 @@ class RLTrainingApp:
         )
         self.sim_config = ORCASimConfig(time_step=0.1)
         self.scenes = _build_scene_pool(self.args.template_set)
-        scene_factory = _make_scene_factory(
+        scene_factory = make_scene_factory(
             self.scenes,
             selection=self.args.scene_selection,
             fixed_scene_index=int(self.args.fixed_scene_index),
@@ -625,7 +598,7 @@ class RLTrainingApp:
             raise RuntimeError("Q network must be initialized before evaluation")
 
         eval_seed_base = int(self.args.seed) + int(self.args.eval_seed_offset)
-        eval_scene_factory = _make_scene_factory(
+        eval_scene_factory = make_scene_factory(
             self.scenes,
             selection=str(self.args.eval_scene_selection),
             fixed_scene_index=int(self.args.fixed_scene_index),

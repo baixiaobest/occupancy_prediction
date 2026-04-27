@@ -86,35 +86,6 @@ def _build_empty_goal_scene_pool(
 
 
 
-def _make_scene_factory(
-    scenes: list[Scene],
-    *,
-    selection: str,
-    fixed_scene_index: int,
-    seed: int,
-):
-    rng = random.Random(int(seed))
-    scene_count = len(scenes)
-    if scene_count == 0:
-        raise ValueError("scenes must not be empty")
-
-    fixed_idx = int(fixed_scene_index) % scene_count
-    next_idx = 0
-
-    def factory() -> Scene:
-        nonlocal next_idx
-        if selection == "fixed":
-            scene = scenes[fixed_idx]
-        elif selection == "cycle":
-            scene = scenes[next_idx % scene_count]
-            next_idx += 1
-        else:
-            scene = scenes[rng.randrange(scene_count)]
-        return copy.deepcopy(scene)
-
-    return factory
-
-
 
 def _load_simple_q_checkpoint(
     checkpoint_path: Path,
