@@ -11,7 +11,7 @@ pytest.importorskip("stable_baselines3")
 
 import gymnasium as gym
 
-from sb3.policy import OccupancyActorCriticPolicy
+from src.sb3.policy import OccupancyActorCriticPolicy
 
 
 class _DummyOccupancyDictEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):

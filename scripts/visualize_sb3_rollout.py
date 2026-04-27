@@ -27,7 +27,7 @@ from src.templates import (
     l_shape_templates,
     test_templates,
 )
-from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
+from src.sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
 
 try:
     from stable_baselines3 import PPO
@@ -37,7 +37,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
         "stable_baselines3 is required. Install with: pip install stable-baselines3[extra]"
     ) from exc
 
-from sb3.utils import load_decoder_context_len_from_checkpoint
+from src.sb3.utils import load_decoder_context_len_from_checkpoint
 
 
 @dataclass

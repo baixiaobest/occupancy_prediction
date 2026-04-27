@@ -24,11 +24,11 @@ from src.templates import (
     test_templates,
 )
 
-from sb3.env_orca import ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
-from sb3.minimal_policy import MinimalActorCriticPolicy
-from sb3.policy import OccupancyActorCriticPolicy
-from sb3.utils import load_decoder_context_len_from_checkpoint
-from sb3.vec_env_orca import build_orca_vec_env
+from src.sb3.env_orca import ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
+from src.sb3.minimal_policy import MinimalActorCriticPolicy
+from src.sb3.policy import OccupancyActorCriticPolicy
+from src.sb3.utils import load_decoder_context_len_from_checkpoint
+from src.sb3.vec_env_orca import build_orca_vec_env
 from src.training_profiler import RunProfiler
 
 try:

@@ -12,7 +12,7 @@ pytest.importorskip("gymnasium")
 
 from src.scene import Scene
 from src.templates import empty_goal_templates
-from sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
+from src.sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
 
 
 def _single_empty_goal_scene() -> Scene:
@@ -87,7 +87,7 @@ def test_sb3_ppo_wiring_runs_short_rollout() -> None:
     sb3 = pytest.importorskip("stable_baselines3")
     ppo_cls = sb3.PPO
 
-    from sb3.policy import OccupancyActorCriticPolicy
+    from src.sb3.policy import OccupancyActorCriticPolicy
 
     base_scene = _single_empty_goal_scene()
 
