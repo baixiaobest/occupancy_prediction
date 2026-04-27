@@ -4,26 +4,16 @@ import argparse
 import datetime as dt
 import importlib
 import os
-import random
 import sys
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
 # Allow running this script directly from the repository root.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.scene import Scene
-from src.templates import (
-    cross_templates,
-    default_templates,
-    empty_goal_templates,
-    l_shape_templates,
-    test_templates,
-)
-
+from src.experiment_utils import EmptyGoalTemplateConfig, build_scene_pool, seed_everything
 from src.sb3.env_orca import ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
 from src.sb3.minimal_policy import MinimalActorCriticPolicy
 from src.sb3.policy import OccupancyActorCriticPolicy
@@ -110,59 +100,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-output", type=Path, default=Path("profiles/train_ppo.prof"))
 
     return parser.parse_args()
-
-
-def _seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _select_templates(template_set: str):
-    if template_set == "default":
-        return default_templates()
-    if template_set == "test":
-        return test_templates()
-    if template_set == "cross":
-        return cross_templates()
-    if template_set == "l_shape":
-        return l_shape_templates()
-    if template_set == "empty_goal":
-        return empty_goal_templates()
-    raise ValueError(f"Unknown template set: {template_set}")
-
-
-def _build_scene_pool(
-    *,
-    template_set: str,
-    goal_distance_range: tuple[float, float],
-    seed: int,
-    empty_goal_other_agents_range: tuple[int, int],
-    empty_goal_other_spawn_radius_range: tuple[float, float],
-    empty_goal_other_goal_distance_range: tuple[float, float],
-    empty_goal_other_min_start_separation: float,
-) -> list[Scene]:
-    if template_set == "empty_goal":
-        templates = empty_goal_templates(
-            goal_distance_range=goal_distance_range,
-            goal_seed=seed,
-            num_other_agents_range=empty_goal_other_agents_range,
-            other_agent_spawn_radius_range=empty_goal_other_spawn_radius_range,
-            other_agent_goal_distance_range=empty_goal_other_goal_distance_range,
-            other_agent_min_start_separation=float(empty_goal_other_min_start_separation),
-        )
-    else:
-        templates = _select_templates(template_set)
-
-    scenes: list[Scene] = []
-    for template in templates:
-        scenes.extend(template.generate())
-
-    if not scenes:
-        raise ValueError(f"No scenes generated for template set: {template_set}")
-    return scenes
 
 
 def _wandb_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -299,7 +236,7 @@ def main() -> None:
     wandb_module = None
     wandb_run = None
 
-    _seed_everything(int(args.seed))
+    seed_everything(int(args.seed))
 
     tensorboard_log_path = args.tensorboard_log
     if bool(args.wandb) and tensorboard_log_path is None:
@@ -324,15 +261,15 @@ def main() -> None:
         float(args.empty_goal_other_goal_distance_range[1]),
     )
 
-    scenes = _build_scene_pool(
-        template_set=str(args.template_set),
+    empty_goal_cfg = EmptyGoalTemplateConfig(
         goal_distance_range=goal_distance_range,
-        seed=int(args.seed),
-        empty_goal_other_agents_range=other_agents_range,
-        empty_goal_other_spawn_radius_range=other_spawn_radius_range,
-        empty_goal_other_goal_distance_range=other_goal_distance_range,
-        empty_goal_other_min_start_separation=float(args.empty_goal_other_min_start_separation),
+        goal_seed=int(args.seed),
+        num_other_agents_range=other_agents_range,
+        other_agent_spawn_radius_range=other_spawn_radius_range,
+        other_agent_goal_distance_range=other_goal_distance_range,
+        other_agent_min_start_separation=float(args.empty_goal_other_min_start_separation),
     )
+    scenes = build_scene_pool(str(args.template_set), empty_goal=empty_goal_cfg)
 
     sim_cfg = ORCASB3SimConfig(
         max_speed=float(args.max_speed),

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import random
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -17,12 +16,12 @@ try:
 except ImportError:
     wandb = None
 
+from ...experiment_utils import EmptyGoalTemplateConfig, build_scene_pool, seed_everything
 from ..networks.q_network import build_q_network
 from ...scene import Scene
 from ...scene_sampling import make_scene_factory
 from ..networks.simple_q_network import build_simple_q_network
 from ..networks.simple_proposal_network import build_simple_proposal_network
-from ...templates import cross_templates, default_templates, empty_goal_templates, l_shape_templates, test_templates
 from ..collectors.collector import QActionSelectionConfig, RandomPlanCollector, RandomPlanCollectorConfig
 from ..counterfactual import rollout_counterfactual_futures, sample_random_velocity_plans
 from ..envs.env_single import ORCASimConfig, ORCASingleEnv, SingleEnvConfig
@@ -68,50 +67,6 @@ def _log_message(message: str, wandb_run: object | None = None) -> None:
     _log(message)
     if wandb_run is not None and wandb is not None:
         wandb.termlog(message)
-
-
-def _select_templates(template_set: str):
-    if template_set == "default":
-        return default_templates()
-    if template_set == "test":
-        return test_templates()
-    if template_set == "cross":
-        return cross_templates()
-    if template_set == "l_shape":
-        return l_shape_templates()
-    raise ValueError(f"Unknown template set: {template_set}")
-
-
-def _build_scene_pool(template_set: str) -> list[Scene]:
-    scenes: list[Scene] = []
-    for template in _select_templates(template_set):
-        scenes.extend(template.generate())
-    if not scenes:
-        raise ValueError(f"No scenes generated for template set {template_set}")
-    return scenes
-
-
-def _build_empty_goal_scene_pool(
-    *,
-    goal_distance_range: tuple[float, float],
-    goal_seed: int | None,
-) -> list[Scene]:
-    scenes: list[Scene] = []
-    for template in empty_goal_templates(
-        goal_distance_range=goal_distance_range,
-        goal_seed=goal_seed,
-    ):
-        scenes.extend(template.generate())
-    if not scenes:
-        raise ValueError("No scenes generated for empty_goal template")
-    return scenes
-
-
-def _seed_everything(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def _load_checkpoint_model_config(checkpoint_path: Path) -> dict[str, object]:
@@ -230,7 +185,7 @@ class RLTrainingApp:
     def run(self) -> None:
         self.profiler.start()
         try:
-            _seed_everything(int(self.args.seed))
+            seed_everything(int(self.args.seed), include_numpy=False)
             with self.profiler.section("setup_runtime"):
                 self._setup_runtime()
             self._log_setup()
@@ -308,9 +263,12 @@ class RLTrainingApp:
         )
         self.sim_config = ORCASimConfig(time_step=0.1)
         goal_distance_range = tuple(float(value) for value in self.args.empty_goal_distance_range)
-        self.scenes = _build_empty_goal_scene_pool(
-            goal_distance_range=(goal_distance_range[0], goal_distance_range[1]),
-            goal_seed=int(self.args.seed),
+        self.scenes = build_scene_pool(
+            "empty_goal",
+            empty_goal=EmptyGoalTemplateConfig(
+                goal_distance_range=(goal_distance_range[0], goal_distance_range[1]),
+                goal_seed=int(self.args.seed),
+            ),
         )
         scene_factory = make_scene_factory(
             self.scenes,
@@ -406,7 +364,7 @@ class RLTrainingApp:
             observation=self.observation_config,
         )
         self.sim_config = ORCASimConfig(time_step=0.1)
-        self.scenes = _build_scene_pool(self.args.template_set)
+        self.scenes = build_scene_pool(str(self.args.template_set))
         scene_factory = make_scene_factory(
             self.scenes,
             selection=self.args.scene_selection,

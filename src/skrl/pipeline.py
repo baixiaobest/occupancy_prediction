@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import copy
+from dataclasses import asdict
+from pathlib import Path
+
+import torch
+
+from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.envs.wrappers.torch import wrap_env
+from skrl.memories.torch import RandomMemory
+from skrl.trainers.torch import SequentialTrainer
+from skrl.trainers.torch.sequential import SEQUENTIAL_TRAINER_DEFAULT_CONFIG
+
+from src.experiment_utils import EmptyGoalTemplateConfig, build_scene_pool, seed_everything
+from src.scene import Scene
+from src.scene_sampling import make_scene_factory
+from src.sb3.utils import load_decoder_context_len_from_checkpoint
+from src.skrl.config import SkrlEnvBuildConfig, SkrlPPOTrainConfig
+from src.skrl.env_torch_orca import (
+    TorchORCAEnv,
+    TorchORCAEnvConfig,
+    TorchORCARewardConfig,
+    TorchORCASimConfig,
+)
+from src.skrl.models import OccupancyPolicyModel, OccupancyValueModel
+
+
+def _build_scene_pool(config: SkrlEnvBuildConfig, *, seed: int) -> list[Scene]:
+    empty_goal_cfg: EmptyGoalTemplateConfig | None = None
+    if config.template_set == "empty_goal":
+        empty_goal_cfg = EmptyGoalTemplateConfig(
+            goal_distance_range=tuple(float(v) for v in config.empty_goal_distance_range),
+            goal_seed=int(seed),
+            num_other_agents_range=tuple(int(v) for v in config.empty_goal_other_agents_range),
+            other_agent_spawn_radius_range=tuple(float(v) for v in config.empty_goal_other_spawn_radius_range),
+            other_agent_goal_distance_range=tuple(float(v) for v in config.empty_goal_other_goal_distance_range),
+            other_agent_min_start_separation=float(config.empty_goal_other_min_start_separation),
+        )
+    return build_scene_pool(str(config.template_set), empty_goal=empty_goal_cfg)
+
+
+def _make_single_env(env_cfg: SkrlEnvBuildConfig, seed: int, device: torch.device) -> TorchORCAEnv:
+    scenes = _build_scene_pool(env_cfg, seed=seed)
+    scene_factory = make_scene_factory(
+        scenes,
+        selection=str(env_cfg.scene_selection),
+        fixed_scene_index=int(env_cfg.fixed_scene_index),
+        seed=int(seed),
+    )
+
+    sim_cfg = TorchORCASimConfig(
+        max_speed=float(env_cfg.max_speed),
+        goal_tolerance=float(env_cfg.goal_tolerance),
+    )
+    reward_cfg = TorchORCARewardConfig(
+        progress_weight=float(env_cfg.progress_weight),
+        step_penalty=float(env_cfg.step_penalty),
+        collision_penalty=float(env_cfg.collision_penalty),
+        success_reward=float(env_cfg.success_reward),
+        collision_distance=float(env_cfg.collision_distance),
+    )
+    config = TorchORCAEnvConfig(
+        max_steps=int(env_cfg.max_steps),
+        controlled_agent_index=int(env_cfg.controlled_agent_index),
+        device=str(device),
+        sim=sim_cfg,
+        reward=reward_cfg,
+    )
+
+    if str(env_cfg.map_extractor_type) == "vae_tap":
+        if env_cfg.vae_checkpoint is None:
+            raise ValueError("vae_checkpoint is required when map_extractor_type='vae_tap'")
+        config.occupancy.dynamic_context_len = load_decoder_context_len_from_checkpoint(env_cfg.vae_checkpoint)
+
+    return TorchORCAEnv(scene_factory=scene_factory, config=config)
+
+
+def run_skrl_ppo_training(
+    env_config: SkrlEnvBuildConfig,
+    train_config: SkrlPPOTrainConfig,
+) -> Path:
+    """Train a simple SKRL PPO agent on a single ORCA environment.
+
+    This first version intentionally targets num_envs=1 to keep the stack minimal.
+    """
+    if int(train_config.num_envs) != 1:
+        raise NotImplementedError("This initial SKRL pipeline supports only num_envs=1")
+
+    seed_everything(int(train_config.seed))
+
+    device = torch.device(str(train_config.device))
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
+
+    env = _make_single_env(env_config, seed=int(train_config.seed), device=device)
+    wrapped_env = wrap_env(env, wrapper="gymnasium", verbose=False)
+
+    models = {
+        "policy": OccupancyPolicyModel(
+            wrapped_env.observation_space,
+            wrapped_env.action_space,
+            device=device,
+            hidden_dims=tuple(int(v) for v in train_config.actor_hidden_dims),
+        ),
+        "value": OccupancyValueModel(
+            wrapped_env.observation_space,
+            wrapped_env.action_space,
+            device=device,
+            hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
+        ),
+    }
+
+    memory = RandomMemory(
+        memory_size=int(train_config.rollouts),
+        num_envs=int(wrapped_env.num_envs),
+        device=device,
+    )
+
+    agent_cfg = copy.deepcopy(PPO_DEFAULT_CONFIG)
+    agent_cfg["rollouts"] = int(train_config.rollouts)
+    agent_cfg["learning_epochs"] = int(train_config.learning_epochs)
+    agent_cfg["mini_batches"] = int(train_config.mini_batches)
+    agent_cfg["learning_rate"] = float(train_config.learning_rate)
+    agent_cfg["discount_factor"] = float(train_config.discount_factor)
+    agent_cfg["lambda"] = float(train_config.gae_lambda)
+    agent_cfg["random_timesteps"] = 0
+    agent_cfg["learning_starts"] = 0
+    agent_cfg["experiment"]["wandb"] = False
+
+    agent = PPO(
+        models=models,
+        memory=memory,
+        observation_space=wrapped_env.observation_space,
+        action_space=wrapped_env.action_space,
+        device=device,
+        cfg=agent_cfg,
+    )
+
+    trainer_cfg = copy.deepcopy(SEQUENTIAL_TRAINER_DEFAULT_CONFIG)
+    trainer_cfg["timesteps"] = int(train_config.total_timesteps)
+    trainer_cfg["headless"] = True
+    trainer_cfg["disable_progressbar"] = False
+
+    trainer = SequentialTrainer(
+        env=wrapped_env,
+        agents=agent,
+        cfg=trainer_cfg,
+    )
+
+    output_path = Path(train_config.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        trainer.train()
+        agent.save(str(output_path))
+    finally:
+        wrapped_env.close()
+
+    return output_path
+
+
+def dump_effective_configs(env_config: SkrlEnvBuildConfig, train_config: SkrlPPOTrainConfig) -> dict[str, dict]:
+    return {
+        "env": asdict(env_config),
+        "train": {
+            **asdict(train_config),
+            "output": str(train_config.output),
+        },
+    }

@@ -19,14 +19,8 @@ from matplotlib.widgets import Button, Slider
 # Ensure project root is on sys.path so `from src...` works when running this script.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from src.experiment_utils import EmptyGoalTemplateConfig, build_scene_pool
 from src.scene import Scene
-from src.templates import (
-    cross_templates,
-    default_templates,
-    empty_goal_templates,
-    l_shape_templates,
-    test_templates,
-)
 from src.sb3.env_orca import ORCASB3Env, ORCASB3EnvConfig, ORCASB3RewardConfig, ORCASB3SimConfig
 
 try:
@@ -100,20 +94,6 @@ def _resolve_checkpoint_path(path: Path) -> Path:
     raise FileNotFoundError(f"Checkpoint not found: {path}")
 
 
-def _select_templates(template_set: str):
-    if template_set == "default":
-        return default_templates()
-    if template_set == "test":
-        return test_templates()
-    if template_set == "cross":
-        return cross_templates()
-    if template_set == "l_shape":
-        return l_shape_templates()
-    if template_set == "empty_goal":
-        return empty_goal_templates()
-    raise ValueError(f"Unknown template set: {template_set}")
-
-
 def _build_scene_pool(
     *,
     template_set: str,
@@ -124,24 +104,17 @@ def _build_scene_pool(
     empty_goal_other_goal_distance_range: tuple[float, float],
     empty_goal_other_min_start_separation: float,
 ) -> list[Scene]:
-    if template_set == "empty_goal":
-        templates = empty_goal_templates(
+    scenes = build_scene_pool(
+        str(template_set),
+        empty_goal=EmptyGoalTemplateConfig(
             goal_distance_range=goal_distance_range,
             goal_seed=goal_seed,
             num_other_agents_range=empty_goal_other_agents_range,
             other_agent_spawn_radius_range=empty_goal_other_spawn_radius_range,
             other_agent_goal_distance_range=empty_goal_other_goal_distance_range,
             other_agent_min_start_separation=float(empty_goal_other_min_start_separation),
-        )
-    else:
-        templates = _select_templates(template_set)
-
-    scenes: list[Scene] = []
-    for template in templates:
-        scenes.extend(template.generate())
-
-    if not scenes:
-        raise ValueError(f"No scenes generated for template set: {template_set}")
+        ),
+    )
 
     valid_scenes = [scene for scene in scenes if _scene_has_controllable_agent(scene)]
     if not valid_scenes:

@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import argparse
 import os
-import random
 import sys
 
 import numpy as np
-import torch
 
 # Ensure project root is on sys.path so `from src...` works when running this script.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from src.experiment_utils import seed_everything, select_templates
 from src.ORCASim import ORCASim
 from src.rollout_data import SceneRollOutData
 from src.rollout_helpers import (
@@ -27,7 +26,6 @@ from src.rollout_visualization import (
     prepare_animation_grids,
     prepare_past_future_dynamic_grids,
 )
-from src.templates import cross_templates, default_templates, test_templates, l_shape_templates, empty_goal_preset_templates
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -90,20 +88,6 @@ def _resolve_data_dir(data_dir_arg: str | None) -> str:
     return os.path.abspath(os.path.expanduser(data_dir_arg))
 
 
-def _select_templates(template_set: str):
-    if template_set == "default":
-        return default_templates(), "default"
-    if template_set == "test":
-        return test_templates(), "test"
-    if template_set == "cross":
-        return cross_templates(), "cross"
-    if template_set == "l_shape":
-        return l_shape_templates(), "l_shape"
-    if template_set == "empty_goal":
-        return empty_goal_preset_templates(), "empty_goal"
-    raise ValueError(f"Unknown template set: {template_set}")
-
-
 def main() -> None:
     """Run an ORCA rollout with optional animation and occupancy-map generation."""
     parser = _build_arg_parser()
@@ -118,11 +102,7 @@ def main() -> None:
 
     if args.seed is not None:
         seed = int(args.seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        seed_everything(seed)
         print(f"using global seed: {seed}")
 
     # ORCASim configuration constants
@@ -149,7 +129,8 @@ def main() -> None:
     occ_length = 12.8
     occ_width = 12.8
 
-    selected_templates, selected_template_set = _select_templates(args.template_set)
+    selected_template_set = str(args.template_set)
+    selected_templates = select_templates(selected_template_set, use_empty_goal_preset=True)
     rollout_setting = RollOutSetting(
         templates=selected_templates,
         mirror=False,
