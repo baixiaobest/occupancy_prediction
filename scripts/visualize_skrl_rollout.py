@@ -4,6 +4,7 @@ import argparse
 import copy
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -48,7 +49,42 @@ def _resolve_checkpoint_path(path: Path) -> Path:
     raise FileNotFoundError(f"Checkpoint not found: {path}")
 
 
-def _build_env_config(args: argparse.Namespace) -> TorchORCAEnvConfig:
+def _load_checkpoint_dict(*, checkpoint_path: Path, device: torch.device) -> dict:
+    resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path)
+    try:
+        checkpoint = torch.load(resolved_checkpoint, map_location=device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(resolved_checkpoint, map_location=device)
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError("SKRL checkpoint must be a dict with at least 'policy' and 'value' keys")
+    if "policy" not in checkpoint or "value" not in checkpoint:
+        raise ValueError("SKRL checkpoint missing required keys: 'policy' and/or 'value'")
+    if not isinstance(checkpoint["policy"], Mapping) or not isinstance(checkpoint["value"], Mapping):
+        raise ValueError("SKRL checkpoint 'policy' and 'value' entries must be state_dict mappings")
+
+    return checkpoint
+
+
+def _checkpoint_uses_feature_extractor(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    return any(str(name).startswith("feature_extractor.") for name in state_dict.keys())
+
+
+def _infer_checkpoint_map_extractor_type(checkpoint: dict) -> str:
+    policy_uses_extractor = _checkpoint_uses_feature_extractor(checkpoint["policy"])
+    value_uses_extractor = _checkpoint_uses_feature_extractor(checkpoint["value"])
+    if policy_uses_extractor != value_uses_extractor:
+        raise ValueError(
+            "Checkpoint appears inconsistent: policy and value disagree on feature_extractor weights"
+        )
+    return "vae_tap" if policy_uses_extractor else "conv"
+
+
+def _build_env_config(
+    args: argparse.Namespace,
+    *,
+    effective_map_extractor_type: str | None = None,
+) -> TorchORCAEnvConfig:
     env_config = TorchORCAEnvConfig(
         max_steps=int(args.env_max_steps),
         controlled_agent_index=int(args.controlled_agent_index),
@@ -66,7 +102,10 @@ def _build_env_config(args: argparse.Namespace) -> TorchORCAEnvConfig:
         ),
     )
 
-    if str(args.map_extractor_type) == "vae_tap":
+    extractor_type = str(
+        args.map_extractor_type if effective_map_extractor_type is None else effective_map_extractor_type
+    ).strip().lower()
+    if extractor_type == "vae_tap":
         if args.vae_checkpoint is None:
             raise ValueError("--vae-checkpoint is required when --map-extractor-type=vae_tap")
         env_config.occupancy.dynamic_context_len = load_decoder_context_len_from_checkpoint(args.vae_checkpoint)
@@ -109,18 +148,18 @@ def _load_skrl_models(
     vae_checkpoint: Path | None,
     vae_tap_layer: int | None,
 ) -> tuple[OccupancyPolicyModel, OccupancyValueModel]:
-    resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path)
-    try:
-        checkpoint = torch.load(resolved_checkpoint, map_location=device, weights_only=True)
-    except TypeError:
-        checkpoint = torch.load(resolved_checkpoint, map_location=device)
-    if not isinstance(checkpoint, dict):
-        raise ValueError("SKRL checkpoint must be a dict with at least 'policy' and 'value' keys")
-    if "policy" not in checkpoint or "value" not in checkpoint:
-        raise ValueError("SKRL checkpoint missing required keys: 'policy' and/or 'value'")
+    checkpoint = _load_checkpoint_dict(checkpoint_path=checkpoint_path, device=device)
+
+    checkpoint_map_extractor_type = _infer_checkpoint_map_extractor_type(checkpoint)
+    requested_map_extractor_type = str(map_extractor_type).strip().lower()
+    if requested_map_extractor_type != checkpoint_map_extractor_type:
+        raise ValueError(
+            "Requested map extractor type does not match checkpoint: "
+            f"requested='{requested_map_extractor_type}', checkpoint='{checkpoint_map_extractor_type}'."
+        )
 
     shared_feature_extractor = None
-    if str(map_extractor_type).strip().lower() == "vae_tap":
+    if checkpoint_map_extractor_type == "vae_tap":
         if vae_checkpoint is None:
             raise ValueError("--vae-checkpoint is required when --map-extractor-type=vae_tap")
         shared_feature_extractor = VAEDecoderTapFeatureExtractor(
@@ -144,6 +183,20 @@ def _load_skrl_models(
         hidden_dims=critic_hidden_dims,
         feature_extractor=shared_feature_extractor,
     ).to(device)
+
+    checkpoint_input_dim = None
+    checkpoint_net0 = checkpoint["policy"].get("net.0.weight")
+    if isinstance(checkpoint_net0, torch.Tensor) and checkpoint_net0.ndim == 2:
+        checkpoint_input_dim = int(checkpoint_net0.shape[1])
+    model_input_dim = None
+    if len(policy.net) > 0 and hasattr(policy.net[0], "in_features"):
+        model_input_dim = int(policy.net[0].in_features)
+    if checkpoint_input_dim is not None and model_input_dim is not None and checkpoint_input_dim != model_input_dim:
+        raise ValueError(
+            "Model input dimension mismatch before loading weights: "
+            f"checkpoint net.0.in_features={checkpoint_input_dim}, model net.0.in_features={model_input_dim}. "
+            "This usually means checkpoint and observation settings differ."
+        )
 
     policy.load_state_dict(checkpoint["policy"])
     value.load_state_dict(checkpoint["value"])
@@ -331,7 +384,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--map-extractor-type", choices=["conv", "vae_tap"], default="conv")
+    parser.add_argument("--map-extractor-type", choices=["auto", "conv", "vae_tap"], default="auto")
     parser.add_argument(
         "--vae-checkpoint",
         type=Path,
@@ -390,7 +443,22 @@ def main() -> None:
         empty_goal_other_min_start_separation=float(args.empty_goal_other_min_start_separation),
     )
 
-    env_config = _build_env_config(args)
+    checkpoint = _load_checkpoint_dict(checkpoint_path=Path(args.checkpoint), device=device)
+    checkpoint_map_extractor_type = _infer_checkpoint_map_extractor_type(checkpoint)
+    requested_map_extractor_type = str(args.map_extractor_type).strip().lower()
+    if requested_map_extractor_type == "auto":
+        effective_map_extractor_type = checkpoint_map_extractor_type
+    elif requested_map_extractor_type != checkpoint_map_extractor_type:
+        print(
+            "[visualize_skrl_rollout] map extractor mismatch: "
+            f"requested={requested_map_extractor_type}, checkpoint={checkpoint_map_extractor_type}. "
+            f"Using checkpoint setting: {checkpoint_map_extractor_type}"
+        )
+        effective_map_extractor_type = checkpoint_map_extractor_type
+    else:
+        effective_map_extractor_type = requested_map_extractor_type
+
+    env_config = _build_env_config(args, effective_map_extractor_type=effective_map_extractor_type)
 
     variants_per_scene = int(args.scenario_variants_per_scene)
     total_setups = len(scenes) * variants_per_scene
@@ -418,7 +486,7 @@ def main() -> None:
             actor_hidden_dims=tuple(int(v) for v in args.actor_hidden_dims),
             critic_hidden_dims=tuple(int(v) for v in args.critic_hidden_dims),
             device=device,
-            map_extractor_type=str(args.map_extractor_type),
+            map_extractor_type=effective_map_extractor_type,
             vae_checkpoint=None if args.vae_checkpoint is None else Path(args.vae_checkpoint),
             vae_tap_layer=None if args.vae_tap_layer is None else int(args.vae_tap_layer),
         )

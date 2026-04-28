@@ -146,6 +146,8 @@ def run_skrl_ppo_training(
             observation_space=wrapped_env.observation_space,
             vae_checkpoint=str(env_config.vae_checkpoint),
             tap_layer=(None if env_config.vae_tap_layer is None else int(env_config.vae_tap_layer)),
+            tap_bottleneck_hidden_dim=tuple(int(v) for v in train_config.tap_bottleneck_hidden_dims),
+            tap_bottleneck_output_dim=int(train_config.tap_bottleneck_output_dim),
         ).to(device)
         shared_feature_extractor.eval()
 

@@ -29,8 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-timesteps", type=int, default=300000)
     parser.add_argument("--rollouts", type=int, default=1024)
     parser.add_argument("--learning-epochs", type=int, default=8)
-    parser.add_argument("--mini-batches", type=int, default=8)
-    
+    parser.add_argument("--mini-batches", type=int, default=8) 
+        
     parser.add_argument("--summary-interval-episodes", type=int, default=10)
     parser.add_argument("--checkpoint-interval", type=int, default=50000)
 

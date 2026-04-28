@@ -43,6 +43,8 @@ class SkrlPPOTrainConfig:
 
     actor_hidden_dims: tuple[int, ...] = (64, 64)
     critic_hidden_dims: tuple[int, ...] = (64, 64)
+    tap_bottleneck_hidden_dims: tuple[int, ...] = (128,)
+    tap_bottleneck_output_dim: int = 32
 
     # Policy initialization / PPO control terms
     initial_policy_std: float = 0.3

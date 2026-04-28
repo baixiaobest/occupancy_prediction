@@ -87,6 +87,8 @@ class VAEDecoderTapFeatureExtractor(nn.Module):
         *,
         vae_checkpoint: str,
         tap_layer: int | None = None,
+        tap_bottleneck_hidden_dim: list[int] | tuple[int, ...] = (128,),
+        tap_bottleneck_output_dim: int = 32,
         dynamic_key: str = "dynamic_context",
         static_key: str = "static_map",
         velocity_key: str = "current_velocity",
@@ -205,7 +207,22 @@ class VAEDecoderTapFeatureExtractor(nn.Module):
             )
             map_latent_dim = int(tapped.flatten(start_dim=1).shape[1])
 
-        self.features_dim = int(vector_dim + map_latent_dim)
+        hidden_dims = [int(v) for v in tap_bottleneck_hidden_dim]
+        if not hidden_dims:
+            raise ValueError("tap_bottleneck_hidden_dim must contain at least one value")
+        if any(int(v) <= 0 for v in hidden_dims):
+            raise ValueError("tap_bottleneck_hidden_dim values must be > 0")
+        if int(tap_bottleneck_output_dim) <= 0:
+            raise ValueError("tap_bottleneck_output_dim must be > 0")
+
+        self.tap_latent_dim = int(map_latent_dim)
+        self.tap_bottleneck_hidden_dims = tuple(hidden_dims)
+        self.tap_bottleneck = _build_mlp(
+            input_dim=self.tap_latent_dim,
+            output_dim=int(tap_bottleneck_output_dim),
+            hidden_dims=self.tap_bottleneck_hidden_dims,
+        )
+        self.features_dim = int(vector_dim + int(tap_bottleneck_output_dim))
 
     def train(self, mode: bool = True) -> VAEDecoderTapFeatureExtractor:
         super().train(mode)
@@ -292,13 +309,15 @@ class VAEDecoderTapFeatureExtractor(nn.Module):
             )
             map_latent = tapped.flatten(start_dim=1)
 
+        map_features = self.tap_bottleneck(map_latent)
+
         if self.vector_keys:
             vector_features = torch.cat(
                 [observations[key].float().flatten(start_dim=1) for key in self.vector_keys],
                 dim=1,
             )
-            return torch.cat([vector_features, map_latent], dim=1)
-        return map_latent
+            return torch.cat([vector_features, map_features], dim=1)
+        return map_features
 
 
 class OccupancyPolicyModel(GaussianMixin, Model):
