@@ -14,8 +14,8 @@ pytest.importorskip("stable_baselines3")
 
 from src.scene import Scene
 from src.templates import empty_goal_templates
-from src.sb3.env_orca import ORCASB3EnvConfig
-from src.sb3.vec_env_orca import build_orca_vec_env
+from sb3.env_orca import ORCASB3EnvConfig
+from sb3.vec_env_orca import build_orca_vec_env
 
 
 def _single_empty_goal_scene() -> Scene:
