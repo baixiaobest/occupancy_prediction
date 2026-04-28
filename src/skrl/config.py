@@ -11,6 +11,7 @@ class SkrlEnvBuildConfig:
     template_set: str = "default"
     scene_selection: str = "random"
     fixed_scene_index: int = 0
+    observation_mode: str = "occupancy"
 
     empty_goal_distance_range: tuple[float, float] = (2.0, 6.0)
     empty_goal_other_agents_range: tuple[int, int] = (0, 0)
@@ -20,14 +21,6 @@ class SkrlEnvBuildConfig:
 
     max_steps: int = 200
     controlled_agent_index: int = 0
-    max_speed: float = 3.0
-    goal_tolerance: float = 0.2
-
-    progress_weight: float = 1.0
-    step_penalty: float = 0.0
-    collision_penalty: float = -1.0
-    success_reward: float = 5.0
-    collision_distance: float = 0.4
 
     map_extractor_type: str = "conv"
     vae_checkpoint: Path | None = None
@@ -37,16 +30,28 @@ class SkrlEnvBuildConfig:
 class SkrlPPOTrainConfig:
     total_timesteps: int = 300000
     rollouts: int = 1024
-    learning_epochs: int = 8
+    learning_epochs: int = 10
     mini_batches: int = 8
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     discount_factor: float = 0.99
     gae_lambda: float = 0.95
     seed: int = 42
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
     num_envs: int = 1
 
-    actor_hidden_dims: tuple[int, ...] = (256, 256)
-    critic_hidden_dims: tuple[int, ...] = (256, 256)
+    actor_hidden_dims: tuple[int, ...] = (64, 64)
+    critic_hidden_dims: tuple[int, ...] = (64, 64)
+
+    # Policy initialization / PPO control terms
+    initial_policy_std: float = 0.3
+    max_policy_std: float = 0.5
+    ratio_clip: float = 0.2
+    kl_threshold: float = 0.01
+    entropy_loss_scale: float = 0.001
+
+    summary_interval_episodes: int = 10
+
+    # Periodic checkpoint saving via SKRL experiment hooks.
+    checkpoint_interval: int = 50000
 
     output: Path = Path("checkpoints/skrl_ppo_orca.pt")

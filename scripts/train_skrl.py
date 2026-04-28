@@ -17,26 +17,10 @@ from src.skrl.pipeline import dump_effective_configs, run_skrl_ppo_training
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train ORCA policy with SKRL PPO (single environment)")
 
-    parser.add_argument("--template-set", choices=["default", "test", "cross", "l_shape", "empty_goal"], default="default")
+    parser.add_argument("--template-set", choices=["default", "test", "cross", "l_shape", "empty_goal"], default="empty_goal")
     parser.add_argument("--scene-selection", choices=["random", "cycle", "fixed"], default="random")
     parser.add_argument("--fixed-scene-index", type=int, default=0)
-
-    parser.add_argument("--empty-goal-distance-range", type=float, nargs=2, default=[2.0, 6.0])
-    parser.add_argument("--empty-goal-other-agents-range", type=int, nargs=2, default=[0, 0])
-    parser.add_argument("--empty-goal-other-spawn-radius-range", type=float, nargs=2, default=[1.5, 6.0])
-    parser.add_argument("--empty-goal-other-goal-distance-range", type=float, nargs=2, default=[2.0, 6.0])
-    parser.add_argument("--empty-goal-other-min-start-separation", type=float, default=0.8)
-
-    parser.add_argument("--max-steps", type=int, default=200)
-    parser.add_argument("--controlled-agent-index", type=int, default=0)
-    parser.add_argument("--max-speed", type=float, default=3.0)
-    parser.add_argument("--goal-tolerance", type=float, default=0.2)
-
-    parser.add_argument("--progress-weight", type=float, default=1.0)
-    parser.add_argument("--step-penalty", type=float, default=0.0)
-    parser.add_argument("--collision-penalty", type=float, default=-1.0)
-    parser.add_argument("--success-reward", type=float, default=5.0)
-    parser.add_argument("--collision-distance", type=float, default=0.4)
+    parser.add_argument("--observation-mode", choices=["occupancy", "minimal"], default="occupancy")
 
     parser.add_argument("--map-extractor-type", choices=["conv", "vae_tap"], default="conv")
     parser.add_argument("--vae-checkpoint", type=Path, default=None)
@@ -45,12 +29,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollouts", type=int, default=1024)
     parser.add_argument("--learning-epochs", type=int, default=8)
     parser.add_argument("--mini-batches", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--discount-factor", type=float, default=0.99)
-    parser.add_argument("--gae-lambda", type=float, default=0.95)
-
-    parser.add_argument("--actor-hidden-dims", type=int, nargs="+", default=[256, 256])
-    parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=[256, 256])
+    
+    parser.add_argument("--summary-interval-episodes", type=int, default=10)
+    parser.add_argument("--checkpoint-interval", type=int, default=50000)
 
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
@@ -67,26 +48,14 @@ def main() -> None:
         template_set=str(args.template_set),
         scene_selection=str(args.scene_selection),
         fixed_scene_index=int(args.fixed_scene_index),
-        empty_goal_distance_range=(float(args.empty_goal_distance_range[0]), float(args.empty_goal_distance_range[1])),
-        empty_goal_other_agents_range=(int(args.empty_goal_other_agents_range[0]), int(args.empty_goal_other_agents_range[1])),
-        empty_goal_other_spawn_radius_range=(
-            float(args.empty_goal_other_spawn_radius_range[0]),
-            float(args.empty_goal_other_spawn_radius_range[1]),
-        ),
-        empty_goal_other_goal_distance_range=(
-            float(args.empty_goal_other_goal_distance_range[0]),
-            float(args.empty_goal_other_goal_distance_range[1]),
-        ),
-        empty_goal_other_min_start_separation=float(args.empty_goal_other_min_start_separation),
-        max_steps=int(args.max_steps),
-        controlled_agent_index=int(args.controlled_agent_index),
-        max_speed=float(args.max_speed),
-        goal_tolerance=float(args.goal_tolerance),
-        progress_weight=float(args.progress_weight),
-        step_penalty=float(args.step_penalty),
-        collision_penalty=float(args.collision_penalty),
-        success_reward=float(args.success_reward),
-        collision_distance=float(args.collision_distance),
+        observation_mode=str(args.observation_mode),
+        empty_goal_distance_range=(0.5, 6.0),
+        empty_goal_other_agents_range=(0, 0),
+        empty_goal_other_spawn_radius_range=(6.0, 6.0),
+        empty_goal_other_goal_distance_range=(6.0, 6.0),
+        empty_goal_other_min_start_separation=0.8,
+        max_steps=200,
+        controlled_agent_index=0,
         map_extractor_type=str(args.map_extractor_type),
         vae_checkpoint=None if args.vae_checkpoint is None else Path(args.vae_checkpoint),
     )
@@ -96,14 +65,11 @@ def main() -> None:
         rollouts=int(args.rollouts),
         learning_epochs=int(args.learning_epochs),
         mini_batches=int(args.mini_batches),
-        learning_rate=float(args.learning_rate),
-        discount_factor=float(args.discount_factor),
-        gae_lambda=float(args.gae_lambda),
         seed=int(args.seed),
         device=str(args.device),
         num_envs=int(args.num_envs),
-        actor_hidden_dims=tuple(int(v) for v in args.actor_hidden_dims),
-        critic_hidden_dims=tuple(int(v) for v in args.critic_hidden_dims),
+        summary_interval_episodes=int(args.summary_interval_episodes),
+        checkpoint_interval=int(args.checkpoint_interval),
         output=Path(args.output),
     )
 

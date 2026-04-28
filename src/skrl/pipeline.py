@@ -4,6 +4,7 @@ import copy
 from dataclasses import asdict
 from pathlib import Path
 
+import gymnasium as gym
 import torch
 
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
@@ -24,6 +25,8 @@ from src.skrl.env_torch_orca import (
     TorchORCASimConfig,
 )
 from src.skrl.models import OccupancyPolicyModel, OccupancyValueModel
+from src.skrl.observation_wrappers import MinimalKinematicsObservationWrapper
+from src.skrl.training_summary import PeriodicEpisodeSummaryWrapper, install_agent_tracking_summary
 
 
 def _build_scene_pool(config: SkrlEnvBuildConfig, *, seed: int) -> list[Scene]:
@@ -40,7 +43,7 @@ def _build_scene_pool(config: SkrlEnvBuildConfig, *, seed: int) -> list[Scene]:
     return build_scene_pool(str(config.template_set), empty_goal=empty_goal_cfg)
 
 
-def _make_single_env(env_cfg: SkrlEnvBuildConfig, seed: int, device: torch.device) -> TorchORCAEnv:
+def _make_single_env(env_cfg: SkrlEnvBuildConfig, seed: int, device: torch.device) -> gym.Env:
     scenes = _build_scene_pool(env_cfg, seed=seed)
     scene_factory = make_scene_factory(
         scenes,
@@ -49,17 +52,8 @@ def _make_single_env(env_cfg: SkrlEnvBuildConfig, seed: int, device: torch.devic
         seed=int(seed),
     )
 
-    sim_cfg = TorchORCASimConfig(
-        max_speed=float(env_cfg.max_speed),
-        goal_tolerance=float(env_cfg.goal_tolerance),
-    )
-    reward_cfg = TorchORCARewardConfig(
-        progress_weight=float(env_cfg.progress_weight),
-        step_penalty=float(env_cfg.step_penalty),
-        collision_penalty=float(env_cfg.collision_penalty),
-        success_reward=float(env_cfg.success_reward),
-        collision_distance=float(env_cfg.collision_distance),
-    )
+    sim_cfg = TorchORCASimConfig()
+    reward_cfg = TorchORCARewardConfig()
     config = TorchORCAEnvConfig(
         max_steps=int(env_cfg.max_steps),
         controlled_agent_index=int(env_cfg.controlled_agent_index),
@@ -73,7 +67,16 @@ def _make_single_env(env_cfg: SkrlEnvBuildConfig, seed: int, device: torch.devic
             raise ValueError("vae_checkpoint is required when map_extractor_type='vae_tap'")
         config.occupancy.dynamic_context_len = load_decoder_context_len_from_checkpoint(env_cfg.vae_checkpoint)
 
-    return TorchORCAEnv(scene_factory=scene_factory, config=config)
+    base_env = TorchORCAEnv(scene_factory=scene_factory, config=config)
+
+    observation_mode = str(env_cfg.observation_mode).strip().lower()
+    if observation_mode == "occupancy":
+        return base_env
+    if observation_mode == "minimal":
+        return MinimalKinematicsObservationWrapper(base_env)
+    raise ValueError(
+        f"Unknown observation_mode '{env_cfg.observation_mode}'. Expected one of: occupancy, minimal"
+    )
 
 
 def run_skrl_ppo_training(
@@ -93,7 +96,16 @@ def run_skrl_ppo_training(
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
 
+    summary_interval_episodes = int(train_config.summary_interval_episodes)
+    if summary_interval_episodes <= 0:
+        raise ValueError("summary_interval_episodes must be > 0")
+
     env = _make_single_env(env_config, seed=int(train_config.seed), device=device)
+    env = PeriodicEpisodeSummaryWrapper(
+        env,
+        interval_episodes=summary_interval_episodes,
+        prefix="[train_skrl]",
+    )
     wrapped_env = wrap_env(env, wrapper="gymnasium", verbose=False)
 
     models = {
@@ -102,6 +114,8 @@ def run_skrl_ppo_training(
             wrapped_env.action_space,
             device=device,
             hidden_dims=tuple(int(v) for v in train_config.actor_hidden_dims),
+            initial_std=float(train_config.initial_policy_std),
+            max_std=float(train_config.max_policy_std),
         ),
         "value": OccupancyValueModel(
             wrapped_env.observation_space,
@@ -117,6 +131,9 @@ def run_skrl_ppo_training(
         device=device,
     )
 
+    output_path = Path(train_config.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     agent_cfg = copy.deepcopy(PPO_DEFAULT_CONFIG)
     agent_cfg["rollouts"] = int(train_config.rollouts)
     agent_cfg["learning_epochs"] = int(train_config.learning_epochs)
@@ -124,9 +141,20 @@ def run_skrl_ppo_training(
     agent_cfg["learning_rate"] = float(train_config.learning_rate)
     agent_cfg["discount_factor"] = float(train_config.discount_factor)
     agent_cfg["lambda"] = float(train_config.gae_lambda)
+    agent_cfg["ratio_clip"] = float(train_config.ratio_clip)
+    agent_cfg["kl_threshold"] = float(train_config.kl_threshold)
+    agent_cfg["entropy_loss_scale"] = float(train_config.entropy_loss_scale)
     agent_cfg["random_timesteps"] = 0
     agent_cfg["learning_starts"] = 0
     agent_cfg["experiment"]["wandb"] = False
+    # Align tracking writes with update cadence to avoid mostly-empty summary lines.
+    agent_cfg["experiment"]["write_interval"] = int(train_config.rollouts)
+    checkpoint_interval = int(train_config.checkpoint_interval)
+    if checkpoint_interval > 0:
+        agent_cfg["experiment"]["checkpoint_interval"] = checkpoint_interval
+        agent_cfg["experiment"]["directory"] = str(output_path.parent)
+        agent_cfg["experiment"]["experiment_name"] = output_path.stem
+        agent_cfg["experiment"]["store_separately"] = False
 
     agent = PPO(
         models=models,
@@ -136,6 +164,7 @@ def run_skrl_ppo_training(
         device=device,
         cfg=agent_cfg,
     )
+    install_agent_tracking_summary(agent, prefix="[train_skrl]")
 
     trainer_cfg = copy.deepcopy(SEQUENTIAL_TRAINER_DEFAULT_CONFIG)
     trainer_cfg["timesteps"] = int(train_config.total_timesteps)
@@ -147,9 +176,6 @@ def run_skrl_ppo_training(
         agents=agent,
         cfg=trainer_cfg,
     )
-
-    output_path = Path(train_config.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         trainer.train()

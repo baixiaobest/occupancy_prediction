@@ -14,6 +14,7 @@ from src.occupancy2d import Occupancy2d
 from src.occupancy_patch import slice_centered_patch
 from src.rollout_helpers import _compute_scene_canvas
 from src.scene import Scene
+import math
 
 
 @dataclass
@@ -45,12 +46,14 @@ class TorchORCARewardConfig:
     """Reward terms matching ORCASB3Env behavior."""
 
     progress_weight: float = 1.0
-    step_penalty: float = 0.0
+    step_penalty: float = -0.01
     collision_penalty: float = -1.0
-    success_reward: float = 5.0
+    success_reward: float = 20.0
     collision_distance: float = 0.2
     success_speed_threshold: float = 0.1
-    action_change_penalty_weight: float = 0.005
+    success_distance: float = 0.3
+    action_change_penalty_weight: float = 0.05
+    max_goal_distance_termination: float | None = 12.0
 
 
 @dataclass
@@ -109,6 +112,9 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
             raise ValueError("occupancy.dynamic_context_len must be > 0")
         if float(self.config.occupancy.agent_radius) < 0.0:
             raise ValueError("occupancy.agent_radius must be >= 0")
+        max_goal_distance_termination = self.config.reward.max_goal_distance_termination
+        if max_goal_distance_termination is not None and float(max_goal_distance_termination) <= 0.0:
+            raise ValueError("reward.max_goal_distance_termination must be > 0 when set")
 
         occ_cfg = self.config.occupancy
         self._occupancy_resolution = float(occ_cfg.resolution)
@@ -179,6 +185,10 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
         self._dynamic_renderer: Occupancy2d | None = None
         self._dynamic_context_history: deque[torch.Tensor] = deque(maxlen=self._dynamic_context_len + 1)
         self._step_count: int = 0
+        self._termination_checks: list[tuple[str, Callable[[dict[str, Any]], bool]]] = [
+            ("success", self._terminate_on_success),
+            ("too_far", self._terminate_on_too_far),
+        ]
 
     def reset(
         self,
@@ -248,6 +258,7 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
         low = torch.as_tensor(self.action_space.low, dtype=torch.float32, device=self.device)
         high = torch.as_tensor(self.action_space.high, dtype=torch.float32, device=self.device)
         action_t = torch.clamp(action_t, min=low, max=high)
+
         commanded_velocity = action_t * self._controlled_agent_max_speed
         controlled_idx = int(self.config.controlled_agent_index)
 
@@ -416,12 +427,13 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
             new_goal_distance=new_goal_distance,
             new_velocities=new_velocities,
         )
+        too_far = self._compute_too_far(new_goal_distance)
 
         reward_terms = {
-            "progress": self._compute_progress_reward(progress),
+            "progress": self._compute_progress_reward(progress), #self._compute_distance_reward(new_goal_distance),
             "step_penalty": self._compute_step_penalty_reward(),
             "collision": self._compute_collision_reward(collision),
-            "success": self._compute_success_reward(success),
+            "success": self._compute_success_reward(success, new_goal_distance),
         }
         reward = float(sum(reward_terms.values()))
 
@@ -433,18 +445,33 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
             "controlled_speed": float(controlled_speed),
             "within_goal": bool(within_goal),
             "stationary": bool(stationary),
+            "too_far": bool(too_far),
             "success_speed_threshold": float(self.config.reward.success_speed_threshold),
-            "progress": float(progress),
+            "max_goal_distance_termination": (
+                None
+                if self.config.reward.max_goal_distance_termination is None
+                else float(self.config.reward.max_goal_distance_termination)
+            ),
+            "distance_to_goal": float(new_goal_distance),
             "reward_terms": reward_terms,
         }
-        terminated = success
+
+        termination_state = {
+            "success": bool(success),
+            "too_far": bool(too_far),
+            "collision": bool(collision),
+            "goal_distance": float(new_goal_distance),
+            "step_count": int(self._step_count),
+        }
+        terminated, termination_reasons = self._evaluate_termination_checks(termination_state)
+        info["termination_reasons"] = termination_reasons
         return float(reward), bool(terminated), info
 
     def _compute_progress(self, prev_positions: torch.Tensor, new_positions: torch.Tensor) -> tuple[float, float, float]:
         prev_goal_distance = self._goal_distance(prev_positions)
         new_goal_distance = self._goal_distance(new_positions)
         progress = float(prev_goal_distance - new_goal_distance)
-        return float(prev_goal_distance), float(new_goal_distance), float(progress)
+        return float(prev_goal_distance), float(new_goal_distance), progress
 
     def _compute_collision(self, new_positions: torch.Tensor) -> bool:
         controlled_idx = int(self.config.controlled_agent_index)
@@ -467,13 +494,19 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
 
         controlled_idx = int(self.config.controlled_agent_index)
         controlled_speed = float(torch.linalg.norm(new_velocities[controlled_idx]).item())
-        within_goal = bool(new_goal_distance <= float(self.sim.goal_tolerance))
+        within_goal = bool(new_goal_distance <= float(self.config.reward.success_distance))
         stationary = bool(controlled_speed <= float(self.config.reward.success_speed_threshold))
         success = bool(within_goal and stationary)
         return float(controlled_speed), bool(within_goal), bool(stationary), bool(success)
 
     def _compute_progress_reward(self, progress: float) -> float:
-        return float(self.config.reward.progress_weight) * float(progress)
+        penalty = min(progress, 0.0) * 2 * float(self.config.reward.progress_weight)
+        reward = max(progress, 0.0) * float(self.config.reward.progress_weight)
+        return penalty + reward
+    
+    def _compute_distance_reward(self, distance_to_goal: float) -> float:
+        sigma = 5.0
+        return float(self.config.reward.progress_weight) * (1 - math.tanh(distance_to_goal / sigma))
 
     def _compute_step_penalty_reward(self) -> float:
         return float(self.config.reward.step_penalty)
@@ -481,8 +514,28 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
     def _compute_collision_reward(self, collision: bool) -> float:
         return float(self.config.reward.collision_penalty) if collision else 0.0
 
-    def _compute_success_reward(self, success: bool) -> float:
-        return float(self.config.reward.success_reward) if success else 0.0
+    def _compute_success_reward(self, success: bool, distance_to_goal: float) -> float:
+        goal_bonus = 1.0 - math.tanh(distance_to_goal/3.0)
+        return float(self.config.reward.success_reward) * goal_bonus * success
+
+    def _compute_too_far(self, new_goal_distance: float) -> bool:
+        threshold = self.config.reward.max_goal_distance_termination
+        if threshold is None:
+            return False
+        return bool(float(new_goal_distance) >= float(threshold))
+
+    def _evaluate_termination_checks(self, state: dict[str, Any]) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        for name, check in self._termination_checks:
+            if bool(check(state)):
+                reasons.append(name)
+        return bool(reasons), reasons
+
+    def _terminate_on_success(self, state: dict[str, Any]) -> bool:
+        return bool(state.get("success", False))
+
+    def _terminate_on_too_far(self, state: dict[str, Any]) -> bool:
+        return bool(state.get("too_far", False))
 
     def _compute_action_change_penalty(self, commanded_velocity: torch.Tensor) -> tuple[float, float]:
         action_change = 0.0
