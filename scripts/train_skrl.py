@@ -62,7 +62,8 @@ def main() -> None:
 
     observation_mode = str(args.observation_mode).strip().lower()
     if args.output is None:
-        output_path = Path(f"checkpoints/skrl_ppo_orca_{observation_mode}_{dt.datetime.now().strftime("%m-%d_%H-%M")}.pt")
+        time = dt.datetime.now().strftime("%m-%d_%H-%M")
+        output_path = Path(f"checkpoints/skrl_ppo_orca_{observation_mode}_{time}.pt")
     else:
         output_path = Path(args.output)
 
