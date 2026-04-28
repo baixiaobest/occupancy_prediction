@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import importlib
 from dataclasses import asdict
 from pathlib import Path
 
@@ -30,7 +31,11 @@ from src.skrl.models import (
     VAEDecoderTapFeatureExtractor,
 )
 from src.skrl.observation_wrappers import MinimalKinematicsObservationWrapper
-from src.skrl.training_summary import PeriodicEpisodeSummaryWrapper, install_agent_tracking_summary
+from src.skrl.training_summary import (
+    PeriodicEpisodeSummaryWrapper,
+    _build_wandb_summary_callback,
+    install_agent_tracking_summary,
+)
 from src.skrl.vec_env_torch_orca import build_torch_orca_vec_env
 
 
@@ -94,6 +99,70 @@ def _build_torch_orca_env_config(
     return config
 
 
+def _build_wandb_experiment_kwargs(train_config: SkrlPPOTrainConfig, *, output_path: Path) -> dict[str, object]:
+    run_name = train_config.wandb_run_name
+    if run_name is None or not str(run_name).strip():
+        run_name = output_path.stem
+
+    return {
+        "project": str(train_config.wandb_project),
+        "name": str(run_name),
+    }
+
+
+def _save_checkpoint_file_to_wandb(*, checkpoint_path: Path, wandb_module: object | None = None) -> None:
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint file not found for W&B upload: {checkpoint_path}")
+
+    module = wandb_module
+    if module is None:
+        try:
+            module = importlib.import_module("wandb")
+        except ImportError as exc:
+            raise ImportError("wandb is required when wandb logging is enabled. Install with: pip install wandb") from exc
+
+    module.save(str(checkpoint_path), base_path=str(checkpoint_path.parent), policy="now")
+
+
+def _install_periodic_checkpoint_upload_hook(
+    *,
+    agent,
+    train_config: SkrlPPOTrainConfig,
+) -> None:
+    if not bool(train_config.wandb):
+        return
+
+    if not hasattr(agent, "write_tracking_data") or not hasattr(agent, "experiment_dir"):
+        return
+
+    original_write_tracking_data = agent.write_tracking_data
+    checkpoint_dir = Path(str(agent.experiment_dir)) / "checkpoints"
+    wandb_module = importlib.import_module("wandb")
+
+    uploaded_checkpoint_paths: set[str] = set()
+
+    def _patched_write_tracking_data(timestep: int, timesteps: int) -> None:
+        original_write_tracking_data(timestep, timesteps)
+
+        for checkpoint_path in sorted(checkpoint_dir.glob("*.pt")):
+            checkpoint_key = str(checkpoint_path.resolve())
+            if checkpoint_key in uploaded_checkpoint_paths:
+                continue
+            _save_checkpoint_file_to_wandb(checkpoint_path=checkpoint_path, wandb_module=wandb_module)
+            uploaded_checkpoint_paths.add(checkpoint_key)
+
+    agent.write_tracking_data = _patched_write_tracking_data
+
+
+def _save_checkpoint_to_wandb_if_enabled(*, train_config: SkrlPPOTrainConfig, checkpoint_path: Path) -> None:
+    if not bool(train_config.wandb):
+        return
+    try:
+        _save_checkpoint_file_to_wandb(checkpoint_path=checkpoint_path)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to upload checkpoint to W&B: {checkpoint_path}") from exc
+
+
 def run_skrl_ppo_training(
     env_config: SkrlEnvBuildConfig,
     train_config: SkrlPPOTrainConfig,
@@ -113,12 +182,17 @@ def run_skrl_ppo_training(
     if summary_interval_episodes <= 0:
         raise ValueError("summary_interval_episodes must be > 0")
 
+    enable_wandb = bool(train_config.wandb)
+    summary_callback = _build_wandb_summary_callback(train_config=train_config)
+
     if num_envs == 1:
         env = _make_single_env(env_config, seed=int(train_config.seed), device=device)
         env = PeriodicEpisodeSummaryWrapper(
             env,
             interval_episodes=summary_interval_episodes,
             prefix="[train_skrl]",
+            summary_key="env_0",
+            summary_callback=summary_callback,
         )
     else:
         env = build_torch_orca_vec_env(
@@ -131,6 +205,7 @@ def run_skrl_ppo_training(
             observation_mode=str(env_config.observation_mode),
             interval_episodes=summary_interval_episodes,
             backend=str(train_config.vec_env_backend),
+            summary_callback=summary_callback,
         )
 
     wrapped_env = wrap_env(env, wrapper="gymnasium", verbose=False)
@@ -191,7 +266,12 @@ def run_skrl_ppo_training(
     agent_cfg["entropy_loss_scale"] = float(train_config.entropy_loss_scale)
     agent_cfg["random_timesteps"] = 0
     agent_cfg["learning_starts"] = 0
-    agent_cfg["experiment"]["wandb"] = False
+    agent_cfg["experiment"]["wandb"] = enable_wandb
+    if enable_wandb:
+        agent_cfg["experiment"]["wandb_kwargs"] = _build_wandb_experiment_kwargs(
+            train_config,
+            output_path=output_path,
+        )
     # Align tracking writes with update cadence to avoid mostly-empty summary lines.
     agent_cfg["experiment"]["write_interval"] = int(train_config.rollouts)
     checkpoint_interval = int(train_config.checkpoint_interval)
@@ -210,6 +290,7 @@ def run_skrl_ppo_training(
         cfg=agent_cfg,
     )
     install_agent_tracking_summary(agent, prefix="[train_skrl]")
+    _install_periodic_checkpoint_upload_hook(agent=agent, train_config=train_config)
 
     trainer_cfg = copy.deepcopy(SEQUENTIAL_TRAINER_DEFAULT_CONFIG)
     trainer_cfg["timesteps"] = int(train_config.total_timesteps)
@@ -225,6 +306,7 @@ def run_skrl_ppo_training(
     try:
         trainer.train()
         agent.save(str(output_path))
+        _save_checkpoint_to_wandb_if_enabled(train_config=train_config, checkpoint_path=output_path)
     finally:
         wrapped_env.close()
 

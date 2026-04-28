@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import gymnasium as gym
 import torch
@@ -150,6 +150,7 @@ def build_torch_orca_vec_env(
     observation_mode: str,
     interval_episodes: int,
     backend: Literal["torch_dummy"] = "torch_dummy",
+    summary_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> gym.Env:
     """Build a torch-native vectorized Torch ORCA env for SKRL training."""
     if num_envs <= 0:
@@ -192,6 +193,8 @@ def build_torch_orca_vec_env(
                 env,
                 interval_episodes=int(interval_episodes),
                 prefix=f"[train_skrl][env={int(rank_idx)}]",
+                summary_key=f"env_{int(rank_idx)}",
+                summary_callback=summary_callback,
             )
             env.action_space.seed(rank_seed)
             env.observation_space.seed(rank_seed)

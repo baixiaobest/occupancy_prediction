@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import importlib
+from typing import Callable
+
 import gymnasium as gym
 import numpy as np
+
+from src.skrl.config import SkrlPPOTrainConfig
 
 
 def _mean_metric(tracking_data: dict[str, list[float]], key: str) -> float | None:
@@ -9,6 +14,62 @@ def _mean_metric(tracking_data: dict[str, list[float]], key: str) -> float | Non
     if not values:
         return None
     return float(np.mean(values))
+
+
+def _build_wandb_summary_callback(
+    *,
+    train_config: SkrlPPOTrainConfig,
+    group: str = "EnvSummary",
+) -> Callable[[dict[str, object]], None] | None:
+    if not bool(train_config.wandb):
+        return None
+
+    wandb_module: object | None = None
+
+    def _log_summary(payload: dict[str, object]) -> None:
+        nonlocal wandb_module
+        if wandb_module is None:
+            try:
+                wandb_module = importlib.import_module("wandb")
+            except ImportError as exc:
+                raise ImportError(
+                    "wandb is required when wandb logging is enabled. Install with: pip install wandb"
+                ) from exc
+
+        source = str(payload.get("source", "env"))
+        base = f"{group}/{source}"
+
+        metrics: dict[str, float] = {}
+        scalar_keys = {
+            "mean_return": "mean_return",
+            "mean_len": "mean_len",
+            "success_rate": "success_rate",
+            "collision_rate": "collision_rate",
+            "timeout_rate": "timeout_rate",
+            "episodes_start": "episodes_start",
+            "episodes_end": "episodes_end",
+        }
+        for key, metric_name in scalar_keys.items():
+            value = payload.get(key)
+            if isinstance(value, (int, float)):
+                metrics[f"{base}/{metric_name}"] = float(value)
+
+        reward_terms = payload.get("reward_terms_mean_per_episode")
+        if isinstance(reward_terms, dict):
+            for term_name, term_value in reward_terms.items():
+                if isinstance(term_value, (int, float)):
+                    metrics[f"{base}/reward_terms/{str(term_name)}"] = float(term_value)
+
+        if not metrics:
+            return
+
+        step = payload.get("steps")
+        if isinstance(step, (int, float)):
+            wandb_module.log(metrics, step=int(step), commit=True)
+        else:
+            wandb_module.log(metrics, commit=True)
+
+    return _log_summary
 
 
 def install_agent_tracking_summary(agent, *, prefix: str = "[train_skrl]") -> None:
@@ -100,6 +161,8 @@ class PeriodicEpisodeSummaryWrapper(gym.Wrapper):
         *,
         interval_episodes: int = 10,
         prefix: str = "[train_skrl]",
+        summary_key: str = "env",
+        summary_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         super().__init__(env)
         interval = int(interval_episodes)
@@ -108,6 +171,8 @@ class PeriodicEpisodeSummaryWrapper(gym.Wrapper):
 
         self.interval_episodes = interval
         self.prefix = str(prefix)
+        self.summary_key = str(summary_key)
+        self.summary_callback = summary_callback
 
         self._global_steps = 0
         self._global_episodes = 0
@@ -174,14 +239,37 @@ class PeriodicEpisodeSummaryWrapper(gym.Wrapper):
                 collision_rate = float(self._window_collision_count) / n
                 timeout_rate = float(self._window_timeout_count) / n
 
-                reward_breakdown = ""
+                reward_term_means: dict[str, float] = {}
                 if self._window_reward_term_sums:
-                    parts: list[str] = []
                     for key in sorted(self._window_reward_term_sums):
-                        mean_value = self._window_reward_term_sums[key] / n
+                        reward_term_means[key] = self._window_reward_term_sums[key] / n
+
+                reward_breakdown = ""
+                if reward_term_means:
+                    parts: list[str] = []
+                    for key in sorted(reward_term_means):
+                        mean_value = reward_term_means[key]
                         parts.append(f"{key}={mean_value:.4f}")
                     if parts:
                         reward_breakdown = "reward_terms_mean_per_episode\n" + "\n".join(parts)
+
+                if self.summary_callback is not None:
+                    payload: dict[str, object] = {
+                        "source": self.summary_key,
+                        "episodes_start": int(self._global_episodes - self._window_episode_count + 1),
+                        "episodes_end": int(self._global_episodes),
+                        "steps": int(self._global_steps),
+                        "mean_return": float(mean_return),
+                        "mean_len": float(mean_len),
+                        "success_rate": float(success_rate),
+                        "collision_rate": float(collision_rate),
+                        "timeout_rate": float(timeout_rate),
+                        "reward_terms_mean_per_episode": reward_term_means,
+                    }
+                    try:
+                        self.summary_callback(payload)
+                    except Exception as exc:
+                        print(f"{self.prefix} warning: failed to publish summary callback: {exc}", flush=True)
 
                 print(
                     f"{self.prefix} summary \n"
@@ -207,4 +295,8 @@ class PeriodicEpisodeSummaryWrapper(gym.Wrapper):
         return observation, reward, terminated, truncated, info
 
 
-__all__ = ["PeriodicEpisodeSummaryWrapper", "install_agent_tracking_summary"]
+__all__ = [
+    "PeriodicEpisodeSummaryWrapper",
+    "install_agent_tracking_summary",
+    "_build_wandb_summary_callback",
+]

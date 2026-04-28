@@ -58,4 +58,9 @@ class SkrlPPOTrainConfig:
     # Periodic checkpoint saving via SKRL experiment hooks.
     checkpoint_interval: int = 50000
 
+    # Optional Weights & Biases integration through SKRL experiment hooks.
+    wandb: bool = False
+    wandb_project: str = "occupancy-prediction-rl"
+    wandb_run_name: str | None = None
+
     output: Path = Path("checkpoints/skrl_ppo_orca.pt")

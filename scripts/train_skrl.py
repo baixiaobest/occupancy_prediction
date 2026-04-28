@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+import datetime as dt
 
 import torch
 
@@ -31,8 +32,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-epochs", type=int, default=8)
     parser.add_argument("--mini-batches", type=int, default=8) 
         
-    parser.add_argument("--summary-interval-episodes", type=int, default=10)
+    parser.add_argument("--summary-interval-episodes", type=int, default=100)
     parser.add_argument("--checkpoint-interval", type=int, default=50000)
+    parser.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable/disable Weights & Biases logging",
+    )
+    parser.add_argument("--wandb-project", type=str, default="occupancy-prediction-rl")
+    parser.add_argument("--wandb-run-name", type=str, default=dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
 
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--vec-env", choices=["torch_dummy"], default="torch_dummy")
@@ -53,7 +62,7 @@ def main() -> None:
 
     observation_mode = str(args.observation_mode).strip().lower()
     if args.output is None:
-        output_path = Path(f"checkpoints/skrl_ppo_orca_{observation_mode}.pt")
+        output_path = Path(f"checkpoints/skrl_ppo_orca_{observation_mode}_{dt.datetime.now().strftime("%m-%d_%H-%M")}.pt")
     else:
         output_path = Path(args.output)
 
@@ -85,6 +94,9 @@ def main() -> None:
         vec_env_backend=str(args.vec_env),
         summary_interval_episodes=int(args.summary_interval_episodes),
         checkpoint_interval=int(args.checkpoint_interval),
+        wandb=bool(args.wandb),
+        wandb_project=str(args.wandb_project),
+        wandb_run_name=args.wandb_run_name,
         output=output_path,
     )
 
