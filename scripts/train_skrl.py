@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--map-extractor-type", choices=["conv", "vae_tap"], default="conv")
     parser.add_argument("--vae-checkpoint", type=Path, default=None)
+    parser.add_argument("--vae-tap-layer", type=int, default=None)
 
     parser.add_argument("--total-timesteps", type=int, default=300000)
     parser.add_argument("--rollouts", type=int, default=1024)
@@ -58,6 +59,7 @@ def main() -> None:
         controlled_agent_index=0,
         map_extractor_type=str(args.map_extractor_type),
         vae_checkpoint=None if args.vae_checkpoint is None else Path(args.vae_checkpoint),
+        vae_tap_layer=None if args.vae_tap_layer is None else int(args.vae_tap_layer),
     )
 
     train_config = SkrlPPOTrainConfig(

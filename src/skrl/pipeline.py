@@ -24,7 +24,11 @@ from src.skrl.env_torch_orca import (
     TorchORCARewardConfig,
     TorchORCASimConfig,
 )
-from src.skrl.models import OccupancyPolicyModel, OccupancyValueModel
+from src.skrl.models import (
+    OccupancyPolicyModel,
+    OccupancyValueModel,
+    VAEDecoderTapFeatureExtractor,
+)
 from src.skrl.observation_wrappers import MinimalKinematicsObservationWrapper
 from src.skrl.training_summary import PeriodicEpisodeSummaryWrapper, install_agent_tracking_summary
 
@@ -108,6 +112,20 @@ def run_skrl_ppo_training(
     )
     wrapped_env = wrap_env(env, wrapper="gymnasium", verbose=False)
 
+    map_extractor_type = str(env_config.map_extractor_type).strip().lower()
+    shared_feature_extractor = None
+    if map_extractor_type == "vae_tap":
+        if str(env_config.observation_mode).strip().lower() != "occupancy":
+            raise ValueError("map_extractor_type='vae_tap' requires observation_mode='occupancy'")
+        if env_config.vae_checkpoint is None:
+            raise ValueError("vae_checkpoint is required when map_extractor_type='vae_tap'")
+        shared_feature_extractor = VAEDecoderTapFeatureExtractor(
+            observation_space=wrapped_env.observation_space,
+            vae_checkpoint=str(env_config.vae_checkpoint),
+            tap_layer=(None if env_config.vae_tap_layer is None else int(env_config.vae_tap_layer)),
+        ).to(device)
+        shared_feature_extractor.eval()
+
     models = {
         "policy": OccupancyPolicyModel(
             wrapped_env.observation_space,
@@ -116,12 +134,14 @@ def run_skrl_ppo_training(
             hidden_dims=tuple(int(v) for v in train_config.actor_hidden_dims),
             initial_std=float(train_config.initial_policy_std),
             max_std=float(train_config.max_policy_std),
+            feature_extractor=shared_feature_extractor,
         ),
         "value": OccupancyValueModel(
             wrapped_env.observation_space,
             wrapped_env.action_space,
             device=device,
             hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
+            feature_extractor=shared_feature_extractor,
         ),
     }
 

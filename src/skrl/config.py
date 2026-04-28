@@ -24,6 +24,7 @@ class SkrlEnvBuildConfig:
 
     map_extractor_type: str = "conv"
     vae_checkpoint: Path | None = None
+    vae_tap_layer: int | None = None
 
 
 @dataclass

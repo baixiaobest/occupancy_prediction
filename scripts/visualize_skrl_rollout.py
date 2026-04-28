@@ -23,7 +23,7 @@ from src.skrl.env_torch_orca import (
     TorchORCARewardConfig,
     TorchORCASimConfig,
 )
-from src.skrl.models import OccupancyPolicyModel, OccupancyValueModel
+from src.skrl.models import OccupancyPolicyModel, OccupancyValueModel, VAEDecoderTapFeatureExtractor
 from src.skrl.observation_wrappers import MinimalKinematicsObservationWrapper
 
 # Reuse scene sampling and plotting utilities from SB3 visualizer.
@@ -105,6 +105,9 @@ def _load_skrl_models(
     actor_hidden_dims: tuple[int, ...],
     critic_hidden_dims: tuple[int, ...],
     device: torch.device,
+    map_extractor_type: str,
+    vae_checkpoint: Path | None,
+    vae_tap_layer: int | None,
 ) -> tuple[OccupancyPolicyModel, OccupancyValueModel]:
     resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path)
     try:
@@ -116,17 +119,30 @@ def _load_skrl_models(
     if "policy" not in checkpoint or "value" not in checkpoint:
         raise ValueError("SKRL checkpoint missing required keys: 'policy' and/or 'value'")
 
+    shared_feature_extractor = None
+    if str(map_extractor_type).strip().lower() == "vae_tap":
+        if vae_checkpoint is None:
+            raise ValueError("--vae-checkpoint is required when --map-extractor-type=vae_tap")
+        shared_feature_extractor = VAEDecoderTapFeatureExtractor(
+            observation_space=observation_space,
+            vae_checkpoint=str(vae_checkpoint),
+            tap_layer=(None if vae_tap_layer is None else int(vae_tap_layer)),
+        ).to(device)
+        shared_feature_extractor.eval()
+
     policy = OccupancyPolicyModel(
         observation_space,
         action_space,
         device=device,
         hidden_dims=actor_hidden_dims,
+        feature_extractor=shared_feature_extractor,
     ).to(device)
     value = OccupancyValueModel(
         observation_space,
         action_space,
         device=device,
         hidden_dims=critic_hidden_dims,
+        feature_extractor=shared_feature_extractor,
     ).to(device)
 
     policy.load_state_dict(checkpoint["policy"])
@@ -325,6 +341,12 @@ def parse_args() -> argparse.Namespace:
             "--map-extractor-type=vae_tap."
         ),
     )
+    parser.add_argument(
+        "--vae-tap-layer",
+        type=int,
+        default=None,
+        help="Optional decoder tap layer index when --map-extractor-type=vae_tap.",
+    )
 
     return parser.parse_args()
 
@@ -396,6 +418,9 @@ def main() -> None:
             actor_hidden_dims=tuple(int(v) for v in args.actor_hidden_dims),
             critic_hidden_dims=tuple(int(v) for v in args.critic_hidden_dims),
             device=device,
+            map_extractor_type=str(args.map_extractor_type),
+            vae_checkpoint=None if args.vae_checkpoint is None else Path(args.vae_checkpoint),
+            vae_tap_layer=None if args.vae_tap_layer is None else int(args.vae_tap_layer),
         )
     finally:
         probe_wrapped_env.close()
