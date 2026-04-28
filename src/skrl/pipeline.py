@@ -31,6 +31,7 @@ from src.skrl.models import (
 )
 from src.skrl.observation_wrappers import MinimalKinematicsObservationWrapper
 from src.skrl.training_summary import PeriodicEpisodeSummaryWrapper, install_agent_tracking_summary
+from src.skrl.vec_env_torch_orca import build_torch_orca_vec_env
 
 
 def _build_scene_pool(config: SkrlEnvBuildConfig, *, seed: int) -> list[Scene]:
@@ -48,6 +49,8 @@ def _build_scene_pool(config: SkrlEnvBuildConfig, *, seed: int) -> list[Scene]:
 
 
 def _make_single_env(env_cfg: SkrlEnvBuildConfig, seed: int, device: torch.device) -> gym.Env:
+    config = _build_torch_orca_env_config(env_cfg, device=device)
+
     scenes = _build_scene_pool(env_cfg, seed=seed)
     scene_factory = make_scene_factory(
         scenes,
@@ -56,6 +59,23 @@ def _make_single_env(env_cfg: SkrlEnvBuildConfig, seed: int, device: torch.devic
         seed=int(seed),
     )
 
+    base_env = TorchORCAEnv(scene_factory=scene_factory, config=config)
+
+    observation_mode = str(env_cfg.observation_mode).strip().lower()
+    if observation_mode == "occupancy":
+        return base_env
+    if observation_mode == "minimal":
+        return MinimalKinematicsObservationWrapper(base_env)
+    raise ValueError(
+        f"Unknown observation_mode '{env_cfg.observation_mode}'. Expected one of: occupancy, minimal"
+    )
+
+
+def _build_torch_orca_env_config(
+    env_cfg: SkrlEnvBuildConfig,
+    *,
+    device: torch.device,
+) -> TorchORCAEnvConfig:
     sim_cfg = TorchORCASimConfig()
     reward_cfg = TorchORCARewardConfig()
     config = TorchORCAEnvConfig(
@@ -71,28 +91,17 @@ def _make_single_env(env_cfg: SkrlEnvBuildConfig, seed: int, device: torch.devic
             raise ValueError("vae_checkpoint is required when map_extractor_type='vae_tap'")
         config.occupancy.dynamic_context_len = load_decoder_context_len_from_checkpoint(env_cfg.vae_checkpoint)
 
-    base_env = TorchORCAEnv(scene_factory=scene_factory, config=config)
-
-    observation_mode = str(env_cfg.observation_mode).strip().lower()
-    if observation_mode == "occupancy":
-        return base_env
-    if observation_mode == "minimal":
-        return MinimalKinematicsObservationWrapper(base_env)
-    raise ValueError(
-        f"Unknown observation_mode '{env_cfg.observation_mode}'. Expected one of: occupancy, minimal"
-    )
+    return config
 
 
 def run_skrl_ppo_training(
     env_config: SkrlEnvBuildConfig,
     train_config: SkrlPPOTrainConfig,
 ) -> Path:
-    """Train a simple SKRL PPO agent on a single ORCA environment.
-
-    This first version intentionally targets num_envs=1 to keep the stack minimal.
-    """
-    if int(train_config.num_envs) != 1:
-        raise NotImplementedError("This initial SKRL pipeline supports only num_envs=1")
+    """Train SKRL PPO agent on one or many ORCA environments."""
+    num_envs = int(train_config.num_envs)
+    if num_envs <= 0:
+        raise ValueError("num_envs must be > 0")
 
     seed_everything(int(train_config.seed))
 
@@ -104,12 +113,26 @@ def run_skrl_ppo_training(
     if summary_interval_episodes <= 0:
         raise ValueError("summary_interval_episodes must be > 0")
 
-    env = _make_single_env(env_config, seed=int(train_config.seed), device=device)
-    env = PeriodicEpisodeSummaryWrapper(
-        env,
-        interval_episodes=summary_interval_episodes,
-        prefix="[train_skrl]",
-    )
+    if num_envs == 1:
+        env = _make_single_env(env_config, seed=int(train_config.seed), device=device)
+        env = PeriodicEpisodeSummaryWrapper(
+            env,
+            interval_episodes=summary_interval_episodes,
+            prefix="[train_skrl]",
+        )
+    else:
+        env = build_torch_orca_vec_env(
+            scenes=_build_scene_pool(env_config, seed=int(train_config.seed)),
+            selection=str(env_config.scene_selection),
+            fixed_scene_index=int(env_config.fixed_scene_index),
+            seed=int(train_config.seed),
+            num_envs=num_envs,
+            env_config=_build_torch_orca_env_config(env_config, device=device),
+            observation_mode=str(env_config.observation_mode),
+            interval_episodes=summary_interval_episodes,
+            backend=str(train_config.vec_env_backend),
+        )
+
     wrapped_env = wrap_env(env, wrapper="gymnasium", verbose=False)
 
     map_extractor_type = str(env_config.map_extractor_type).strip().lower()

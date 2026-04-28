@@ -15,7 +15,7 @@ from src.skrl.pipeline import dump_effective_configs, run_skrl_ppo_training
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train ORCA policy with SKRL PPO (single environment)")
+    parser = argparse.ArgumentParser(description="Train ORCA policy with SKRL PPO")
 
     parser.add_argument("--template-set", choices=["default", "test", "cross", "l_shape", "empty_goal"], default="empty_goal")
     parser.add_argument("--scene-selection", choices=["random", "cycle", "fixed"], default="random")
@@ -35,15 +35,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-interval", type=int, default=50000)
 
     parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument("--vec-env", choices=["torch_dummy"], default="torch_dummy")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--output", type=Path, default=Path("checkpoints/skrl_ppo_orca.pt"))
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional output path. If omitted, defaults to checkpoints/skrl_ppo_orca_<observation_mode>.pt",
+    )
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    observation_mode = str(args.observation_mode).strip().lower()
+    if args.output is None:
+        output_path = Path(f"checkpoints/skrl_ppo_orca_{observation_mode}.pt")
+    else:
+        output_path = Path(args.output)
 
     env_config = SkrlEnvBuildConfig(
         template_set=str(args.template_set),
@@ -70,9 +82,10 @@ def main() -> None:
         seed=int(args.seed),
         device=str(args.device),
         num_envs=int(args.num_envs),
+        vec_env_backend=str(args.vec_env),
         summary_interval_episodes=int(args.summary_interval_episodes),
         checkpoint_interval=int(args.checkpoint_interval),
-        output=Path(args.output),
+        output=output_path,
     )
 
     effective = dump_effective_configs(env_config, train_config)

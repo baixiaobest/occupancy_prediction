@@ -39,6 +39,7 @@ class SkrlPPOTrainConfig:
     seed: int = 42
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
     num_envs: int = 1
+    vec_env_backend: str = "torch_dummy"
 
     actor_hidden_dims: tuple[int, ...] = (64, 64)
     critic_hidden_dims: tuple[int, ...] = (64, 64)
