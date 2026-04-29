@@ -74,7 +74,7 @@ class SkrlPPOTrainConfig(SkrlTrainConfigBase):
 
 @dataclass
 class SkrlSACTrainConfig(SkrlTrainConfigBase):
-    memory_size: int = 4e4
+    memory_size: int = 2e4
     gradient_steps: int = 1
     batch_size: int = 512
     polyak: float = 0.005
