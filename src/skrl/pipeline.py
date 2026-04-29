@@ -9,7 +9,7 @@ import gymnasium as gym
 import torch
 
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
-from skrl.agents.torch.sac import SAC, SAC_DEFAULT_CONFIG
+from skrl.agents.torch.sac import SAC_DEFAULT_CONFIG
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
 from skrl.trainers.torch import SequentialTrainer
@@ -33,6 +33,7 @@ from src.skrl.models import (
     build_tap_bottleneck_feature_projector,
 )
 from src.skrl.observation_wrappers import MinimalKinematicsObservationWrapper
+from src.skrl.custom_sac import CustomSAC
 from src.skrl.training_summary import (
     PeriodicEpisodeSummaryWrapper,
     _build_wandb_summary_callback,
@@ -345,6 +346,9 @@ def run_skrl_sac_training(
     train_config: SkrlSACTrainConfig,
 ) -> Path:
     """Train SKRL SAC agent on one or many ORCA environments."""
+    if int(train_config.train_freq) <= 0:
+        raise ValueError("train_freq must be > 0")
+
     wrapped_env, device, enable_wandb = _prepare_wrapped_env(
         env_config=env_config,
         train_config=train_config,
@@ -413,6 +417,7 @@ def run_skrl_sac_training(
     agent_cfg["critic_learning_rate"] = float(train_config.critic_learning_rate)
     agent_cfg["random_timesteps"] = int(train_config.random_timesteps)
     agent_cfg["learning_starts"] = int(train_config.learning_starts)
+    agent_cfg["train_freq"] = int(train_config.train_freq)
     agent_cfg["learn_entropy"] = bool(train_config.learn_entropy)
     agent_cfg["entropy_learning_rate"] = float(train_config.entropy_learning_rate)
     agent_cfg["initial_entropy_value"] = float(train_config.initial_entropy_value)
@@ -434,7 +439,7 @@ def run_skrl_sac_training(
         agent_cfg["experiment"]["experiment_name"] = output_path.stem
         agent_cfg["experiment"]["store_separately"] = False
 
-    agent = SAC(
+    agent = CustomSAC(
         models=models,
         memory=memory,
         observation_space=wrapped_env.observation_space,

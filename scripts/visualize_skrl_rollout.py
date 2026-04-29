@@ -25,7 +25,7 @@ from src.skrl.env_torch_orca import (
     TorchORCARewardConfig,
     TorchORCASimConfig,
 )
-from src.skrl.models import OccupancyPolicyModel, OccupancyValueModel
+from src.skrl.models import OccupancyPolicyModel, OccupancyQValueModel, OccupancyValueModel
 from src.skrl.observation_wrappers import MinimalKinematicsObservationWrapper
 
 # Reuse scene sampling and plotting utilities from SB3 visualizer.
@@ -58,13 +58,31 @@ def _load_checkpoint_dict(*, checkpoint_path: Path, device: torch.device) -> dic
         checkpoint = torch.load(resolved_checkpoint, map_location=device)
 
     if not isinstance(checkpoint, dict):
-        raise ValueError("SKRL checkpoint must be a dict with at least 'policy' and 'value' keys")
-    if "policy" not in checkpoint or "value" not in checkpoint:
-        raise ValueError("SKRL checkpoint missing required keys: 'policy' and/or 'value'")
-    if not isinstance(checkpoint["policy"], Mapping) or not isinstance(checkpoint["value"], Mapping):
-        raise ValueError("SKRL checkpoint 'policy' and 'value' entries must be state_dict mappings")
+        raise ValueError("SKRL checkpoint must be a dict with at least a 'policy' state_dict")
+
+    _select_policy_and_aux_state_dicts(checkpoint)
 
     return checkpoint
+
+
+def _select_policy_and_aux_state_dicts(
+    checkpoint: Mapping[str, object],
+) -> tuple[Mapping[str, torch.Tensor], Mapping[str, torch.Tensor], str]:
+    policy_state_dict = checkpoint.get("policy")
+    if not isinstance(policy_state_dict, Mapping):
+        raise ValueError("SKRL checkpoint missing required key: 'policy'")
+
+    value_state_dict = checkpoint.get("value")
+    if isinstance(value_state_dict, Mapping):
+        return policy_state_dict, value_state_dict, "ppo"
+
+    critic_state_dict = checkpoint.get("critic_1")
+    if isinstance(critic_state_dict, Mapping):
+        return policy_state_dict, critic_state_dict, "sac"
+
+    raise ValueError(
+        "SKRL checkpoint missing required critic/value key: expected 'value' (PPO) or 'critic_1' (SAC)"
+    )
 
 
 def _checkpoint_uses_legacy_feature_extractor(state_dict: Mapping[str, torch.Tensor]) -> bool:
@@ -99,19 +117,21 @@ def _infer_tap_bottleneck_arch(state_dict: Mapping[str, torch.Tensor]) -> tuple[
 
 
 def _infer_checkpoint_map_extractor_type(checkpoint: dict) -> str:
-    policy_uses_legacy_extractor = _checkpoint_uses_legacy_feature_extractor(checkpoint["policy"])
-    value_uses_legacy_extractor = _checkpoint_uses_legacy_feature_extractor(checkpoint["value"])
-    if policy_uses_legacy_extractor or value_uses_legacy_extractor:
+    policy_state_dict, aux_state_dict, _ = _select_policy_and_aux_state_dicts(checkpoint)
+
+    policy_uses_legacy_extractor = _checkpoint_uses_legacy_feature_extractor(policy_state_dict)
+    aux_uses_legacy_extractor = _checkpoint_uses_legacy_feature_extractor(aux_state_dict)
+    if policy_uses_legacy_extractor or aux_uses_legacy_extractor:
         raise ValueError(
             "This checkpoint uses the legacy feature_extractor path. "
             "Use a checkpoint trained with env-side decoder tapping."
         )
 
-    policy_uses_tap_projector = _checkpoint_uses_tap_projector(checkpoint["policy"])
-    value_uses_tap_projector = _checkpoint_uses_tap_projector(checkpoint["value"])
-    if policy_uses_tap_projector != value_uses_tap_projector:
+    policy_uses_tap_projector = _checkpoint_uses_tap_projector(policy_state_dict)
+    aux_uses_tap_projector = _checkpoint_uses_tap_projector(aux_state_dict)
+    if policy_uses_tap_projector != aux_uses_tap_projector:
         raise ValueError(
-            "Checkpoint appears inconsistent: policy and value disagree on tap bottleneck weights"
+            "Checkpoint appears inconsistent: policy and auxiliary critic/value disagree on tap bottleneck weights"
         )
     return "vae_tap" if policy_uses_tap_projector else "conv"
 
@@ -186,8 +206,9 @@ def _load_skrl_models(
     map_extractor_type: str,
     vae_checkpoint: Path | None,
     vae_tap_layer: int | None,
-) -> tuple[OccupancyPolicyModel, OccupancyValueModel]:
+) -> tuple[OccupancyPolicyModel, OccupancyValueModel | OccupancyQValueModel]:
     checkpoint = _load_checkpoint_dict(checkpoint_path=checkpoint_path, device=device)
+    policy_state_dict, aux_state_dict, algorithm = _select_policy_and_aux_state_dicts(checkpoint)
 
     checkpoint_map_extractor_type = _infer_checkpoint_map_extractor_type(checkpoint)
     requested_map_extractor_type = str(map_extractor_type).strip().lower()
@@ -202,7 +223,7 @@ def _load_skrl_models(
     if checkpoint_map_extractor_type == "vae_tap":
         if vae_checkpoint is None:
             raise ValueError("--vae-checkpoint is required when --map-extractor-type=vae_tap")
-        tap_bottleneck_hidden_dims, tap_bottleneck_output_dim = _infer_tap_bottleneck_arch(checkpoint["policy"])
+        tap_bottleneck_hidden_dims, tap_bottleneck_output_dim = _infer_tap_bottleneck_arch(policy_state_dict)
 
     policy = OccupancyPolicyModel(
         observation_space,
@@ -212,17 +233,27 @@ def _load_skrl_models(
         tap_bottleneck_hidden_dims=tap_bottleneck_hidden_dims,
         tap_bottleneck_output_dim=tap_bottleneck_output_dim,
     ).to(device)
-    value = OccupancyValueModel(
-        observation_space,
-        action_space,
-        device=device,
-        hidden_dims=critic_hidden_dims,
-        tap_bottleneck_hidden_dims=tap_bottleneck_hidden_dims,
-        tap_bottleneck_output_dim=tap_bottleneck_output_dim,
-    ).to(device)
+    if algorithm == "ppo":
+        value_or_critic_model: OccupancyValueModel | OccupancyQValueModel = OccupancyValueModel(
+            observation_space,
+            action_space,
+            device=device,
+            hidden_dims=critic_hidden_dims,
+            tap_bottleneck_hidden_dims=tap_bottleneck_hidden_dims,
+            tap_bottleneck_output_dim=tap_bottleneck_output_dim,
+        ).to(device)
+    else:
+        value_or_critic_model = OccupancyQValueModel(
+            observation_space,
+            action_space,
+            device=device,
+            hidden_dims=critic_hidden_dims,
+            tap_bottleneck_hidden_dims=tap_bottleneck_hidden_dims,
+            tap_bottleneck_output_dim=tap_bottleneck_output_dim,
+        ).to(device)
 
     checkpoint_input_dim = None
-    checkpoint_net0 = checkpoint["policy"].get("net.0.weight")
+    checkpoint_net0 = policy_state_dict.get("net.0.weight")
     if isinstance(checkpoint_net0, torch.Tensor) and checkpoint_net0.ndim == 2:
         checkpoint_input_dim = int(checkpoint_net0.shape[1])
     model_input_dim = None
@@ -235,23 +266,21 @@ def _load_skrl_models(
             "This usually means checkpoint and observation settings differ."
         )
 
-    policy.load_state_dict(checkpoint["policy"])
-    value.load_state_dict(checkpoint["value"])
+    policy.load_state_dict(policy_state_dict)
+    value_or_critic_model.load_state_dict(aux_state_dict)
     policy.eval()
-    value.eval()
-    return policy, value
+    value_or_critic_model.eval()
+    return policy, value_or_critic_model
 
 
 def _policy_action_and_stats(
     *,
     policy: OccupancyPolicyModel,
-    value_model: OccupancyValueModel,
+    value_model: OccupancyValueModel | OccupancyQValueModel,
     state_tensor: torch.Tensor,
     deterministic: bool,
 ) -> tuple[torch.Tensor, float, float, float]:
     with torch.no_grad():
-        values, _, _ = value_model.act({"states": state_tensor}, role="value")
-
         if deterministic:
             mean_actions, log_std_parameter, _ = policy.compute({"states": state_tensor}, role="policy")
             log_std = log_std_parameter.view(1, -1).expand_as(mean_actions)
@@ -264,6 +293,17 @@ def _policy_action_and_stats(
             actions, log_prob, _ = policy.act({"states": state_tensor}, role="policy")
             actions = torch.clamp(actions, -1.0, 1.0)
             entropy = policy.get_entropy(role="policy").sum(dim=-1, keepdim=True)
+
+        if isinstance(value_model, OccupancyQValueModel):
+            values, _ = value_model.compute(
+                {
+                    "states": state_tensor,
+                    "taken_actions": actions,
+                },
+                role="critic_1",
+            )
+        else:
+            values, _ = value_model.compute({"states": state_tensor}, role="value")
 
     value_scalar = float(values.reshape(-1)[0].item())
     log_prob_scalar = float(log_prob.reshape(-1)[0].item())
@@ -287,7 +327,7 @@ def _compute_fixed_plot_limits(record: EpisodeRecord, dt: float) -> tuple[float,
 def _run_selected_episode(
     *,
     policy: OccupancyPolicyModel,
-    value_model: OccupancyValueModel,
+    value_model: OccupancyValueModel | OccupancyQValueModel,
     scenes: list,
     selection: ScenarioSelection,
     env_config: TorchORCAEnvConfig,

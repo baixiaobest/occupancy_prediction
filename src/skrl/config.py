@@ -75,8 +75,9 @@ class SkrlPPOTrainConfig(SkrlTrainConfigBase):
 @dataclass
 class SkrlSACTrainConfig(SkrlTrainConfigBase):
     memory_size: int = 1e6
+    train_freq: int = 1
     gradient_steps: int = 1
-    batch_size: int = 512
+    batch_size: int = 1024
     polyak: float = 0.005
 
     actor_learning_rate: float = 1e-4

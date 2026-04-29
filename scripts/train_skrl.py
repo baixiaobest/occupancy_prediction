@@ -36,7 +36,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Replay buffer size override (used only when --algorithm sac)",
     )
-        
     parser.add_argument("--summary-interval-episodes", type=int, default=100)
     parser.add_argument("--checkpoint-interval", type=int, default=50000)
     parser.add_argument(
