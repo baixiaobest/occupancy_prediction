@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-tap-layer", type=int, default=None)
 
     parser.add_argument("--total-timesteps", type=int, default=300000)
+    parser.add_argument(
+        "--memory-size",
+        type=int,
+        default=None,
+        help="Replay buffer size override (used only when --algorithm sac)",
+    )
         
     parser.add_argument("--summary-interval-episodes", type=int, default=100)
     parser.add_argument("--checkpoint-interval", type=int, default=50000)
@@ -99,7 +105,11 @@ def main() -> None:
     )
 
     if algorithm == "sac":
-        train_config = SkrlSACTrainConfig(**common_train_kwargs)
+        sac_train_kwargs = dict(common_train_kwargs)
+        if args.memory_size is not None:
+            sac_train_kwargs["memory_size"] = int(args.memory_size)
+
+        train_config = SkrlSACTrainConfig(**sac_train_kwargs)
         train_fn = run_skrl_sac_training
     else:
         train_config = SkrlPPOTrainConfig(**common_train_kwargs)
