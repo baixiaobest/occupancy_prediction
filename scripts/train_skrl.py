@@ -33,8 +33,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-size",
         type=int,
-        default=None,
+        default=1e6,
         help="Replay buffer size override (used only when --algorithm sac)",
+    )
+    parser.add_argument(
+        "--train-freq",
+        type=int,
+        default=1,
+        help="SAC update frequency in interactions (used only when --algorithm sac)",
     )
     parser.add_argument("--summary-interval-episodes", type=int, default=100)
     parser.add_argument("--checkpoint-interval", type=int, default=50000)
@@ -107,6 +113,8 @@ def main() -> None:
         sac_train_kwargs = dict(common_train_kwargs)
         if args.memory_size is not None:
             sac_train_kwargs["memory_size"] = int(args.memory_size)
+        if args.train_freq is not None:
+            sac_train_kwargs["train_freq"] = int(args.train_freq)
 
         train_config = SkrlSACTrainConfig(**sac_train_kwargs)
         train_fn = run_skrl_sac_training
