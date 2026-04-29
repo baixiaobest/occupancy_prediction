@@ -11,12 +11,14 @@ import torch
 # Allow running this script directly from the repository root.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.skrl.config import SkrlEnvBuildConfig, SkrlPPOTrainConfig
-from src.skrl.pipeline import dump_effective_configs, run_skrl_ppo_training
+from src.skrl.config import SkrlEnvBuildConfig, SkrlPPOTrainConfig, SkrlSACTrainConfig
+from src.skrl.pipeline import dump_effective_configs, run_skrl_ppo_training, run_skrl_sac_training
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train ORCA policy with SKRL PPO")
+    parser = argparse.ArgumentParser(description="Train ORCA policy with SKRL")
+
+    parser.add_argument("--algorithm", choices=["ppo", "sac"], default="ppo")
 
     parser.add_argument("--template-set", choices=["default", "test", "cross", "l_shape", "empty_goal"], default="empty_goal")
     parser.add_argument("--scene-selection", choices=["random", "cycle", "fixed"], default="random")
@@ -28,9 +30,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-tap-layer", type=int, default=None)
 
     parser.add_argument("--total-timesteps", type=int, default=300000)
-    parser.add_argument("--rollouts", type=int, default=1024)
-    parser.add_argument("--learning-epochs", type=int, default=8)
-    parser.add_argument("--mini-batches", type=int, default=8) 
         
     parser.add_argument("--summary-interval-episodes", type=int, default=100)
     parser.add_argument("--checkpoint-interval", type=int, default=50000)
@@ -51,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=None,
-        help="Optional output path. If omitted, defaults to checkpoints/skrl_ppo_orca_<observation_mode>.pt",
+        help="Optional output path. If omitted, defaults to checkpoints/skrl_<algorithm>_orca_<observation_mode>.pt",
     )
 
     return parser.parse_args()
@@ -60,10 +59,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    algorithm = str(args.algorithm).strip().lower()
     observation_mode = str(args.observation_mode).strip().lower()
     if args.output is None:
         time = dt.datetime.now().strftime("%m-%d_%H-%M")
-        output_path = Path(f"checkpoints/skrl_ppo_orca_{observation_mode}_{time}.pt")
+        output_path = Path(f"checkpoints/skrl_{algorithm}_orca_{observation_mode}_{time}.pt")
     else:
         output_path = Path(args.output)
 
@@ -84,11 +84,8 @@ def main() -> None:
         vae_tap_layer=None if args.vae_tap_layer is None else int(args.vae_tap_layer),
     )
 
-    train_config = SkrlPPOTrainConfig(
+    common_train_kwargs = dict(
         total_timesteps=int(args.total_timesteps),
-        rollouts=int(args.rollouts),
-        learning_epochs=int(args.learning_epochs),
-        mini_batches=int(args.mini_batches),
         seed=int(args.seed),
         device=str(args.device),
         num_envs=int(args.num_envs),
@@ -101,12 +98,19 @@ def main() -> None:
         output=output_path,
     )
 
+    if algorithm == "sac":
+        train_config = SkrlSACTrainConfig(**common_train_kwargs)
+        train_fn = run_skrl_sac_training
+    else:
+        train_config = SkrlPPOTrainConfig(**common_train_kwargs)
+        train_fn = run_skrl_ppo_training
+
     effective = dump_effective_configs(env_config, train_config)
     print("[train_skrl] effective env config:", effective["env"])
     print("[train_skrl] effective train config:", effective["train"])
     print(f"[train_skrl] torch.cuda.is_available={torch.cuda.is_available()} | requested device={train_config.device}")
 
-    output_path = run_skrl_ppo_training(env_config=env_config, train_config=train_config)
+    output_path = train_fn(env_config=env_config, train_config=train_config)
     print(f"[train_skrl] saved checkpoint: {output_path}")
 
 

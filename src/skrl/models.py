@@ -390,3 +390,36 @@ class OccupancyValueModel(DeterministicMixin, Model):
         states = inputs["states"]
         features = _extract_features(states, self.feature_extractor)
         return self.net(features), {}
+
+
+class OccupancyQValueModel(DeterministicMixin, Model):
+    """State-action critic for off-policy algorithms such as SAC."""
+
+    def __init__(
+        self,
+        observation_space,
+        action_space,
+        device: str | torch.device,
+        hidden_dims: tuple[int, ...] = (256, 256),
+        feature_extractor: nn.Module | None = None,
+    ) -> None:
+        Model.__init__(self, observation_space, action_space, device)
+        DeterministicMixin.__init__(self, clip_actions=False)
+
+        self.feature_extractor = feature_extractor
+        feature_dim = _resolve_feature_dim(self.feature_extractor, self.num_observations)
+        self.net = _build_mlp(feature_dim + self.num_actions, 1, hidden_dims)
+
+    def compute(self, inputs, role):
+        states = inputs["states"]
+        taken_actions = inputs["taken_actions"]
+
+        features = _extract_features(states, self.feature_extractor)
+        if not torch.is_tensor(taken_actions):
+            taken_actions = torch.as_tensor(taken_actions)
+        if taken_actions.ndim == 1:
+            taken_actions = taken_actions.unsqueeze(0)
+        taken_actions = taken_actions.float()
+
+        q_input = torch.cat((features, taken_actions), dim=1)
+        return self.net(q_input), {}

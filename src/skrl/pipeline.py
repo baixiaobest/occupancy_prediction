@@ -9,6 +9,7 @@ import gymnasium as gym
 import torch
 
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.agents.torch.sac import SAC, SAC_DEFAULT_CONFIG
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
 from skrl.trainers.torch import SequentialTrainer
@@ -18,7 +19,7 @@ from src.experiment_utils import EmptyGoalTemplateConfig, build_scene_pool, seed
 from src.scene import Scene
 from src.scene_sampling import make_scene_factory
 from src.sb3.utils import load_decoder_context_len_from_checkpoint
-from src.skrl.config import SkrlEnvBuildConfig, SkrlPPOTrainConfig
+from src.skrl.config import SkrlEnvBuildConfig, SkrlPPOTrainConfig, SkrlSACTrainConfig, SkrlTrainConfigBase
 from src.skrl.env_torch_orca import (
     TorchORCAEnv,
     TorchORCAEnvConfig,
@@ -27,6 +28,7 @@ from src.skrl.env_torch_orca import (
 )
 from src.skrl.models import (
     OccupancyPolicyModel,
+    OccupancyQValueModel,
     OccupancyValueModel,
     VAEDecoderTapFeatureExtractor,
 )
@@ -99,7 +101,7 @@ def _build_torch_orca_env_config(
     return config
 
 
-def _build_wandb_experiment_kwargs(train_config: SkrlPPOTrainConfig, *, output_path: Path) -> dict[str, object]:
+def _build_wandb_experiment_kwargs(train_config: SkrlTrainConfigBase, *, output_path: Path) -> dict[str, object]:
     run_name = train_config.wandb_run_name
     if run_name is None or not str(run_name).strip():
         run_name = output_path.stem
@@ -127,7 +129,7 @@ def _save_checkpoint_file_to_wandb(*, checkpoint_path: Path, wandb_module: objec
 def _install_periodic_checkpoint_upload_hook(
     *,
     agent,
-    train_config: SkrlPPOTrainConfig,
+    train_config: SkrlTrainConfigBase,
 ) -> None:
     if not bool(train_config.wandb):
         return
@@ -154,7 +156,7 @@ def _install_periodic_checkpoint_upload_hook(
     agent.write_tracking_data = _patched_write_tracking_data
 
 
-def _save_checkpoint_to_wandb_if_enabled(*, train_config: SkrlPPOTrainConfig, checkpoint_path: Path) -> None:
+def _save_checkpoint_to_wandb_if_enabled(*, train_config: SkrlTrainConfigBase, checkpoint_path: Path) -> None:
     if not bool(train_config.wandb):
         return
     try:
@@ -163,11 +165,11 @@ def _save_checkpoint_to_wandb_if_enabled(*, train_config: SkrlPPOTrainConfig, ch
         raise RuntimeError(f"Failed to upload checkpoint to W&B: {checkpoint_path}") from exc
 
 
-def run_skrl_ppo_training(
+def _prepare_wrapped_env(
+    *,
     env_config: SkrlEnvBuildConfig,
-    train_config: SkrlPPOTrainConfig,
-) -> Path:
-    """Train SKRL PPO agent on one or many ORCA environments."""
+    train_config: SkrlTrainConfigBase,
+) -> tuple[object, torch.device, bool]:
     num_envs = int(train_config.num_envs)
     if num_envs <= 0:
         raise ValueError("num_envs must be > 0")
@@ -209,22 +211,86 @@ def run_skrl_ppo_training(
         )
 
     wrapped_env = wrap_env(env, wrapper="gymnasium", verbose=False)
+    return wrapped_env, device, enable_wandb
 
+
+def _build_shared_feature_extractor_if_needed(
+    *,
+    env_config: SkrlEnvBuildConfig,
+    train_config: SkrlTrainConfigBase,
+    wrapped_env,
+    device: torch.device,
+):
     map_extractor_type = str(env_config.map_extractor_type).strip().lower()
-    shared_feature_extractor = None
-    if map_extractor_type == "vae_tap":
-        if str(env_config.observation_mode).strip().lower() != "occupancy":
-            raise ValueError("map_extractor_type='vae_tap' requires observation_mode='occupancy'")
-        if env_config.vae_checkpoint is None:
-            raise ValueError("vae_checkpoint is required when map_extractor_type='vae_tap'")
-        shared_feature_extractor = VAEDecoderTapFeatureExtractor(
-            observation_space=wrapped_env.observation_space,
-            vae_checkpoint=str(env_config.vae_checkpoint),
-            tap_layer=(None if env_config.vae_tap_layer is None else int(env_config.vae_tap_layer)),
-            tap_bottleneck_hidden_dim=tuple(int(v) for v in train_config.tap_bottleneck_hidden_dims),
-            tap_bottleneck_output_dim=int(train_config.tap_bottleneck_output_dim),
-        ).to(device)
-        shared_feature_extractor.eval()
+    if map_extractor_type != "vae_tap":
+        return None
+
+    if str(env_config.observation_mode).strip().lower() != "occupancy":
+        raise ValueError("map_extractor_type='vae_tap' requires observation_mode='occupancy'")
+    if env_config.vae_checkpoint is None:
+        raise ValueError("vae_checkpoint is required when map_extractor_type='vae_tap'")
+
+    shared_feature_extractor = VAEDecoderTapFeatureExtractor(
+        observation_space=wrapped_env.observation_space,
+        vae_checkpoint=str(env_config.vae_checkpoint),
+        tap_layer=(None if env_config.vae_tap_layer is None else int(env_config.vae_tap_layer)),
+        tap_bottleneck_hidden_dim=tuple(int(v) for v in train_config.tap_bottleneck_hidden_dims),
+        tap_bottleneck_output_dim=int(train_config.tap_bottleneck_output_dim),
+    ).to(device)
+    shared_feature_extractor.eval()
+    return shared_feature_extractor
+
+
+def _prepare_output_path(train_config: SkrlTrainConfigBase) -> Path:
+    output_path = Path(train_config.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return output_path
+
+
+def _run_training(
+    *,
+    agent,
+    wrapped_env,
+    train_config: SkrlTrainConfigBase,
+    output_path: Path,
+) -> Path:
+    trainer_cfg = copy.deepcopy(SEQUENTIAL_TRAINER_DEFAULT_CONFIG)
+    trainer_cfg["timesteps"] = int(train_config.total_timesteps)
+    trainer_cfg["headless"] = True
+    trainer_cfg["disable_progressbar"] = False
+
+    trainer = SequentialTrainer(
+        env=wrapped_env,
+        agents=agent,
+        cfg=trainer_cfg,
+    )
+
+    try:
+        trainer.train()
+        agent.save(str(output_path))
+        _save_checkpoint_to_wandb_if_enabled(train_config=train_config, checkpoint_path=output_path)
+    finally:
+        wrapped_env.close()
+
+    return output_path
+
+
+def run_skrl_ppo_training(
+    env_config: SkrlEnvBuildConfig,
+    train_config: SkrlPPOTrainConfig,
+) -> Path:
+    """Train SKRL PPO agent on one or many ORCA environments."""
+    wrapped_env, device, enable_wandb = _prepare_wrapped_env(
+        env_config=env_config,
+        train_config=train_config,
+    )
+
+    shared_feature_extractor = _build_shared_feature_extractor_if_needed(
+        env_config=env_config,
+        train_config=train_config,
+        wrapped_env=wrapped_env,
+        device=device,
+    )
 
     models = {
         "policy": OccupancyPolicyModel(
@@ -251,8 +317,7 @@ def run_skrl_ppo_training(
         device=device,
     )
 
-    output_path = Path(train_config.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path = _prepare_output_path(train_config)
 
     agent_cfg = copy.deepcopy(PPO_DEFAULT_CONFIG)
     agent_cfg["rollouts"] = int(train_config.rollouts)
@@ -292,28 +357,128 @@ def run_skrl_ppo_training(
     install_agent_tracking_summary(agent, prefix="[train_skrl]")
     _install_periodic_checkpoint_upload_hook(agent=agent, train_config=train_config)
 
-    trainer_cfg = copy.deepcopy(SEQUENTIAL_TRAINER_DEFAULT_CONFIG)
-    trainer_cfg["timesteps"] = int(train_config.total_timesteps)
-    trainer_cfg["headless"] = True
-    trainer_cfg["disable_progressbar"] = False
-
-    trainer = SequentialTrainer(
-        env=wrapped_env,
-        agents=agent,
-        cfg=trainer_cfg,
+    return _run_training(
+        agent=agent,
+        wrapped_env=wrapped_env,
+        train_config=train_config,
+        output_path=output_path,
     )
 
-    try:
-        trainer.train()
-        agent.save(str(output_path))
-        _save_checkpoint_to_wandb_if_enabled(train_config=train_config, checkpoint_path=output_path)
-    finally:
-        wrapped_env.close()
 
-    return output_path
+def run_skrl_sac_training(
+    env_config: SkrlEnvBuildConfig,
+    train_config: SkrlSACTrainConfig,
+) -> Path:
+    """Train SKRL SAC agent on one or many ORCA environments."""
+    wrapped_env, device, enable_wandb = _prepare_wrapped_env(
+        env_config=env_config,
+        train_config=train_config,
+    )
+
+    shared_feature_extractor = _build_shared_feature_extractor_if_needed(
+        env_config=env_config,
+        train_config=train_config,
+        wrapped_env=wrapped_env,
+        device=device,
+    )
+
+    models = {
+        "policy": OccupancyPolicyModel(
+            wrapped_env.observation_space,
+            wrapped_env.action_space,
+            device=device,
+            hidden_dims=tuple(int(v) for v in train_config.actor_hidden_dims),
+            initial_std=float(train_config.initial_policy_std),
+            max_std=float(train_config.max_policy_std),
+            feature_extractor=shared_feature_extractor,
+        ),
+        "critic_1": OccupancyQValueModel(
+            wrapped_env.observation_space,
+            wrapped_env.action_space,
+            device=device,
+            hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
+            feature_extractor=shared_feature_extractor,
+        ),
+        "critic_2": OccupancyQValueModel(
+            wrapped_env.observation_space,
+            wrapped_env.action_space,
+            device=device,
+            hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
+            feature_extractor=shared_feature_extractor,
+        ),
+        "target_critic_1": OccupancyQValueModel(
+            wrapped_env.observation_space,
+            wrapped_env.action_space,
+            device=device,
+            hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
+            feature_extractor=shared_feature_extractor,
+        ),
+        "target_critic_2": OccupancyQValueModel(
+            wrapped_env.observation_space,
+            wrapped_env.action_space,
+            device=device,
+            hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
+            feature_extractor=shared_feature_extractor,
+        ),
+    }
+
+    memory = RandomMemory(
+        memory_size=int(train_config.memory_size),
+        num_envs=int(wrapped_env.num_envs),
+        device=device,
+    )
+
+    output_path = _prepare_output_path(train_config)
+
+    agent_cfg = copy.deepcopy(SAC_DEFAULT_CONFIG)
+    agent_cfg["gradient_steps"] = int(train_config.gradient_steps)
+    agent_cfg["batch_size"] = int(train_config.batch_size)
+    agent_cfg["discount_factor"] = float(train_config.discount_factor)
+    agent_cfg["polyak"] = float(train_config.polyak)
+    agent_cfg["actor_learning_rate"] = float(train_config.actor_learning_rate)
+    agent_cfg["critic_learning_rate"] = float(train_config.critic_learning_rate)
+    agent_cfg["random_timesteps"] = int(train_config.random_timesteps)
+    agent_cfg["learning_starts"] = int(train_config.learning_starts)
+    agent_cfg["learn_entropy"] = bool(train_config.learn_entropy)
+    agent_cfg["entropy_learning_rate"] = float(train_config.entropy_learning_rate)
+    agent_cfg["initial_entropy_value"] = float(train_config.initial_entropy_value)
+    agent_cfg["target_entropy"] = (
+        None if train_config.target_entropy is None else float(train_config.target_entropy)
+    )
+    agent_cfg["experiment"]["wandb"] = enable_wandb
+    if enable_wandb:
+        agent_cfg["experiment"]["wandb_kwargs"] = _build_wandb_experiment_kwargs(
+            train_config,
+            output_path=output_path,
+        )
+    # Keep SAC write cadence reasonable for off-policy updates.
+    agent_cfg["experiment"]["write_interval"] = int(max(train_config.batch_size, 1000))
+    checkpoint_interval = int(train_config.checkpoint_interval)
+    if checkpoint_interval > 0:
+        agent_cfg["experiment"]["checkpoint_interval"] = checkpoint_interval
+        agent_cfg["experiment"]["directory"] = str(output_path.parent)
+        agent_cfg["experiment"]["experiment_name"] = output_path.stem
+        agent_cfg["experiment"]["store_separately"] = False
+
+    agent = SAC(
+        models=models,
+        memory=memory,
+        observation_space=wrapped_env.observation_space,
+        action_space=wrapped_env.action_space,
+        device=device,
+        cfg=agent_cfg,
+    )
+    _install_periodic_checkpoint_upload_hook(agent=agent, train_config=train_config)
+
+    return _run_training(
+        agent=agent,
+        wrapped_env=wrapped_env,
+        train_config=train_config,
+        output_path=output_path,
+    )
 
 
-def dump_effective_configs(env_config: SkrlEnvBuildConfig, train_config: SkrlPPOTrainConfig) -> dict[str, dict]:
+def dump_effective_configs(env_config: SkrlEnvBuildConfig, train_config: SkrlTrainConfigBase) -> dict[str, dict]:
     return {
         "env": asdict(env_config),
         "train": {

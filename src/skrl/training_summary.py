@@ -6,7 +6,7 @@ from typing import Callable
 import gymnasium as gym
 import numpy as np
 
-from src.skrl.config import SkrlPPOTrainConfig
+from src.skrl.config import SkrlTrainConfigBase
 
 
 def _mean_metric(tracking_data: dict[str, list[float]], key: str) -> float | None:
@@ -18,7 +18,7 @@ def _mean_metric(tracking_data: dict[str, list[float]], key: str) -> float | Non
 
 def _build_wandb_summary_callback(
     *,
-    train_config: SkrlPPOTrainConfig,
+    train_config: SkrlTrainConfigBase,
     group: str = "EnvSummary",
 ) -> Callable[[dict[str, object]], None] | None:
     if not bool(train_config.wandb):
