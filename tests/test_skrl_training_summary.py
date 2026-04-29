@@ -127,5 +127,38 @@ def test_periodic_summary_wrapper_prints_summary(capsys) -> None:
     assert "step_penalty=-0.2000\n" in captured
 
 
+def test_periodic_summary_wrapper_emits_callback_payload() -> None:
+    payloads: list[dict[str, object]] = []
+
+    wrapped = PeriodicEpisodeSummaryWrapper(
+        _DoneEveryStepEnv(),
+        interval_episodes=2,
+        prefix="[unit]",
+        summary_key="env_0",
+        summary_callback=payloads.append,
+    )
+    wrapped.reset()
+    wrapped.step(np.zeros((2,), dtype=np.float32))
+    wrapped.step(np.zeros((2,), dtype=np.float32))
+    wrapped.reset()
+    wrapped.step(np.zeros((2,), dtype=np.float32))
+    wrapped.step(np.zeros((2,), dtype=np.float32))
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["source"] == "env_0"
+    assert payload["episodes_start"] == 1
+    assert payload["episodes_end"] == 2
+    assert payload["mean_return"] == pytest.approx(2.0)
+    assert payload["mean_len"] == pytest.approx(2.0)
+    assert payload["success_rate"] == pytest.approx(1.0)
+
+    reward_terms = payload["reward_terms_mean_per_episode"]
+    assert isinstance(reward_terms, dict)
+    assert reward_terms["progress"] == pytest.approx(2.0)
+    assert reward_terms["step_penalty"] == pytest.approx(-0.2)
+    assert reward_terms["action_change"] == pytest.approx(-0.1)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

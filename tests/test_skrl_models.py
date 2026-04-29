@@ -12,7 +12,7 @@ pytest.importorskip("skrl")
 
 import gymnasium as gym
 
-from src.skrl.models import OccupancyPolicyModel, OccupancyValueModel, _build_mlp
+from src.skrl.models import OccupancyPolicyModel, OccupancyValueModel, _build_mlp, _flatten_states
 
 
 def test_build_mlp_output_shape() -> None:
@@ -106,6 +106,58 @@ def test_value_model_output_shape() -> None:
 
     assert tuple(values.shape) == (7, 1)
     assert isinstance(extra, dict)
+
+
+def test_flatten_states_dict_uses_sorted_key_order() -> None:
+    states = {
+        "z": torch.tensor([[9.0, 8.0]], dtype=torch.float32),
+        "a": torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+    }
+    flat = _flatten_states(states)
+    assert tuple(flat.shape) == (1, 4)
+    assert torch.allclose(flat, torch.tensor([[1.0, 2.0, 9.0, 8.0]], dtype=torch.float32))
+
+
+def test_policy_and_value_apply_tap_bottleneck_projector() -> None:
+    observation_space = gym.spaces.Dict(
+        {
+            "decoder_tap": gym.spaces.Box(low=-1.0, high=1.0, shape=(10,), dtype=np.float32),
+            "goal_position": gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
+            "current_velocity": gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
+            "last_commanded_velocity": gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
+        }
+    )
+    action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+
+    policy = OccupancyPolicyModel(
+        observation_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        hidden_dims=(8,),
+        tap_bottleneck_hidden_dims=(16,),
+        tap_bottleneck_output_dim=6,
+    )
+    value = OccupancyValueModel(
+        observation_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        hidden_dims=(8,),
+        tap_bottleneck_hidden_dims=(16,),
+        tap_bottleneck_output_dim=6,
+    )
+
+    x = {
+        "decoder_tap": torch.randn(3, 10),
+        "goal_position": torch.randn(3, 2),
+        "current_velocity": torch.randn(3, 2),
+        "last_commanded_velocity": torch.randn(3, 2),
+    }
+    mean, log_std, _ = policy.compute({"states": x}, role="policy")
+    values, _ = value.compute({"states": x}, role="value")
+
+    assert tuple(mean.shape) == (3, 2)
+    assert tuple(log_std.shape) == (2,)
+    assert tuple(values.shape) == (3, 1)
 
 
 if __name__ == "__main__":
