@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 import gymnasium as gym
@@ -14,6 +15,12 @@ from src.occupancy2d import Occupancy2d
 from src.occupancy_patch import slice_centered_patch
 from src.rollout_helpers import _compute_scene_canvas
 from src.scene import Scene
+from src.vae_decoder_tap_utils import (
+    _normalize_dynamic_context_tensor,
+    _normalize_static_context_tensor,
+    load_vae_decoder_tap_bundle,
+    state_to_xy_vec,
+)
 import math
 
 
@@ -78,6 +85,9 @@ class TorchORCAEnvConfig:
     sim: TorchORCASimConfig = field(default_factory=TorchORCASimConfig)
     reward: TorchORCARewardConfig = field(default_factory=TorchORCARewardConfig)
     occupancy: TorchORCAOccupancyConfig = field(default_factory=TorchORCAOccupancyConfig)
+    map_extractor_type: str = "conv"
+    vae_tap_checkpoint: Path | None = None
+    vae_tap_layer: int | None = None
 
 
 class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
@@ -132,46 +142,72 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
             raise ValueError("occupancy patch size/resolution yields non-positive local map shape")
         self._dynamic_context_len = int(occ_cfg.dynamic_context_len)
 
+        self._map_extractor_type = str(self.config.map_extractor_type).strip().lower()
+        if self._map_extractor_type not in {"conv", "vae_tap"}:
+            raise ValueError(
+                f"Unknown map_extractor_type '{self.config.map_extractor_type}'. Expected one of: conv, vae_tap"
+            )
+
+        self._decoder_tap_key = "decoder_tap"
+        self._decoder = None
+        self._decoder_tap_layer: int | None = None
+        self._decoder_tap_output_dim: int = 0
+        self._decoder_latent_channels: int | None = None
+        self._decoder_latent_height: int | None = None
+        self._decoder_latent_width: int | None = None
+        self._episode_decoder_z: torch.Tensor | None = None
+
+        if self._map_extractor_type == "vae_tap":
+            self._initialize_decoder_tap_components()
+
         self.action_space = spaces.Box(
             low=np.array([-1.0, -1.0], dtype=np.float32),
             high=np.array([1.0, 1.0], dtype=np.float32),
             shape=(2,),
             dtype=np.float32,
         )
-        self.observation_space = spaces.Dict(
-            {
-                "dynamic_context": spaces.Box(
-                    low=0.0,
-                    high=1.0,
-                    shape=(1, self._dynamic_context_len, self._local_map_shape[0], self._local_map_shape[1]),
-                    dtype=np.float32,
-                ),
-                "static_map": spaces.Box(
-                    low=0.0,
-                    high=1.0,
-                    shape=(1, self._local_map_shape[0], self._local_map_shape[1]),
-                    dtype=np.float32,
-                ),
-                "goal_position": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(2,),
-                    dtype=np.float32,
-                ),
-                "current_velocity": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(2,),
-                    dtype=np.float32,
-                ),
-                "last_commanded_velocity": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(2,),
-                    dtype=np.float32,
-                ),
-            }
-        )
+        base_obs_spaces: dict[str, spaces.Space] = {
+            "goal_position": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(2,),
+                dtype=np.float32,
+            ),
+            "current_velocity": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(2,),
+                dtype=np.float32,
+            ),
+            "last_commanded_velocity": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(2,),
+                dtype=np.float32,
+            ),
+        }
+        if self._map_extractor_type == "vae_tap":
+            base_obs_spaces[self._decoder_tap_key] = spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(int(self._decoder_tap_output_dim),),
+                dtype=np.float32,
+            )
+        else:
+            base_obs_spaces["dynamic_context"] = spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(1, self._dynamic_context_len, self._local_map_shape[0], self._local_map_shape[1]),
+                dtype=np.float32,
+            )
+            base_obs_spaces["static_map"] = spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(1, self._local_map_shape[0], self._local_map_shape[1]),
+                dtype=np.float32,
+            )
+
+        self.observation_space = spaces.Dict(base_obs_spaces)
 
         self.sim: ORCASim | None = None
         self._goals: torch.Tensor | None = None
@@ -189,6 +225,75 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
             ("success", self._terminate_on_success),
             ("too_far", self._terminate_on_too_far),
         ]
+
+    def _initialize_decoder_tap_components(self) -> None:
+        checkpoint = self.config.vae_tap_checkpoint
+        if checkpoint is None:
+            raise ValueError("vae_tap_checkpoint is required when map_extractor_type='vae_tap'")
+
+        tap_bundle = load_vae_decoder_tap_bundle(Path(checkpoint))
+        self._decoder = tap_bundle.decoder.to(self.device)
+        for param in self._decoder.parameters():
+            param.requires_grad = False
+        self._decoder.eval()
+
+        if int(tap_bundle.decoder_context_frames) != int(self._dynamic_context_len):
+            raise ValueError(
+                "occupancy.dynamic_context_len must match VAE decoder context length, "
+                f"got dynamic_context_len={self._dynamic_context_len}, "
+                f"decoder_context_frames={int(tap_bundle.decoder_context_frames)}"
+            )
+
+        self._decoder_tap_layer = (
+            int(tap_bundle.num_upsample_blocks - 1)
+            if self.config.vae_tap_layer is None
+            else int(self.config.vae_tap_layer)
+        )
+        self._decoder_latent_channels = int(tap_bundle.latent_channels)
+        self._decoder_latent_height = int(tap_bundle.latent_height)
+        self._decoder_latent_width = int(tap_bundle.latent_width)
+
+        with torch.no_grad():
+            dynamic_dummy = _normalize_dynamic_context_tensor(
+                torch.zeros(
+                    (1, 1, self._dynamic_context_len, self._local_map_shape[0], self._local_map_shape[1]),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                expected_channels=1,
+                expected_time=self._dynamic_context_len,
+                expected_hw=self._local_map_shape,
+            )
+            static_dummy = _normalize_static_context_tensor(
+                torch.zeros(
+                    (1, 1, self._local_map_shape[0], self._local_map_shape[1]),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                expected_channels=1,
+                expected_hw=self._local_map_shape,
+                target_t=self._dynamic_context_len,
+            )
+            velocity_dummy = torch.zeros((1, 2), dtype=torch.float32, device=self.device)
+            position_dummy = torch.zeros((1, 2), dtype=torch.float32, device=self.device)
+            z_dummy = torch.randn(
+                (1, self._decoder_latent_channels, 1, self._decoder_latent_height, self._decoder_latent_width),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            tapped = self._decoder(
+                z_dummy,
+                dynamic_dummy,
+                static_dummy,
+                velocity_dummy,
+                position_dummy,
+                tap_layer=self._decoder_tap_layer,
+                tap_only=True,
+            )
+            self._decoder_tap_output_dim = int(tapped.flatten(start_dim=1).shape[1])
+
+        if self._decoder_tap_output_dim <= 0:
+            raise ValueError("Invalid decoder tap output dim: must be > 0")
 
     def reset(
         self,
@@ -238,6 +343,18 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
         self._last_positions = positions
         self._last_velocities = velocities
         self._last_commanded_velocity = None
+
+        if self._map_extractor_type == "vae_tap":
+            if self._decoder_latent_channels is None or self._decoder_latent_height is None or self._decoder_latent_width is None:
+                raise RuntimeError("Decoder tap latent shape is not initialized")
+            self._episode_decoder_z = torch.randn(
+                (1, self._decoder_latent_channels, 1, self._decoder_latent_height, self._decoder_latent_width),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            self._episode_decoder_z = None
+
         self._initialize_occupancy(scene=self.sim.scene, positions=positions)
 
         obs = self._build_obs(positions, velocities)
@@ -402,6 +519,44 @@ class TorchORCAEnv(gym.Env[dict[str, torch.Tensor], torch.Tensor]):
         while len(context_frames) < self._dynamic_context_len:
             context_frames.insert(0, context_frames[0])
         dynamic_context = torch.stack(context_frames, dim=0).unsqueeze(0)
+
+        if self._map_extractor_type == "vae_tap":
+            if self._decoder is None or self._decoder_tap_layer is None or self._episode_decoder_z is None:
+                raise RuntimeError("Decoder tap state is not initialized")
+
+            dynamic_batch = _normalize_dynamic_context_tensor(
+                dynamic_context.unsqueeze(0),
+                expected_channels=1,
+                expected_time=self._dynamic_context_len,
+                expected_hw=self._local_map_shape,
+            )
+            static_batch = _normalize_static_context_tensor(
+                static_local.unsqueeze(0).unsqueeze(0),
+                expected_channels=1,
+                expected_hw=self._local_map_shape,
+                target_t=self._dynamic_context_len,
+            )
+            velocity_vec = state_to_xy_vec(current_velocity.unsqueeze(0), key_name="current_velocity")
+            position_vec = state_to_xy_vec(goal_offset.unsqueeze(0), key_name="goal_position")
+
+            with torch.no_grad():
+                tapped = self._decoder(
+                    self._episode_decoder_z,
+                    dynamic_batch,
+                    static_batch,
+                    velocity_vec,
+                    position_vec,
+                    tap_layer=self._decoder_tap_layer,
+                    tap_only=True,
+                )
+            decoder_tap = tapped.flatten(start_dim=1).squeeze(0)
+
+            return {
+                self._decoder_tap_key: decoder_tap.to(dtype=torch.float32),
+                "goal_position": goal_offset,
+                "current_velocity": current_velocity,
+                "last_commanded_velocity": last_commanded_velocity,
+            }
 
         return {
             "dynamic_context": dynamic_context.to(dtype=torch.float32),

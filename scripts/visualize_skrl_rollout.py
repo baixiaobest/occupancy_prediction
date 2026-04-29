@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -24,7 +25,7 @@ from src.skrl.env_torch_orca import (
     TorchORCARewardConfig,
     TorchORCASimConfig,
 )
-from src.skrl.models import OccupancyPolicyModel, OccupancyValueModel, VAEDecoderTapFeatureExtractor
+from src.skrl.models import OccupancyPolicyModel, OccupancyValueModel
 from src.skrl.observation_wrappers import MinimalKinematicsObservationWrapper
 
 # Reuse scene sampling and plotting utilities from SB3 visualizer.
@@ -66,18 +67,53 @@ def _load_checkpoint_dict(*, checkpoint_path: Path, device: torch.device) -> dic
     return checkpoint
 
 
-def _checkpoint_uses_feature_extractor(state_dict: Mapping[str, torch.Tensor]) -> bool:
+def _checkpoint_uses_legacy_feature_extractor(state_dict: Mapping[str, torch.Tensor]) -> bool:
     return any(str(name).startswith("feature_extractor.") for name in state_dict.keys())
 
 
+def _checkpoint_uses_tap_projector(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    return any(str(name).startswith("_tap_projector.tap_bottleneck.") for name in state_dict.keys())
+
+
+def _infer_tap_bottleneck_arch(state_dict: Mapping[str, torch.Tensor]) -> tuple[tuple[int, ...], int]:
+    pattern = re.compile(r"^_tap_projector\.tap_bottleneck\.(\d+)\.weight$")
+    linear_layers: list[tuple[int, int]] = []
+    for key, value in state_dict.items():
+        match = pattern.match(str(key))
+        if match is None:
+            continue
+        if not torch.is_tensor(value) or value.ndim != 2:
+            continue
+        layer_index = int(match.group(1))
+        out_features = int(value.shape[0])
+        linear_layers.append((layer_index, out_features))
+
+    if not linear_layers:
+        raise ValueError("Unable to infer tap bottleneck architecture from checkpoint")
+
+    linear_layers.sort(key=lambda item: item[0])
+    out_dims = [dim for _, dim in linear_layers]
+    hidden_dims = tuple(int(v) for v in out_dims[:-1])
+    output_dim = int(out_dims[-1])
+    return hidden_dims, output_dim
+
+
 def _infer_checkpoint_map_extractor_type(checkpoint: dict) -> str:
-    policy_uses_extractor = _checkpoint_uses_feature_extractor(checkpoint["policy"])
-    value_uses_extractor = _checkpoint_uses_feature_extractor(checkpoint["value"])
-    if policy_uses_extractor != value_uses_extractor:
+    policy_uses_legacy_extractor = _checkpoint_uses_legacy_feature_extractor(checkpoint["policy"])
+    value_uses_legacy_extractor = _checkpoint_uses_legacy_feature_extractor(checkpoint["value"])
+    if policy_uses_legacy_extractor or value_uses_legacy_extractor:
         raise ValueError(
-            "Checkpoint appears inconsistent: policy and value disagree on feature_extractor weights"
+            "This checkpoint uses the legacy feature_extractor path. "
+            "Use a checkpoint trained with env-side decoder tapping."
         )
-    return "vae_tap" if policy_uses_extractor else "conv"
+
+    policy_uses_tap_projector = _checkpoint_uses_tap_projector(checkpoint["policy"])
+    value_uses_tap_projector = _checkpoint_uses_tap_projector(checkpoint["value"])
+    if policy_uses_tap_projector != value_uses_tap_projector:
+        raise ValueError(
+            "Checkpoint appears inconsistent: policy and value disagree on tap bottleneck weights"
+        )
+    return "vae_tap" if policy_uses_tap_projector else "conv"
 
 
 def _build_env_config(
@@ -105,10 +141,13 @@ def _build_env_config(
     extractor_type = str(
         args.map_extractor_type if effective_map_extractor_type is None else effective_map_extractor_type
     ).strip().lower()
+    env_config.map_extractor_type = extractor_type
     if extractor_type == "vae_tap":
         if args.vae_checkpoint is None:
             raise ValueError("--vae-checkpoint is required when --map-extractor-type=vae_tap")
         env_config.occupancy.dynamic_context_len = load_decoder_context_len_from_checkpoint(args.vae_checkpoint)
+        env_config.vae_tap_checkpoint = Path(args.vae_checkpoint)
+        env_config.vae_tap_layer = None if args.vae_tap_layer is None else int(args.vae_tap_layer)
 
     return env_config
 
@@ -158,30 +197,28 @@ def _load_skrl_models(
             f"requested='{requested_map_extractor_type}', checkpoint='{checkpoint_map_extractor_type}'."
         )
 
-    shared_feature_extractor = None
+    tap_bottleneck_hidden_dims: tuple[int, ...] = (128,)
+    tap_bottleneck_output_dim = 32
     if checkpoint_map_extractor_type == "vae_tap":
         if vae_checkpoint is None:
             raise ValueError("--vae-checkpoint is required when --map-extractor-type=vae_tap")
-        shared_feature_extractor = VAEDecoderTapFeatureExtractor(
-            observation_space=observation_space,
-            vae_checkpoint=str(vae_checkpoint),
-            tap_layer=(None if vae_tap_layer is None else int(vae_tap_layer)),
-        ).to(device)
-        shared_feature_extractor.eval()
+        tap_bottleneck_hidden_dims, tap_bottleneck_output_dim = _infer_tap_bottleneck_arch(checkpoint["policy"])
 
     policy = OccupancyPolicyModel(
         observation_space,
         action_space,
         device=device,
         hidden_dims=actor_hidden_dims,
-        feature_extractor=shared_feature_extractor,
+        tap_bottleneck_hidden_dims=tap_bottleneck_hidden_dims,
+        tap_bottleneck_output_dim=tap_bottleneck_output_dim,
     ).to(device)
     value = OccupancyValueModel(
         observation_space,
         action_space,
         device=device,
         hidden_dims=critic_hidden_dims,
-        feature_extractor=shared_feature_extractor,
+        tap_bottleneck_hidden_dims=tap_bottleneck_hidden_dims,
+        tap_bottleneck_output_dim=tap_bottleneck_output_dim,
     ).to(device)
 
     checkpoint_input_dim = None

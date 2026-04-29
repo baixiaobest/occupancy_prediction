@@ -30,7 +30,7 @@ from src.skrl.models import (
     OccupancyPolicyModel,
     OccupancyQValueModel,
     OccupancyValueModel,
-    VAEDecoderTapFeatureExtractor,
+    build_tap_bottleneck_feature_projector,
 )
 from src.skrl.observation_wrappers import MinimalKinematicsObservationWrapper
 from src.skrl.training_summary import (
@@ -91,6 +91,9 @@ def _build_torch_orca_env_config(
         device=str(device),
         sim=sim_cfg,
         reward=reward_cfg,
+        map_extractor_type=str(env_cfg.map_extractor_type),
+        vae_tap_checkpoint=(None if env_cfg.vae_checkpoint is None else Path(env_cfg.vae_checkpoint)),
+        vae_tap_layer=(None if env_cfg.vae_tap_layer is None else int(env_cfg.vae_tap_layer)),
     )
 
     if str(env_cfg.map_extractor_type) == "vae_tap":
@@ -214,33 +217,6 @@ def _prepare_wrapped_env(
     return wrapped_env, device, enable_wandb
 
 
-def _build_shared_feature_extractor_if_needed(
-    *,
-    env_config: SkrlEnvBuildConfig,
-    train_config: SkrlTrainConfigBase,
-    wrapped_env,
-    device: torch.device,
-):
-    map_extractor_type = str(env_config.map_extractor_type).strip().lower()
-    if map_extractor_type != "vae_tap":
-        return None
-
-    if str(env_config.observation_mode).strip().lower() != "occupancy":
-        raise ValueError("map_extractor_type='vae_tap' requires observation_mode='occupancy'")
-    if env_config.vae_checkpoint is None:
-        raise ValueError("vae_checkpoint is required when map_extractor_type='vae_tap'")
-
-    shared_feature_extractor = VAEDecoderTapFeatureExtractor(
-        observation_space=wrapped_env.observation_space,
-        vae_checkpoint=str(env_config.vae_checkpoint),
-        tap_layer=(None if env_config.vae_tap_layer is None else int(env_config.vae_tap_layer)),
-        tap_bottleneck_hidden_dim=tuple(int(v) for v in train_config.tap_bottleneck_hidden_dims),
-        tap_bottleneck_output_dim=int(train_config.tap_bottleneck_output_dim),
-    ).to(device)
-    shared_feature_extractor.eval()
-    return shared_feature_extractor
-
-
 def _prepare_output_path(train_config: SkrlTrainConfigBase) -> Path:
     output_path = Path(train_config.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -285,11 +261,10 @@ def run_skrl_ppo_training(
         train_config=train_config,
     )
 
-    shared_feature_extractor = _build_shared_feature_extractor_if_needed(
-        env_config=env_config,
-        train_config=train_config,
-        wrapped_env=wrapped_env,
-        device=device,
+    shared_tap_projector = build_tap_bottleneck_feature_projector(
+        wrapped_env.observation_space,
+        tap_bottleneck_hidden_dims=tuple(int(v) for v in train_config.tap_bottleneck_hidden_dims),
+        tap_bottleneck_output_dim=int(train_config.tap_bottleneck_output_dim),
     )
 
     models = {
@@ -300,14 +275,14 @@ def run_skrl_ppo_training(
             hidden_dims=tuple(int(v) for v in train_config.actor_hidden_dims),
             initial_std=float(train_config.initial_policy_std),
             max_std=float(train_config.max_policy_std),
-            feature_extractor=shared_feature_extractor,
+            tap_projector=shared_tap_projector,
         ),
         "value": OccupancyValueModel(
             wrapped_env.observation_space,
             wrapped_env.action_space,
             device=device,
             hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
-            feature_extractor=shared_feature_extractor,
+            tap_projector=shared_tap_projector,
         ),
     }
 
@@ -375,11 +350,10 @@ def run_skrl_sac_training(
         train_config=train_config,
     )
 
-    shared_feature_extractor = _build_shared_feature_extractor_if_needed(
-        env_config=env_config,
-        train_config=train_config,
-        wrapped_env=wrapped_env,
-        device=device,
+    shared_tap_projector = build_tap_bottleneck_feature_projector(
+        wrapped_env.observation_space,
+        tap_bottleneck_hidden_dims=tuple(int(v) for v in train_config.tap_bottleneck_hidden_dims),
+        tap_bottleneck_output_dim=int(train_config.tap_bottleneck_output_dim),
     )
 
     models = {
@@ -390,35 +364,35 @@ def run_skrl_sac_training(
             hidden_dims=tuple(int(v) for v in train_config.actor_hidden_dims),
             initial_std=float(train_config.initial_policy_std),
             max_std=float(train_config.max_policy_std),
-            feature_extractor=shared_feature_extractor,
+            tap_projector=shared_tap_projector,
         ),
         "critic_1": OccupancyQValueModel(
             wrapped_env.observation_space,
             wrapped_env.action_space,
             device=device,
             hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
-            feature_extractor=shared_feature_extractor,
+            tap_projector=shared_tap_projector,
         ),
         "critic_2": OccupancyQValueModel(
             wrapped_env.observation_space,
             wrapped_env.action_space,
             device=device,
             hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
-            feature_extractor=shared_feature_extractor,
+            tap_projector=shared_tap_projector,
         ),
         "target_critic_1": OccupancyQValueModel(
             wrapped_env.observation_space,
             wrapped_env.action_space,
             device=device,
             hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
-            feature_extractor=shared_feature_extractor,
+            tap_projector=shared_tap_projector,
         ),
         "target_critic_2": OccupancyQValueModel(
             wrapped_env.observation_space,
             wrapped_env.action_space,
             device=device,
             hidden_dims=tuple(int(v) for v in train_config.critic_hidden_dims),
-            feature_extractor=shared_feature_extractor,
+            tap_projector=shared_tap_projector,
         ),
     }
 
